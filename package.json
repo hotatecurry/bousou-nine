@@ -1,0 +1,44 @@
+{
+  "name": "famista",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "balance": "vite-node tools/balance/report.ts",
+    "balance:map": "vite-node tools/balance/map.ts",
+    "balance:exp": "vite-node tools/balance/experiment.ts",
+    "balance:compare": "vite-node tools/balance/compare.ts",
+    "balance:rundown": "vite-node tools/balance/rundown.ts",
+    "balance:steal": "vite-node tools/balance/steal.ts",
+    "balance:fork": "vite-node tools/balance/fork.ts",
+    "balance:stance": "vite-node tools/balance/stance.ts",
+    "balance:cpubreak": "vite-node tools/balance/cpubreak.ts",
+    "balance:walk": "vite-node tools/balance/walk.ts",
+    "balance:lineup": "vite-node tools/balance/lineup.ts",
+    "balance:identity": "vite-node tools/balance/identity.ts",
+    "balance:control": "vite-node tools/balance/control.ts",
+    "balance:draft": "vite-node tools/balance/draft.ts",
+    "balance:rotation": "vite-node tools/balance/rotation.ts",
+    "balance:offense": "vite-node tools/balance/offense.ts",
+    "balance:bunt": "vite-node tools/balance/bunt.ts",
+    "balance:relief": "vite-node tools/balance/relief.ts",
+    "balance:arm": "vite-node tools/balance/arm.ts",
+    "balance:pinchrun": "vite-node tools/balance/pinchrun.ts",
+    "balance:hr": "vite-node tools/balance/homerun.ts"
+  },
+  "dependencies": {
+    "three": "^0.178.0",
+    "xstate": "^5.19.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.178.0",
+    "typescript": "^5.8.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
+  }
+}

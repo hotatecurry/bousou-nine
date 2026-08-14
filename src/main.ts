@@ -1,0 +1,2972 @@
+/**
+ * エントリポイント。
+ * 単一Scene＋カメラ切り替え方式（でっかい/ちっちゃい）で、モード遷移は
+ * modeMachine のステートに完全連動する瞬時カット（原作準拠）。
+ *
+ * 投球・打撃・守備・走塁は本実装済み。打球はスイング接触→BATTED_BALL→ちっちゃいモードへ
+ * 引き継がれ、操作野手の捕球・送球と走者の自動進塁による実プレーでアウト/安打/得点が
+ * 確定する（セッション4）。
+ */
+import * as THREE from 'three';
+import { createActor } from 'xstate';
+import { type GameContext, gameMachine, rerollsLeftOf } from './core/gameMachine';
+import { modeMachine } from './core/modeMachine';
+import {
+  type BaseRunners,
+  type Bases,
+  type Count,
+  type Half,
+  type HitType,
+  type RunnerId,
+  type TeamSide,
+  STRIKES_FOR_OUT,
+  applyPitch,
+  battingTeam,
+  fieldingTeam,
+  occupancy,
+  opponent,
+} from './core/rules';
+import {
+  type PlayerSlot,
+  type SideControllers,
+  PLAYER_LABEL,
+  PLAYER_SLOTS,
+  controllersFor,
+  defensePlayer,
+  isTwoPlayer,
+  offensePlayer,
+  playerOfSide,
+  roleOfPlayer,
+  sideOfPlayer,
+} from './core/players';
+import type { TeamId } from './core/teams';
+import { type BattedBall, type BattingProfile, callAfterSwing } from './core/batting';
+import {
+  type BatterSide,
+  type PitchArm,
+  type PitchCall,
+  batterStandX,
+  LEFT_BATTER_SIDE,
+  NEUTRAL_RATING,
+  RIGHT_BATTER_SIDE,
+  batterFrameX,
+  fatiguedBreak,
+  fatiguedControl,
+  fatiguedSpeed,
+  plateCrossingX,
+} from './core/pitch';
+import {
+  type FieldingPosition,
+  type RosterPlan,
+  DEFAULT_ROSTER_PLAN,
+  activatableEffect,
+  brawlLoadoutOf,
+  canPinchHit,
+  canPinchRun,
+  canShootGun,
+  canUseVerb,
+  controlBonusOf,
+  cpuRosterPlan,
+  currentBatterId,
+  currentBatterPosition,
+  effectiveBatting,
+  effectiveBattingHand,
+  effectivePitching,
+  effectivePlay,
+  fatigueOf,
+  fielderThrowArm,
+  gunRemainingOf,
+  isHot,
+  isPitcherAtBat,
+  nextBatterId,
+  pitchArmOf,
+  pitcherControl,
+  pitcherQualityOf,
+  pitcherRole,
+  remainingStaminaOf,
+  skillHoldersOf,
+} from './core/roster';
+import { runSkillDraft } from './ui/skillDraft';
+import { matchEnd, runEnd, runNextSelect } from './ui/runScreen';
+import {
+  type SkillId,
+  cpuChooseSkill,
+  rerollsLeft,
+  shouldCpuReroll,
+  skillDef,
+} from './core/skills';
+import {
+  type CarriedFatigue,
+  type CarriedSkills,
+  type CarriedUses,
+  type RunState,
+  RUN_GAMES,
+  createRun,
+  preloadedSkills,
+  restedPitchCounts,
+  runDoors,
+  runOutcomeAfter,
+  runProgress,
+  skillCount,
+  withGameResult,
+  withNextGame,
+} from './core/run';
+import { isLuckyInning } from './core/condition';
+import { type EdgeMarker, edgeMarker } from './core/camera';
+import {
+  type AtBatMarker,
+  type InterludeKind,
+  GAME_RESULT_PAUSE_SEC,
+  GUN_TELEGRAPH_SEC,
+  INTERLUDE_SEC,
+  interludeBetween,
+} from './core/tempo';
+import {
+  type BaseKey,
+  type CarriedLeads,
+  type CpuStealOptions,
+  CPU_STEAL_JUMP_SEC,
+  CPU_STEAL_MAX_DEFENSE_SLACK_SEC,
+  DROPKICK_RANGE,
+  MAX_LEAD,
+  STEAL_LEAD,
+  baseFromPadDirection,
+  chooseCpuSteals,
+  cpuStealDefenseSlack,
+  resolveCarriedLeads,
+  runnerSpeed,
+} from './core/fielding';
+import { type Ballpark, type BallparkId, DEFAULT_BALLPARK, ballparkById } from './core/ballpark';
+import type { BrawlLoadouts, BrawlSide } from './core/brawl';
+import {
+  chooseCpuPinchHitter,
+  chooseCpuPinchRunner,
+  chooseCpuStance,
+  crossesSwingDecisionPoint,
+  shouldCpuActivateBattingEffect,
+  shouldCpuSwing,
+} from './core/cpuBatter';
+import { chooseCpuRelief, shouldCpuIntentionalWalk, shouldCpuShoot } from './core/cpuPitcher';
+import { batterAimX } from './core/gun';
+import { sfx } from './audio/sfx';
+import {
+  type VirtualPad,
+  PLAYER1_KEYS,
+  PLAYER2_KEYS,
+  createKeyboardPad,
+  createMergedPad,
+  createRolePad,
+} from './input/keyboard';
+import { type MatchSelection, runRosterPlanSelect, runTeamSelect } from './ui/teamSelect';
+import {
+  type IntentionalWalkTarget,
+  type PinchRunTarget,
+  runManagerMenu,
+} from './ui/managerMenu';
+import { createField, FIELD_POSITIONS } from './scenes/field';
+import {
+  type PitchProfile,
+  createBattingController,
+  createCpuPitcherController,
+  createDekkaiCamera,
+  createGunController,
+  createPitchingController,
+} from './scenes/dekkaiScene';
+import {
+  type PlayPrompt,
+  type PlayPromptKind,
+  createChicchaiCamera,
+  createFielders,
+  createFieldPlayController,
+  createRunners,
+} from './scenes/chicchaiScene';
+import {
+  createBrawlCamera,
+  createBrawlController,
+  createBrawlFighters,
+} from './scenes/brawlScene';
+import {
+  createPlayer,
+  preloadPlayerModel,
+  setPlayerColor,
+  setPlayerFacing,
+  setPlayerPose,
+} from './entities/player';
+import { createProp, preloadProps } from './entities/props';
+import { preloadStadiumModel } from './entities/stadium';
+import { createBall } from './entities/ball';
+import { createReticle } from './entities/reticle';
+import { type PlayPromptLine, createHud } from './ui/hud/hud';
+
+// ---- Three.js セットアップ（単一Scene） ----
+
+const app = document.getElementById('app')!;
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setSize(window.innerWidth, window.innerHeight);
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x101820);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(30, 60, 20);
+scene.add(sun);
+
+/**
+ * この試合の球場（フェーズC-14）。**チーム選択（runTeamSelect）で決まるまで確定しない**
+ * ので、フィールドのジオメトリを組むのも背景色を決めるのも選択の完了後に行う
+ * （メインループも同じタイミングで始まるので、選択前に描かれるフレームは無い）。
+ * 打球物理（フェンスの距離・高さ）はここを問い合わせる ballparkOf 経由で参照される。
+ *
+ * ラン化（フェーズF-26-6）で**試合ごとに変わる**ようになったので、組んだフィールドを
+ * 覚えておいて差し替える（`applyBallpark`）。
+ */
+let ballpark: Ballpark = DEFAULT_BALLPARK;
+/** いま Scene に載っているフィールド（球場を差し替えるときに取り除くため覚えておく） */
+let fieldGroup: THREE.Group | null = null;
+
+/** 取り除いたフィールドのGPU資源を解放する（5試合ぶん積み上がるので捨て置かない） */
+function disposeGroup(group: THREE.Group): void {
+  group.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    mesh.geometry.dispose();
+    const material = mesh.material;
+    if (Array.isArray(material)) material.forEach((m) => m.dispose());
+    else material.dispose();
+    // スタンド・観客は InstancedMesh（フェーズE-25-(d)）。行列と色のバッファは
+    // ジオメトリとは別に持っているので、これを呼ばないと試合ごとに積み上がる。
+    const instanced = child as THREE.InstancedMesh;
+    if (instanced.isInstancedMesh) instanced.dispose();
+  });
+}
+
+/**
+ * その試合の球場を反映する（フィールドの形・芝生の広さ・空の色）。**打球物理も描画も
+ * 同じ `ballpark` から起こす**というC-14の整理はそのままで、ラン化ではここが
+ * 試合ごとに呼ばれるようになっただけ。
+ */
+function applyBallpark(id: BallparkId): void {
+  ballpark = ballparkById(id);
+  scene.background = new THREE.Color(ballpark.skyColor);
+  if (fieldGroup) {
+    scene.remove(fieldGroup);
+    disposeGroup(fieldGroup);
+  }
+  fieldGroup = createField(ballpark);
+  scene.add(fieldGroup);
+}
+
+// でっかいモードの投手・打者の既定色（乱闘の交代で色替えするので、試合ごとに戻せるよう
+// 名前を付けてある。フェーズF-26-6のラン化で試合を作り直すようになったため）。
+const PITCHER_COLOR = 0x2255cc;
+const BATTER_COLOR = 0xcc3333;
+
+// 選手モデル（フェーズE-25）。**人型を作るより前に一度だけ読み込む**：供給口
+// （createPlayer）は同期のままにしてあるので、原型が無い状態で呼ぶと投げる。
+await preloadPlayerModel();
+// 球場の部品（フェーズE-25-(d)）。同じ理由で `createField` より前に読み込む
+// （フィールドを組むのはチーム選択の後なので、ここで待っても表示は遅れない）。
+await preloadStadiumModel();
+// スキルの持ち物（フェーズE-25-(e)。バイク・銃）。走者・投手に持たせるのはこの直後なので、
+// 人型と同じく**作るより前に**読み込む。
+await preloadProps();
+
+const pitcher = createPlayer(PITCHER_COLOR);
+pitcher.position.copy(FIELD_POSITIONS.mound);
+pitcher.position.y = 0.4;
+scene.add(pitcher);
+
+const batter = createPlayer(BATTER_COLOR);
+// 左右のXは打撃コントローラーが打席の左右（BOX）に応じて出し入れする（フェーズB-9）。
+// ここでの初期値は右打席（＝三塁側。フェーズBB-49）で、判定と同じ `batterStandX` から
+// 起こす＝符号の取り決めを書き写さない。向きも打席の左右で決まるので
+// 打撃コントローラー側（applyStance）が書く。
+batter.position.set(batterStandX(), 0, 0.2);
+scene.add(batter);
+
+const catcher = createPlayer(0x33aa55);
+catcher.position.set(0, 0, 2.4);
+// 捕手だけは本塁の後ろから投手（-Z）を向く＝でっかいモードのカメラからは背中が見える
+setPlayerFacing(catcher, Math.PI);
+// 捕手は座って構える（フェーズE-25-(c)）。プレー中この姿勢が変わることは無いので
+// 起動時に一度書くだけでよい（投手・打者と違い、捕手の見た目は状態を持たない）。
+setPlayerPose(catcher, { kind: 'crouch' });
+scene.add(catcher);
+
+const ball = createBall();
+scene.add(ball);
+
+// 守備の9野手（常時シーンに配置。ちっちゃいモードの鳥瞰でのみ実質的に見える）
+const fielders = createFielders();
+for (const f of fielders) scene.add(f.group);
+
+// 走者（打者走者＋一二三塁走者）。フィールドプレー中のみ表示される
+const runners = createRunners();
+scene.add(runners.batter, runners.first, runners.second, runners.third);
+
+// 打球の落下地点を示す影（鳥瞰カメラでの高さの手がかり）
+const ballShadow = new THREE.Mesh(
+  new THREE.CircleGeometry(0.5, 12),
+  new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.35 }),
+);
+ballShadow.rotation.x = -Math.PI / 2;
+ballShadow.visible = false;
+scene.add(ballShadow);
+
+// 銃モードの照準（レティクル）。非銃モード中は非表示
+const reticle = createReticle();
+scene.add(reticle);
+
+// 乱闘（v1）の専用ファイター（でっかいモードの投手/打者とは別インスタンス。
+// ちっちゃいモードの野手/走者と同じく常時シーンに配置し、表示/非表示のみ切り替える）
+const brawlFighters = createBrawlFighters();
+scene.add(brawlFighters.batter, brawlFighters.pitcher);
+
+const aspect = () => window.innerWidth / window.innerHeight;
+const dekkaiCamera = createDekkaiCamera(aspect());
+// ちっちゃいモードは打球・走者に寄ってボールを追うカメラ（フェーズE-24）。カメラ本体は
+// 従来どおり main.ts が持ち（render・リサイズ）、どこを見るかはリグが毎フレーム決める。
+const chicchaiRig = createChicchaiCamera(aspect());
+const chicchaiCamera = chicchaiRig.camera;
+const brawlCamera = createBrawlCamera(aspect());
+let activeCamera: THREE.PerspectiveCamera = dekkaiCamera;
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  for (const cam of [dekkaiCamera, chicchaiCamera, brawlCamera]) {
+    cam.aspect = aspect();
+    cam.updateProjectionMatrix();
+  }
+});
+
+// ---- ステートマシン起動 ----
+//
+// **1試合＝1組のアクター**（フェーズF-26-6のラン化）。`gameMachine` は今までどおり
+// 「1試合」を表すマシン（決着したら最終状態 gameOver で止まる）のままで、**ランは
+// その外側にある試合の列**なので、次の試合はアクターごと作り直す（`startGame`）。
+// マシンに「試合をリセットするイベント」を足す形にしなかったのは、そうすると
+// 最終状態でなくなり「試合は決着したら終わり」という今の性質が消えるため。
+
+let gameActor = createActor(gameMachine).start();
+let modeActor = createActor(modeMachine).start();
+
+const hudRoot = document.getElementById('hud')!;
+// チーム選択中はHUDを出さない（フェーズC-13）。既定のカードのスコアボードが選択画面の
+// 裏に透けて見えると、まだ選んでいない球団が対戦相手のように見えてしまう。
+hudRoot.style.display = 'none';
+const hud = createHud(hudRoot);
+
+/** modeMachine のステート値からトップレベルのモード名を取り出す */
+function currentMode(): string {
+  const value = modeActor.getSnapshot().value;
+  return typeof value === 'string' ? value : Object.keys(value)[0];
+}
+
+function isGunMode(): boolean {
+  return modeActor.getSnapshot().matches({ dekkai: 'gun' });
+}
+
+function refresh(): void {
+  const game = gameActor.getSnapshot().context;
+  const mode = currentMode();
+  // ちっちゃいモードは鳥瞰、乱闘は2.5D横視点、それ以外（でっかい/死球）はクローズアップ視点
+  activeCamera = mode === 'chicchai' ? chicchaiCamera : mode === 'brawl' ? brawlCamera : dekkaiCamera;
+  // でっかいモードの投手/打者/捕手プレースホルダーは、ちっちゃいモード（鳥瞰の
+  // 守備・走塁）・乱闘（専用ファイターに切り替え済み）では不要かつ視界の邪魔になる
+  // （実機テストプレイで、鳥瞰視点にこれらが写り込み守備対象と紛らわしいと判明した
+  // ため非表示にする。詳細はPROGRESS.md「実装メモ」）。
+  const showDekkaiActors = mode !== 'chicchai' && mode !== 'brawl';
+  pitcher.visible = showDekkaiActors;
+  batter.visible = showDekkaiActors;
+  catcher.visible = showDekkaiActors;
+  // 逆に**ちっちゃいモードの野手9人はでっかいモードでは隠す**。野手Pのホームポジションは
+  // マウンド（`FIELDER_HOME_POSITIONS.P`）、野手Cは本塁の後ろで、**でっかいモードの投手・
+  // 捕手とほぼ同じ場所に立っている**＝隠さないと投手が2人・捕手が2人並んで見える
+  // （実機テストプレイで判明。箱のプレースホルダー時代は同じ姿勢・同じ形で重なって
+  // 1体に見えていたが、E-25で人型モデル＋姿勢が入って別々の人として見えるようになった）。
+  const showFielders = mode === 'chicchai';
+  for (const f of fielders) f.group.visible = showFielders;
+  // 持ち越したリード（フェーズL-32）は「いまその塁にいる走者のもの」だけを渡す
+  // ＝走者が入れ替わった塁の古い数字が画面に残らない（表示と判定が同じ関数から起きる）。
+  hud.update(
+    game,
+    mode,
+    isGunMode(),
+    controllers,
+    run ? runProgress(run) : undefined,
+    resolveCarriedLeads(game.baseRunners, carriedLeads),
+  );
+}
+
+// 試合終了は winner が確定して以降、状態変化のたびに何度も refresh() が呼ばれ続けるため
+// （hud.update自体は毎回同じ内容を描き直すだけで無害だが）、勝敗確定の効果音は
+// 二重発火を避けて最初の1回だけ鳴らす。
+let winAnnounced = false;
+/** 決着してからランの画面が出るまでの残り時間（フェーズF-26-6。GAME_RESULT_PAUSE_SEC） */
+let resultPauseRemaining = 0;
+
+/**
+ * アクターの購読をまとめて張り直す（フェーズF-26-6）。**試合ごとにアクターを作り直す**
+ * ので、購読も試合ごとに張り直す必要がある。呼ぶのは `startGame` の中の1か所だけ
+ * （＝購読が二重に積み上がる経路が無い）。
+ *
+ * `batting.syncStance` を同じ購読に相乗りさせているのは、打者が変わった瞬間に
+ * 見た目の左右を判定側と揃えるため（フェーズB-9。詳細は下記 batting の生成箇所）。
+ */
+function subscribeActors(): void {
+  gameActor.subscribe(() => {
+    refresh();
+    batting.syncStance();
+    if (gameActor.getSnapshot().context.winner !== null && !winAnnounced) {
+      winAnnounced = true;
+      sfx.win();
+      // 決着の表示（サヨナラのバナー・スコアボード・勝者）を読み切る間を置いてから
+      // ランの画面へ移る（メインループが消化する）。
+      resultPauseRemaining = GAME_RESULT_PAUSE_SEC;
+    }
+  });
+  modeActor.subscribe(refresh);
+}
+
+// ---- 入力結線 ----
+
+// **プレイヤーは2人ぶん常に用意する**（フェーズD-20）。1P PLAY でも2P側のパッドは
+// 存在するが、`controllers` がどの側にも割り当てないので入力は全部落ちる。
+const pads: Record<PlayerSlot, VirtualPad> = {
+  p1: createKeyboardPad(PLAYER1_KEYS),
+  p2: createKeyboardPad(PLAYER2_KEYS),
+};
+const padList = [pads.p1, pads.p2];
+/** モード選択・試合結果のように「どちらのプレイヤーが押してもよい」画面に渡す */
+const anyPad = createMergedPad(padList);
+
+// 2P/CPU操作分離（セッション7、セッション9ででっかいモードにも拡張、フェーズD-20で
+// 2人の人間に一般化）：試合開始前にプレイヤーが「モード（1P/2P）」「先攻・後攻の球団」
+// 「球場」「（1P PLAYなら）操作するチーム」を選ぶ（runTeamSelect、メインループ開始前に
+// ブロックする。球団選択はフェーズC-13で追加）。
+// ちっちゃいモードはCPUが担う側を簡易CPU（着地点へ自動追跡→自動捕球→自動送球）が
+// 守備代行し、人間が攻撃側のときは走塁（B=進塁/A=帰塁）を操作する（セッション7）。
+// でっかいモード（投球・打撃）は、人間が投手側のときだけ人間がA/D・K・W/Sで
+// 投球を操作し、CPUが投手側のときは core/cpuPitcher.ts が狙い・投球タイミングを
+// 自動で決める。逆に人間が打者側のときだけKでスイングを操作し、CPUが打者側のときは
+// core/cpuBatter.ts がスイングタイミングを自動で判断する。
+//
+// **どの側を誰が操作するかは `controllers` の1か所**（フェーズD-20。core/players.ts）。
+// D-20より前の `humanSide: TeamSide` は「もう一方は必ずCPU」を前提にしていたので、
+// 2P PLAY では成り立たない（実際、ちっちゃいモードは「守備が人間＝攻撃はCPU」として
+// 走者を自動で動かしていた）。
+let controllers: SideControllers = controllersFor('1p', 'home');
+/** runTeamSelect 完了後に true。チーム選択オーバーレイ表示中はゲーム側の入力処理を止める
+ *（pad.onPress はチーム選択のハンドラと同じボタンを共有するため、二重発火を避ける）。 */
+let gameStarted = false;
+
+/**
+ * 進行中のラン（フェーズF-26-6。5試合の勝ち抜き）。**試合の外側の状態**なので
+ * `gameMachine` のコンテキストには持たせず、球場（C-14）と同じく main.ts が持つ
+ * ＝1試合のルール・判定はランを知らないまま従来どおり動く。
+ * チーム選択が終わるまでは null（＝まだランが始まっていない）。
+ */
+let run: RunState | null = null;
+/**
+ * 2P PLAY の対戦カード（フェーズD-20。null なら1P PLAY＝ランを走らせている）。
+ * **2P はランの外＝1試合完結**なので、持つのは結果画面に出す球団の組だけ。
+ */
+let twoPlayerMatch: { away: TeamId; home: TeamId } | null = null;
+/** ランの画面（試合結果・次の相手・チーム選択）が開いている間は全アクターを止める */
+let runScreenOpen = false;
+
+function currentHalf(): Half {
+  return gameActor.getSnapshot().context.half;
+}
+
+/** 守備側を操作している人間（CPU守備なら null）。役割束縛パッドの解決もこれを通る */
+function defensePlayerNow(): PlayerSlot | null {
+  return defensePlayer(controllers, currentHalf());
+}
+
+/** 攻撃側を操作している人間（CPU攻撃なら null） */
+function offensePlayerNow(): PlayerSlot | null {
+  return offensePlayer(controllers, currentHalf());
+}
+
+function isDefenseHuman(): boolean {
+  return defensePlayerNow() !== null;
+}
+
+// でっかいモードへの2P/CPU操作分離拡張（セッション9）：投球と打撃は必ず「表裏で入れ替わる
+// 別チームの役割」なので、fieldingTeam/battingTeam は常に互いに逆を指す。**フェーズD-20
+// より前はここに「人間は1人」という前提が乗っていた**（isPitchingHuman と isBattingHuman は
+// 常にどちらか片方だけが true）が、2P PLAY では両方 true になりうる＝この2つは
+// 「その役割を人間が操作しているか」だけを意味する（＝CPUに任せるかの判断）。
+// **誰の入力かは各パッド（defensePad/offensePad と、押下ハンドラのプレイヤー識別）が持つ。**
+function isPitchingHuman(): boolean {
+  return isDefenseHuman();
+}
+
+function isBattingHuman(): boolean {
+  return offensePlayerNow() !== null;
+}
+
+// **役割に束縛したパッド**（フェーズD-20）：投球・銃・守備は守備側の、打撃・走塁は攻撃側の
+// パッドを読む。攻守が入れ替わっても渡し直しは要らない（読むたびに解決する）ので、
+// 各コントローラーは「1枚のパッドを受け取る」という従来の形のまま2人に対応できる。
+// **CPUが担っている側では何も押されていないパッド**になる＝人間のキーが相手の動作へ
+// 漏れ込む経路が構造的に無い（旧実装は `isBattingHuman()` の分岐でこれを手当てしていた）。
+const defensePad = createRolePad(padList, () => {
+  const player = defensePlayerNow();
+  return player === null ? null : pads[player];
+});
+const offensePad = createRolePad(padList, () => {
+  const player = offensePlayerNow();
+  return player === null ? null : pads[player];
+});
+
+function gameIsOver(): boolean {
+  return gameActor.getSnapshot().context.winner !== null;
+}
+
+// ---- 選手の能力値の解決（フェーズB-8） ----
+//
+// ロスター（誰が打席か・誰がマウンドか・誰が塁にいるか）を知っているのは main.ts だけなので、
+// 「能力値を引いて渡す」役はここに集約する。各コントローラー（打撃・投球・守備）は
+// 能力値の**値**だけを受け取り、ロスターの構造には一切依存しない。
+// 交代・打順の進行で対象は毎球変わりうるため、保持せず毎回問い合わせる。
+
+/** 今打席に立っている打者の打撃能力（打球初速・芯を外したときの減衰に効く） */
+function currentBattingProfile(): BattingProfile {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  // スキルの補正込みで読む（フェーズF-26-1）。`キンニク` のようなレーティング補正が
+  // 打球初速にもHUDの表示本塁打数にも同じ経路で効く。
+  // **イニングを渡すのは好調（フェーズD-19）のため**：ゼッコーチョーもラッキー7も
+  // AV/HR への補正なので、渡しさえすれば打球への効き方はスキルとまったく同じ経路を通る。
+  const batting = effectiveBatting(roster, currentBatterId(roster), ctx.inning);
+  return { power: batting.power, average: batting.average };
+}
+
+/**
+ * 今打席に立っている打者が好調か（フェーズD-19）。**見た目（バットをクルクル回す）
+ * だけに使う**：打球への効果は上の `currentBattingProfile` が能力値として渡すので、
+ * ここは「投げる側が投げる前に読み取れる手がかり」を出すための問い合わせ。
+ */
+function currentBatterIsHot(): boolean {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  return isHot(roster, currentBatterId(roster), ctx.inning);
+}
+
+/**
+ * 今打席に立っている打者の左右（BOX。フェーズB-9）。打席の立ち位置・バットの到達範囲・
+ * 引っ張り方向・死球ゾーン・銃の命中ゾーンが、この符号でまとめて鏡像になる。
+ *
+ * **両打ち（S）は相手投手の腕で決まる**ので、打者だけでなくマウンドの投手も見る
+ * （継投で相手が代われば、同じ打者でも立つ打席が変わる＝実際の野球と同じ）。
+ * 打者交代・継投は投球動作中には起きない（采配メニューは ready フェーズだけ。
+ * canOpenManagerMenu）ので、1球の途中で判定ゾーンが動くことはない。
+ */
+function currentBatterSide(): BatterSide {
+  const ctx = gameActor.getSnapshot().context;
+  const batting = ctx.rosters[battingTeam(ctx.half)];
+  const fielding = ctx.rosters[fieldingTeam(ctx.half)];
+  const bats = batting.players[currentBatterId(batting)].batting.bats;
+  // 投手として起用されている選手は必ず pitching を持つ（roster.ts）。万一欠けても
+  // 打席が決まらず止まることのないよう、右投手として扱う。
+  const throws = fielding.players[fielding.pitcher].pitching?.throws ?? 'R';
+  return effectiveBattingHand(bats, throws) === 'L' ? LEFT_BATTER_SIDE : RIGHT_BATTER_SIDE;
+}
+
+/**
+ * 今マウンドにいる投手の投球腕（説明書のARM。フェーズCC-50）。
+ *
+ * **`currentBatterSide` とまったく同じ材料（守備側のロスターの投手の `throws`）を
+ * 同じ読み方（`pitchArmOf` / `effectiveBattingHand`）で畳む**ので、「両打ちが左打席に
+ * 立っているのに投手は右腕で投げている」という食い違いが構造的に起きない。
+ * ここから**投げる腕の見た目**と**ボールが出るX**の両方が決まる。
+ */
+function currentPitchArm(): PitchArm {
+  const ctx = gameActor.getSnapshot().context;
+  const fielding = ctx.rosters[fieldingTeam(ctx.half)];
+  // 投手として起用されている選手は必ず pitching を持つ（roster.ts）。万一欠けていても
+  // 投球が止まらないよう、`currentBatterSide` と同じく右投手として扱う。
+  return pitchArmOf(fielding.players[fielding.pitcher].pitching?.throws ?? 'R');
+}
+
+/**
+ * 今の打者の打席内の立ち位置（打者ローカルXのオフセット。フェーズO-36）。
+ *
+ * **真実は打撃コントローラーが持つ**（入力で動かし、見た目もそこから書く）ので、
+ * 死球ゾーン（`judgePitch`）・銃の命中ゾーン（`judgeShot`）・CPU投手の狙い（`batterAimX`）は
+ * すべてこの1か所を通して読む＝`currentBatterSide` とまったく同じ配り方。
+ */
+function currentBatterStance(): number {
+  return batting.stanceOffset();
+}
+
+/**
+ * 今マウンドにいる投手の疲労0..1（フェーズB-11）。投球数（gameMachine が PITCH_THROWN で
+ * 記録）とスタミナから導出される値で、球速・変化量・打たれたときの球威にまとめて効く。
+ * **投手が疲れているかどうかは攻守どちらの側でも同じ計算**（守備側のロスターから引く）。
+ */
+function currentPitcherFatigue(): number {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[fieldingTeam(ctx.half)];
+  return fatigueOf(roster, roster.pitcher);
+}
+
+/**
+ * 今マウンドにいる投手の投球能力（球速・変化量に効く）。
+ * **疲労はここで能力値そのものに織り込む**（フェーズB-11）ので、人間の投球・CPUの投球
+ * （cpuPitcher は下でこの speed を読む）・飛行中の曲がりのすべてに一度に効く。
+ */
+/**
+ * 今マウンドにいる投手の制球 0..1（フェーズT-41）。**CPUが狙いをどれだけ外すか**にだけ効く
+ * （人間の投球は今までどおり狙ったところへ行く＝ユーザー判断。人間側は下の
+ * `currentPitcherCourse` が「狙える幅」として受け取る）。
+ *
+ * **W-44で2つ増えた**：(1) ERAはスキルの補正対象になった（`effectivePitching` が
+ * `eraWithControl` で書き戻すので、ここは今までどおり ERA を読むだけで効く）。
+ * (2) **疲労を掛ける**＝B-11の「疲労で効くのは球速・変化量・球威の3つ」に4つ目が付いた。
+ * ただしCPU投手はJ-30の自動継投が残量0.5で代えるので、実際に効くのは
+ * **ブルペンが尽きた場面だけ**（計測：16球団の最大疲労は平均0.091）。
+ */
+function currentPitcherControl(): number {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[fieldingTeam(ctx.half)];
+  const stats = effectivePitching(roster, roster.pitcher);
+  // 投球能力を持たない選手がマウンドにいても止まらないよう基準値（＝従来と同じ狙い）へ落とす
+  if (!stats) return NEUTRAL_RATING;
+  return fatiguedControl(pitcherControl(stats.era), fatigueOf(roster, roster.pitcher));
+}
+
+/**
+ * **人間が投げるときのコース入力の効き幅**の材料（フェーズW-44）。
+ *
+ * CPU側（上の `currentPitcherControl`）が「狙いがどれだけ外れるか」を受け取るのに対し、
+ * 人間側が受け取るのは「**狙える幅**」＝押した向きへは必ず動き、動く量だけが増減する
+ * （T-41のユーザー判断「人間の投球は狙ったところへ行く」を崩さない形。B-11が疲労で
+ * 球速・変化量を痩せさせているのとまったく同じ扱い）。
+ *
+ * 渡すのは**名鑑のERAからの差**（`controlBonusOf`）で、素のERAは効かせない＝
+ * **スキルを持たない無傷の投手は W-44 の前と1mmも変わらない**。
+ */
+function currentPitcherCourse(): { controlBonus: number; fatigue: number } {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[fieldingTeam(ctx.half)];
+  return {
+    controlBonus: controlBonusOf(roster, roster.pitcher),
+    fatigue: fatigueOf(roster, roster.pitcher),
+  };
+}
+
+function currentPitchProfile(): PitchProfile {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[fieldingTeam(ctx.half)];
+  const stats = effectivePitching(roster, roster.pitcher);
+  // 投手として起用されている選手は必ず pitching を持つ（roster.ts で投手だけに持たせている）。
+  // 万一欠けていても投球が止まらないよう、基準値の投手として扱う。
+  if (!stats) {
+    return {
+      speed: NEUTRAL_RATING,
+      breakLeft: NEUTRAL_RATING,
+      breakRight: NEUTRAL_RATING,
+      fork: NEUTRAL_RATING,
+    };
+  }
+  const fatigue = fatigueOf(roster, roster.pitcher);
+  return {
+    speed: fatiguedSpeed(stats.speed, fatigue),
+    breakLeft: fatiguedBreak(stats.breakLeft, fatigue),
+    breakRight: fatiguedBreak(stats.breakRight, fatigue),
+    // **Fにも疲労を掛ける**（フェーズO-35）。FはR/Lと同じ「曲がりの強さ」になったので、
+    // B-11がユーザー判断で確定した3つ（球速・**変化量**・球威）の「変化量」に素直に含まれる
+    // ＝4つ目を足したのではなく、**変化量の残り1つがようやく揃った**。疲れた投手の
+    // フォークだけ曲がり続ける、という食い違いが構造的に起きない。
+    fork: fatiguedBreak(stats.fork, fatigue),
+  };
+}
+
+/**
+ * 走者の走る速さ（走力＝RUNの反映）。塁上の走者も打者走者も攻撃側チームの選手なので、
+ * 打者側のロスターから引く（交代した選手も players には残り続けるので必ず見つかる）。
+ */
+function runnerSpeedOf(id: RunnerId): number {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  // スキル補正込み（`スケボー` 等）。走力の上限そのものは動かさないので、
+  // 「野手の足より遅い＝挟殺が成立する」という前提（CLAUDE.md ⑥）は保たれる。
+  return runnerSpeed(roster.players[id] ? effectiveBatting(roster, id).run : NEUTRAL_RATING);
+}
+
+/**
+ * その走者がスキル `バイク`（フェーズF-26-3）を持っているか。走力（runnerSpeedOf）と
+ * 違ってレーティングに畳めない**動詞系**のスキルなので、問い合わせの形も別に持つ
+ * （銃が `canShootGun` で問い合わされるのと同じ）。
+ */
+function canBikeOf(id: RunnerId): boolean {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  // 常設の `バイク` か、消費型 `ニトロ` のチャージが残っていれば乗れる（F-26-8）。
+  // **問い合わせる側は動詞の名前しか知らない**ので、消費型を足しても分岐は増えない。
+  return roster.players[id] !== undefined && canUseVerb(roster, id, 'baiku');
+}
+
+/**
+ * その走者がスキル `ドロップキック`（フェーズF-26-4）を持っているか。
+ * バイク（canBikeOf）と同じ**動詞系**の問い合わせで、解決先も同じ攻撃側のロスター。
+ */
+function canDropkickOf(id: RunnerId): boolean {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  // 常設の `ドロップキック` か、消費型 `テツゲタ` のチャージ（F-26-8）。canBikeOf と同じ形。
+  return roster.players[id] !== undefined && canUseVerb(roster, id, 'doroppukikku');
+}
+
+/**
+ * 走者が動詞を1回使ったことをロスターへ記録する（フェーズF-26-8）。
+ * **常設の札を持っている走者なら何も起きない**ので、シーン層は「いま使ったのは常設か
+ * 消費型か」を判断しなくてよい（判断は `useVerb` の1か所に閉じている）。
+ */
+function recordVerbUse(id: RunnerId, verb: SkillId): void {
+  const ctx = gameActor.getSnapshot().context;
+  const side = battingTeam(ctx.half);
+  if (ctx.rosters[side].players[id] === undefined) return;
+  gameActor.send({ type: 'VERB_USED', side, playerId: id, verb });
+}
+
+/**
+ * その走者のドロップキックの射程 m（フェーズF-26-5。デュオ `ロケットキック` で伸びる）。
+ * **素の定数に補正を足すだけ**なので、スキルを持たない走者では必ず `DROPKICK_RANGE` に戻る。
+ */
+function dropkickRangeOf(id: RunnerId): number {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  if (roster.players[id] === undefined) return DROPKICK_RANGE;
+  return DROPKICK_RANGE + (effectivePlay(roster, id).dropkickRange ?? 0);
+}
+
+/** その走者の盗塁のスタート位置 m（フェーズF-26-5。ドウブツ系統 `ウサギ`/`ウマ` で深くなる） */
+function stealLeadOf(id: RunnerId): number {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  if (roster.players[id] === undefined) return STEAL_LEAD;
+  // リードが深すぎると塁から離れすぎて逆にけん制で刺されるので、けん制の上限（MAX_LEAD）で
+  // 頭打ちにする＝**盗塁のスタートだけが、けん制で許される深さを超えることはない**。
+  return Math.min(MAX_LEAD, STEAL_LEAD + (effectivePlay(roster, id).stealLead ?? 0));
+}
+
+/**
+ * その守備位置の選手の捕球半径の上乗せ m（フェーズF-26-5。ドウブツ系統 `イヌ`/`タカ` 等）。
+ * **走者系の問い合わせと解決先が逆**（守備側チームのロスター）で、守備位置→選手の対応は
+ * B-10の `positions` を引く＝代打・継投で守備位置に入った選手のスキルがそのまま効く。
+ */
+function catchRadiusBonusOf(id: FieldingPosition): number {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[fieldingTeam(ctx.half)];
+  const playerId = roster.positions[id];
+  return playerId === undefined ? 0 : (effectivePlay(roster, playerId).catchRadius ?? 0);
+}
+
+/**
+ * その守備位置の選手が送球するときの腕（フェーズHH-55。見た目だけ）。
+ * **解決先は捕球半径と同じ守備側チームのロスター**で、実データを持つのは投手だけ
+ * （`fielderThrowArm`）＝継投すればマウンドの送球の腕も一緒に替わる。
+ */
+function throwArmOf(id: FieldingPosition): PitchArm {
+  const ctx = gameActor.getSnapshot().context;
+  return fielderThrowArm(ctx.rosters[fieldingTeam(ctx.half)], id);
+}
+
+// ---- 一時効果（フェーズM-33。CLAUDE.md ⑧「一時効果」） ----
+//
+// **Gの空いていた2つのスロットに入る**（でっかいモードの打者側／ちっちゃいモードの守備側）。
+// 銃・ドロップキックと同じで、ロスターを知っているここが「誰が切るか」を解決し、
+// シーン側とHUDは問い合わせるだけにする。
+
+/**
+ * いまの打者が切れる一時効果（`シニモノグルイ`・`ゼッタイヨチ`）。無ければ null。
+ * **HUDのヒントもGの処理もこれ1つを見る**ので、見えている操作と効く操作がずれない。
+ */
+function battingEffectReady(): SkillId | null {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  return activatableEffect(roster, currentBatterId(roster), 'batting');
+}
+
+/** 打者側の一時効果を切る（でっかいモードの打者側のG） */
+function activateBattingEffect(): void {
+  const ctx = gameActor.getSnapshot().context;
+  const side = battingTeam(ctx.half);
+  const playerId = currentBatterId(ctx.rosters[side]);
+  if (activatableEffect(ctx.rosters[side], playerId, 'batting') === null) return;
+  gameActor.send({ type: 'EFFECT_ACTIVATED', side, playerId, role: 'batting' });
+  sfx.skillActivate();
+}
+
+/**
+ * その守備位置の選手が、いま一時効果を切ったら**捕球半径がいくつ増えるか** m
+ * （フェーズM-33）。切れなければ 0。
+ *
+ * **札そのものの値を読む**（`SKILLS[id].play.catchRadius`）ので、`ケモノガエリ` の
+ * 数値を変えればシーンの判断もCPUの判断も一緒に動く＝定数の写し取りを作らない。
+ */
+function catchEffectGainOf(id: FieldingPosition): number {
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[fieldingTeam(ctx.half)];
+  const playerId = roster.positions[id];
+  if (playerId === undefined) return 0;
+  const skillId = activatableEffect(roster, playerId, 'fielding');
+  return skillId === null ? 0 : (skillDef(skillId).play?.catchRadius ?? 0);
+}
+
+/** 守備側の一時効果が実際に切られた（人間のG／CPUの判断のどちらもここへ来る） */
+function onCatchEffect(id: FieldingPosition): void {
+  const ctx = gameActor.getSnapshot().context;
+  const side = fieldingTeam(ctx.half);
+  const playerId = ctx.rosters[side].positions[id];
+  if (playerId === undefined) return;
+  gameActor.send({ type: 'EFFECT_ACTIVATED', side, playerId, role: 'fielding' });
+  sfx.skillActivate();
+}
+
+/** ちっちゃいモードの守備側のGで一時効果を切る */
+function activateFieldingEffect(): void {
+  fieldPlay.catchEffect();
+}
+
+/** 今の打者走者（打球のプレーを始めるときに、その打者を走者として引き継ぐ） */
+function currentBatterRunnerId(): RunnerId {
+  const ctx = gameActor.getSnapshot().context;
+  return currentBatterId(ctx.rosters[battingTeam(ctx.half)]);
+}
+
+// 乱闘（v1）：死球発生時点の「カウント・走者状況・打者側チームの打順」を控えておく。
+// 乱闘が決着した場合、敗北側の要員入れ替えだけを残して死球そのものを巻き戻す
+// （=同じ打席が継続する）ため gameMachine.BRAWL_RESOLVED に渡す
+// （詳細は core/gameMachine.ts reduceBrawlResolved のコメント）。
+// 乱闘を選ばなかった場合（BRAWL_DECLINED）はこの値を使わないまま捨てる。
+let pendingHbpRestore: {
+  count: Count;
+  bases: Bases;
+  baseRunners: BaseRunners;
+  battingLineupIndex: number;
+} | null = null;
+
+/**
+ * 乱闘に持ち込む両者の装備（フェーズF-26-1）。ローグライトのスキルをここで
+ * 「体力・威力・出せる技」に翻訳してから乱闘へ渡す。
+ *
+ * **打者は `pendingHbpRestore.battingLineupIndex` から引く**。死球は起きた瞬間に
+ * `HIT_BY_PITCH` で打順を1つ進めてしまう（＝楽観的に打席終了を確定させる。乱闘が
+ * 決着したら巻き戻す設計）ので、乱闘に入る時点の `currentBatterId` は**もう次の打者**を
+ * 指している。そのまま読むと「殴られた選手ではなく次の打者のスキル」で戦うことになる
+ * （実機検証で実際にこの取り違えを踏んだ）。巻き戻し用に控えてある死球直前の打順が
+ * そのまま「殴られた打者」なので、そちらを真実として使う。
+ *
+ * 投手は継投が挟まらないので現在の投手でよい。
+ */
+function brawlLoadouts(): BrawlLoadouts {
+  const ctx = gameActor.getSnapshot().context;
+  const battingRoster = ctx.rosters[battingTeam(ctx.half)];
+  const fieldingRoster = ctx.rosters[fieldingTeam(ctx.half)];
+  const batterId =
+    pendingHbpRestore === null
+      ? currentBatterId(battingRoster)
+      : battingRoster.lineup[pendingHbpRestore.battingLineupIndex];
+  return {
+    batter: brawlLoadoutOf(battingRoster, batterId),
+    pitcher: brawlLoadoutOf(fieldingRoster, fieldingRoster.pitcher),
+  };
+}
+
+/**
+ * 乱闘中の操作説明と技表（フェーズG-27）。**人間が操作している側のぶんだけ**出す
+ * （CPUが動かす側の技表は誰の判断材料にもならない）。
+ *
+ * ここで組むのは、必要な3つがHUDからは見えないため：**誰がどの必殺技を持っているか**
+ * （スキル＝`brawl.moveHints`）、**その人が押す向き**（画面左右で「前」が逆＝
+ * `commandNotation` が facing から起こす）、**2Pのキー名の読み替え**（D-20の約束＝
+ * 1Pのキー名をそのまま見せるのは案内として間違っている）。
+ */
+function brawlHintText(): string {
+  const half = currentHalf();
+  const lines = ['ラントウ!'];
+  for (const side of ['batter', 'pitcher'] as const) {
+    const team = side === 'batter' ? battingTeam(half) : fieldingTeam(half);
+    const player = playerOfSide(controllers, team);
+    if (!player) continue;
+    const label = isTwoPlayer(controllers) ? `${PLAYER_LABEL[player]} ` : '';
+    const keys = player === 'p2' ? { a: '[2]', b: '[1]' } : { a: 'K', b: 'J' };
+    lines.push(`${label}${keys.a}:コウゲキ ${keys.b}:ガード マエ+${keys.b}:ナゲ`);
+    for (const hint of brawl.moveHints(side)) {
+      lines.push(`${label}${hint.name} ${hint.notation}+${keys.a}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function captureHbpRestoreSnapshot(): void {
+  const ctx = gameActor.getSnapshot().context;
+  pendingHbpRestore = {
+    count: ctx.count,
+    bases: ctx.bases,
+    // 走者の識別も一緒に巻き戻す（乱闘で死球が無かったことになったとき、塁上の走者が
+    // 誰だったかまで戻らないと走力が入れ替わってしまう）
+    baseRunners: ctx.baseRunners,
+    battingLineupIndex: ctx.rosters[battingTeam(ctx.half)].lineupIndex,
+  };
+}
+
+// でっかいモードのCPU投球AI（セッション9・2P/CPU操作分離の拡張）：CPU側が投手のとき、
+// 狙うコース・球速をカウントから決め、**そこへ届くリリース位置を逆算して**（フェーズP-37）
+// 直接反映してから一定の「間」を置いて投げる
+// （詳細は core/cpuPitcher.ts・dekkaiScene.ts createCpuPitcherController）。
+const cpuPitcher = createCpuPitcherController(pitcher, {
+  // 球速だけでなく変化量（R/L/F）も渡す＝**CPUの球も名鑑の変化量で曲がる**（P-37）。
+  // 疲労は currentPitchProfile が織り込むので、疲れたCPU投手は曲がりも落ちる（B-11）。
+  pitcherProfile: currentPitchProfile,
+  // 制球（フェーズT-41）＝**狙いがゾーンの縁からどれだけ外れるか**。ERAからの導出で、
+  // 荒れた投手はボールが先行し、3ボールになると既存の規則で真ん中へ置きにくる。
+  pitcherControl: currentPitcherControl,
+  // 投球腕（フェーズCC-50）＝**逆算の窓が腕のぶんずれる**。狙うコースは1つも動かない。
+  pitcherArm: currentPitchArm,
+});
+
+// 投球（ファミスタ'90説明書p19準拠）：人間が投手側のときはA/Dでプレート上を移動、
+// Kでワインドアップ開始。ワインドアップ中にW=フォーク/チェンジアップ・S=速球の
+// 事前選択（緩急はリリース時に確定、飛行中は変わらない）。リリースの瞬間のA/Dで
+// コース投げ分け、リリース後のA/Dでカーブ/シュート。CPUが投手側のときは
+// cpuPitcher が狙い・球速を決め、main.tsのメインループが自動でstartPitch()を呼ぶ。
+// 打撃：投球が生きている間、人間が打者側ならKでスイング（下のonFlightStepでCPU打者の
+// スイングも同じbatting.trySwing()へ合流させる）。
+// ---- 盗塁（説明書p13「盗塁しようとすると"ちっちゃいモード"に変わる」） ----
+// 投球中に走者が走り出すと画面はちっちゃいモードへ切り替わるが、**その投球自体は
+// 裏で最後まで進み、カウントとして決着する**（ユーザー判断：2026-07-23）。そのため
+// 「盗塁のプレーが進行中か」を main.ts が持ち、(1)投球の判定を盗塁の決着まで保留する、
+// (2)その球を打てる窓（ヒットエンドラン）を決める、の2つに使う。
+//
+// ---- ヒットエンドラン（フェーズH-28） ----
+// **盗塁を仕掛けた球も打てる**（それまでは接触判定ごと止めていた）。画面はすでに
+// ちっちゃいモードなので、**攻撃側のKは投球が生きている間だけスイングになる**
+// （投球が終われば従来どおり帰塁）＝原作のA/Bが場面で機能を変える多目的ボタン方式の延長。
+// 打球が出たら、走っている盗塁のプレーをそのまま打球のプレーへ引き継ぐ
+// （fieldPlay.convertToBattedBall）＝走者はスタートを切った分だけ先行したまま走り続ける。
+
+/** 盗塁のプレーが進行中（startSteal〜onSettled）。fieldPlay 側の状態と1対1で対応する */
+let stealActive = false;
+
+/**
+ * ヒットエンドランの窓が開いているか（フェーズH-28）＝盗塁のプレー中で、その投球が
+ * まだ生きている。**Kがスイングになる条件も、画面に出るヒントの条件もこれ1つ**
+ * （見えている操作と効く操作が同じ値から起きる）。
+ */
+function hitAndRunOpen(): boolean {
+  return stealActive && pitching.isPitchLive();
+}
+/** 盗塁中に決着した投球の判定。盗塁の決着を反映してから applyPitchCall に渡す */
+let pendingPitch: { call: PitchCall; swung: boolean } | null = null;
+
+/**
+ * 1球の判定を試合状態へ反映する（三振/四球/死球の演出もここで一度だけ発火する）。
+ * 通常は投球の決着（onJudged）から即座に呼ぶが、盗塁（説明書p13）が進行中の球だけは
+ * 保留し、盗塁の決着を反映した後に呼ぶ（applyPendingPitch）。
+ */
+function applyPitchCall(call: PitchCall, swung: boolean): void {
+  if (call === 'hitByPitch') {
+    // v1: スイング中でも死球を優先（銃システムの死球フローと同一経路）
+    sfx.hitByPitch();
+    captureHbpRestoreSnapshot();
+    gameActor.send({ type: 'HIT_BY_PITCH' });
+    modeActor.send({ type: 'DEAD_BALL' });
+    return;
+  }
+  if (swung) sfx.swingMiss(); // 空振り（callAfterSwingにより判定は常にstrikeになる）
+  const judgement = callAfterSwing(call, swung);
+  // applyPitch を先読みして三振/四球の演出（バナー+効果音）をここで一度だけ発火する
+  // （gameMachine 内部でも同じ純粋関数で同じ判定が行われるが、副作用のない再計算なので
+  // 二重に呼んでも安全。決着後は攻守交代/延長判定などをまたぐため main.ts 側で先に判定する）。
+  const outcome = applyPitch(gameActor.getSnapshot().context.count, judgement);
+  if (outcome.kind === 'strikeout') {
+    sfx.strikeout();
+    hud.playBanner('strikeout', 'サンシン!');
+  } else if (outcome.kind === 'walk') {
+    sfx.walk();
+    hud.playBanner('walk', 'フォアボール');
+  } else {
+    // 1球ごとの判定コール（フェーズE-23）。従来は三振・四球という打席の決着しか
+    // 見せておらず、それ以外の球は「HUDのカウントの数字が変わるだけ」で何が起きたか
+    // 分からなかった。捕球後の「間」（PITCH_SETTLE_SEC）に情報を載せる役目も兼ねる。
+    if (judgement === 'ball') hud.playBanner('ball', 'ボール');
+    else hud.playBanner('strike', 'ストライク');
+  }
+  gameActor.send({ type: 'PITCH_RESULT', judgement });
+}
+
+/**
+ * この打席で直前に本塁を通過した球のコース（打者ローカルX。フェーズO-36）。null=初球。
+ * **CPU打者の立ち位置の唯一の材料**（`chooseCpuStance`）で、打席が切り替わるたびに捨てる
+ * （`updateInterlude`）＝前の打者への配球が次の打者の構えに残らない。**誰への配球かを
+ * 一緒に持つ**のは、間が開く前にも同じことを保証するため（下記 `cpuStanceTarget`）。
+ */
+let lastPitch: { batterId: string; localX: number } | null = null;
+
+/**
+ * CPU打者が寄る先（フェーズO-36）。**この打者への配球でなければ材料にしない。**
+ *
+ * 打席が切り替わるたびに `updateInterlude` が記憶を捨てるが、**その間が開くのは
+ * でっかいモードへ戻ってから**なので、死球で打者が代わった直後（deadBall モード）の
+ * ように**打席だけ先に変わっている瞬間**がある。識別を突き合わせておけば、
+ * **前の打者への配球で次の打者が寄る**ことが構造的に起きない
+ * （実機で踏んだ：死球の直後、まだ1球も受けていない打者が 0.2m 寄って立っていた）。
+ */
+function cpuStanceTarget(): number {
+  const ctx = gameActor.getSnapshot().context;
+  const batterId = currentBatterId(ctx.rosters[battingTeam(ctx.half)]);
+  return chooseCpuStance(lastPitch && lastPitch.batterId === batterId ? lastPitch.localX : null);
+}
+
+const pitching = createPitchingController({
+  pitcher,
+  ball,
+  // 投球は守備側の操作（フェーズD-20。2P PLAY では相手のパッドは読まない）
+  pad: defensePad,
+  isCpuTurn: () => !isPitchingHuman(),
+  cpuReleaseSpeed: () => cpuPitcher.releaseSpeed(),
+  // CPUの変化球（フェーズP-37）。投げる前に解いた形をなぞるだけ＝飛行中は判断しない
+  cpuBreak: (sinceRelease, dt) => cpuPitcher.breakAt(sinceRelease, dt),
+  pitcherProfile: currentPitchProfile,
+  // 死球ゾーンは打者と一緒に動く（左打者には反対側へ曲げないと当たらない）
+  batterSide: currentBatterSide,
+  // 打席内の立ち位置（フェーズO-36）。**踏み込んでいる打者には内角のボール球が当たる**
+  // ＝投手側から見れば、寄られたら内角を突けるが外せば一塁を与える、という綱引きになる。
+  batterStance: currentBatterStance,
+  // 制球（フェーズW-44）＝**人間が投げるときのコース入力の効き幅**。スキルで広がり、
+  // 疲労で痩せる（向きは入力どおりのまま）。CPUの狙いのほうは cpuPitcher 側で効く。
+  pitcherCourse: currentPitcherCourse,
+  // 投球腕（フェーズCC-50）＝**投げる腕の見た目**と**ボールが出るX**（プレート上の
+  // 立ち位置＋腕のずれ）。人間の投球もCPUの投球も同じ1本を通る。
+  pitcherArm: currentPitchArm,
+  // スタミナ消耗（フェーズB-11）は**リリースの瞬間に1球ずつ**記録する。判定側で数えると
+  // 打たれた球（判定を経ずに打球のプレーへ移る）が抜け落ちる。
+  onRelease: () => gameActor.send({ type: 'PITCH_THROWN' }),
+  onJudged: (call) => {
+    // 判定確定＝この球は終わり。次の球のためにCPU投手の狙いをリセットする
+    // （リセットを忘れると次の ready フェーズで前の球の狙いを使い回してしまう）。
+    cpuPitcher.reset();
+    const swung = batting.consumeSwung();
+    // バントはバットを出したまま球を待つ（スイングの時間切れで戻らない）ため、
+    // 見送って判定が確定したこのタイミングで打撃動作を終了させる。
+    batting.endPitch();
+    // 盗塁中の球は、盗塁の決着（塁・アウト）を先に反映してからカウントへ反映する。
+    // 逆順にすると、四球で押し出しの進塁を計算した後に盗塁で塁が動く／三振が3アウト目
+    // なら盗塁の結果を反映する先のイニングが変わる、といった順序の矛盾が起きる。
+    if (stealActive) {
+      pendingPitch = { call, swung };
+      return;
+    }
+    applyPitchCall(call, swung);
+  },
+  onFlightStep: (prev, next, dt) => {
+    // でっかいモードのCPU打撃AI（セッション9）：CPUが打者側のとき、着弾までの残り時間が
+    // 理想スイング時間としきい値を跨いだ瞬間（＝人間なら「今だ」と判断する頃合い）に
+    // 一度だけスイングするか判断する。実際の接触判定は下の batting.checkContact が
+    // 既存のジャストミート判定でそのまま行う（曲げ球で予測が外れれば人間同様に凡打/空振りになる）。
+    // **盗塁中も同じ判断をそのまま通す**（フェーズH-28。ユーザー判断：CPUもヒットエンドランを
+    // やる）＝規則は従来どおり決定的なままで、⑧の「CPUも対等」が走らせて打つ場面にも及ぶ。
+    if (!isBattingHuman() && crossesSwingDecisionPoint(prev, next)) {
+      // 打席の左右はCPU打者にも同じように効く（左打者は届く範囲がXについて鏡像）。
+      // 立ち位置（フェーズO-36）も同じ＝**寄っているCPU打者は内角を見送る**（届かないので）。
+      if (
+        shouldCpuSwing(
+          next,
+          gameActor.getSnapshot().context.count,
+          currentBatterSide(),
+          currentBatterStance(),
+        )
+      ) {
+        batting.trySwing();
+      }
+    }
+    // CPU打者の立ち位置の材料（フェーズO-36）＝**この打席で直前に本塁を通過したコース**。
+    // 打たれた球は打撃面（本塁より手前）で終わるのでここには来ない＝記憶に残るのは
+    // 「見送った/空振りした球」だけになる。
+    const crossed = plateCrossingX(prev, next);
+    if (crossed !== null) {
+      const ctx = gameActor.getSnapshot().context;
+      lastPitch = {
+        batterId: currentBatterId(ctx.rosters[battingTeam(ctx.half)]),
+        localX: batterFrameX(crossed, currentBatterSide()),
+      };
+    }
+    // 接触判定は盗塁中も止めない（フェーズH-28）。打球が出たら、走っている盗塁のプレーを
+    // 打球のプレーへ**引き継ぐ**ので、走塁プレーと二重になることはない（下の
+    // ヒットストップ明けの分岐で convertToBattedBall を通す）。
+    batting.checkContact(prev, next, dt);
+  },
+});
+
+// 打球の帰結演出（バナー+効果音）。hit が設定されるのは resultFromHit 経由の決着
+// （安打・本塁打）のみで、守備側主導の送球判定/フライアウトには付かない
+// （chicchaiScene.ts FieldPlayOutcome のコメント参照）。
+const HIT_BANNER: Record<HitType, { kind: 'homerun' | 'triple' | 'double' | 'single'; text: string }> = {
+  homerun: { kind: 'homerun', text: 'ホームラン!' },
+  triple: { kind: 'triple', text: 'スリーベース!' },
+  double: { kind: 'double', text: 'ツーベース!' },
+  single: { kind: 'single', text: 'ヒット!' },
+};
+
+// 守備・走塁：操作野手の捕球/送球（fieldPlay.action、A割り当て）と
+// 走者の自動進塁（フォース対象のみ）でアウト/安打/得点を確定する。
+const fieldPlay = createFieldPlayController({
+  ball,
+  shadow: ballShadow,
+  fielders,
+  runners,
+  // 守備（野手の一斉移動・ファインプレイ・送球/ランダンの塁指定）と走塁（進塁/帰塁・
+  // バイクの点火・ドロップキック）は**別の人間が同時に操作しうる**ので、パッドも
+  // 「人間か」の問い合わせも側ごとに分ける（フェーズD-20）。
+  defensePad,
+  offensePad,
+  isDefenseHuman,
+  isOffenseHuman: isBattingHuman,
+  // 走者ごとの走力（フェーズB-8）。ちっちゃいモードはロスターを知らないので、
+  // 「この走者は何m/sで走るか」だけをここから供給する。
+  runnerSpeedOf,
+  // スキル `バイク`（フェーズF-26-3）を持つ走者か。走力と同じく、選手データの解決は
+  // ロスターを知っている側（ここ）に置き、シーンは問い合わせるだけにする。
+  canBikeOf,
+  // スキル `ドロップキック`（フェーズF-26-4）を持つ走者か（同上）。
+  canDropkickOf,
+  // 既存のプレー定数へのスキル補正（フェーズF-26-5）。攻撃側の走者から引くもの2つと、
+  // 守備側の野手から引くもの1つ。どれも「素の定数＋補正」なので、スキルが無ければ従来どおり。
+  dropkickRangeOf,
+  stealLeadOf,
+  catchRadiusBonusOf,
+  // 送球の腕（フェーズHH-55。見た目だけ）。CC-50 ででっかいモードの投球姿勢が ARM で
+  // 鏡像になったので、これが無いと左投げの投手が投手ゴロだけ右で投げることになる。
+  throwArmOf,
+  // 一時効果（フェーズM-33）。**「これから払えば得られる補正」と「切った」の2本**で、
+  // 上の `catchRadiusBonusOf`（もう効いている補正）と対になる。
+  catchEffectGainOf,
+  onCatchEffect,
+  // 蹴りが出たときの効果音（当たり＝乱闘の打撃音、空振り＝空振り音）。**バナーは出さない**：
+  // CLAUDE.md ⑧のトーン「ゲーム側は一切ツッコまない」に従い、蹴られた野手が倒れて
+  // ボールがこぼれる、という画面上の事実だけで見せる（煽った瞬間にバカゲーに落ちる）。
+  onDropkick: (hit, runnerId) => {
+    if (hit) sfx.brawlAttack();
+    else sfx.swingMiss();
+    // 消費型 `テツゲタ`（F-26-8）のチャージを1つ使う。**当たっても外れても消費する**
+    // ＝1プレーに1回という既存の規則と同じ扱い（当たるまで撃ち直せる札にしない）。
+    recordVerbUse(runnerId, 'doroppukikku');
+  },
+  // バイクの点火（F-26-8。消費型 `ニトロ` のチャージを1つ使う）。常設の `バイク` 持ちなら
+  // `useVerb` が何もしないので、シーンからは常に同じように報せてよい。
+  onBikeIgnite: (runnerId) => recordVerbUse(runnerId, 'baiku'),
+  // ヒットエンドランの窓（フェーズH-28）。**Kがスイングになる条件（onA）と同じ関数**を
+  // 渡すので、画面に出るヒントと実際に効く操作が食い違わない。
+  canHitAndRun: hitAndRunOpen,
+  // この試合の球場（フェーズC-14）。チーム選択の完了時に決まる＝このコントローラーを
+  // 作る時点ではまだ選ばれていないので、値ではなく問い合わせで渡す。
+  ballparkOf: () => ballpark,
+  // 守備プレー中のアウト/セーフをその都度、文字バナー＋効果音で見せる（捕球・各送球の
+  // 到着時に発火）。実機テストプレイの指摘：送球後にセーフ/アウトが分からず、アウトの
+  // 積み重ねも見えないため守備→攻撃の交代が唐突に感じる、への対応。
+  onDefenseResult: (kind) => {
+    if (kind === 'out') {
+      sfx.out();
+      hud.playBanner('out', 'アウト!');
+    } else {
+      sfx.base();
+      hud.playBanner('safe', 'セーフ!');
+    }
+  },
+  // ちっちゃいモードの操作ヒント：人間が攻撃側なら走塁（説明書p19：タッチアップの
+  // 猶予中は「Bで進塁」、仕掛けた走者がいる間は「Aで帰塁」）、守備側なら飛行中は
+  // ファインプレイ（説明書p23：跳べば届く距離にボールがある間だけ「A+方向」）、
+  // 確保中は塁間に走者がいる間だけランダンプレイ（説明書p25：「B+方向」）を画面に
+  // 出す（既存の「意思決定材料は隠さない」方針。状況が変われば消える）。
+  onPlayPrompt: (prompt) => hud.showPlayPrompt(promptLines(prompt)),
+  onSettled: (outcome) => {
+    const wasSteal = stealActive;
+    stealActive = false;
+    // 盗塁の決着でイニングが変わったか（＝3アウト目になったか）を見るために控えておく。
+    // 変わった場合、保留していた投球の判定は捨てる（実際の野球でも、走者が3アウト目に
+    // なった打者は次のイニングに新しいカウントで打ち直す）。
+    const beforeCtx = gameActor.getSnapshot().context;
+    switch (outcome.kind) {
+      case 'foul': {
+        // 打球が出たら走者は塁に戻る＝持ち越したリード（フェーズL-32）は無効になる
+        carriedLeads = {};
+        // バントのファウルだけはファウルの頭打ちが効かない（フェーズAA-48）＝
+        // 2ストライク後は三振。事実は打球（`BattedBall.bunt`）が運んでくるので、
+        // ここは振り分けるだけ。
+        const judgement = outcome.bunt ? 'buntFoul' : 'foul';
+        // 判定コール（フェーズE-23）。ファウルだけは打球のプレー側で決着するので、
+        // ストライク/ボールと違ってここで出す。**三振になる場合は三振のコール**に
+        // 差し替える（`applyPitchCall` と同じ「純粋関数で先読みして演出を一度だけ出す」形で、
+        // **効果音もバナーも1つの帰結につき1つ**）。出さないと、バントを転がしたのに
+        // 打者が消えた理由が画面から読めない。
+        const foulOutcome = applyPitch(beforeCtx.count, judgement);
+        if (foulOutcome.kind === 'strikeout') {
+          sfx.strikeout();
+          hud.playBanner('strikeout', 'バントファウル\nサンシン!');
+        } else {
+          sfx.foul();
+          hud.playBanner('foul', 'ファウル');
+        }
+        gameActor.send({ type: 'PITCH_RESULT', judgement });
+        break;
+      }
+      case 'runnerPlay':
+        // けん制球（説明書p24）・盗塁（説明書p13）の決着。アウト・得点・塁状況だけを
+        // 反映し、カウントと打順には触れない（同じ打者が同じカウントで打席に立ち続ける。
+        // 盗塁のときだけ、この後に保留していた1球ぶんのカウントが進む）。アウト/セーフの
+        // 見せ方は打球のときと同じく onDefenseResult 側で済んでいる。
+        //
+        // **リードはここで次の球へ引き継ぐ**（フェーズL-32）＝早めに帰塁した走者は0、
+        // 耐えた走者は深いまま。これが「けん制で走者を釘付けにする／耐えて走る」という
+        // 読み合いの入れ物で、真実はこの1か所（直近の走塁プレーの終了時の値）だけにある。
+        carriedLeads = outcome.leads;
+        gameActor.send({
+          type: 'RUNNER_PLAY_RESOLVED',
+          outsAdded: outcome.outsAdded,
+          runs: outcome.runs,
+          bases: occupancy(outcome.baseRunners),
+          baseRunners: outcome.baseRunners,
+        });
+        break;
+      case 'result':
+        carriedLeads = {};
+        // 安打・本塁打のバナーはここで（守備プレーのアウト/セーフは onDefenseResult 側で
+        // その都度出しているので、ここでは二重に出さない）。
+        if (outcome.hit) {
+          const banner = HIT_BANNER[outcome.hit];
+          if (outcome.hit === 'homerun') sfx.homerun();
+          else sfx.base();
+          hud.playBanner(banner.kind, banner.text);
+        }
+        gameActor.send({
+          type: 'PLAY_RESOLVED',
+          outsAdded: outcome.outsAdded,
+          runs: outcome.runs,
+          bases: occupancy(outcome.baseRunners),
+          baseRunners: outcome.baseRunners,
+        });
+        break;
+    }
+    modeActor.send({ type: 'PLAY_COMPLETE' });
+
+    // 盗塁中に決着していた投球を、ここでカウントへ反映する（でっかいモードへ戻った後に
+    // 送るのは、死球なら deadBall モードへ遷移するため＝ちっちゃいモードからは遷移できない）。
+    if (wasSteal && pendingPitch) {
+      const pitch = pendingPitch;
+      pendingPitch = null;
+      const after = gameActor.getSnapshot().context;
+      const sameAtBat =
+        after.winner === null &&
+        after.inning === beforeCtx.inning &&
+        after.half === beforeCtx.half;
+      if (sameAtBat) applyPitchCall(pitch.call, pitch.swung);
+    }
+  },
+});
+
+// ヒットストップ：バット接触の瞬間に全体を短時間静止させ、打った手応えを出す
+// （桜井ノウハウ照合の改善対応。静止後のカット自体は瞬時＝原作準拠を維持）。
+// 静止時間は打球初速に比例して延ばす（強い当たりほど重い手応え）。
+const HIT_STOP_BASE_SEC = 0.05;
+const HIT_STOP_PER_SPEED = 0.0015;
+let hitStopRemaining = 0;
+let pendingBatted: BattedBall | null = null;
+
+function hitStopActive(): boolean {
+  return hitStopRemaining > 0;
+}
+
+const batting = createBattingController({
+  batter,
+  // 原作準拠（説明書p14）：Aを押しっぱなしならフルスイング、スイング途中で離すとバント。
+  // バントの方向は十字キー左右で狙う（でっかいモードのカメラは-Z向きなので画面左右＝ワールドX）。
+  // CPUが打者のときは「Aを押しっぱなし」と見なす：isPressed('a') は人間のキー状態なので、
+  // そのまま使うと人間が投球でAを離した瞬間にCPUのスイングまでバントに化けてしまう。
+  // **読むのは攻撃側のパッド**（フェーズD-20）＝2P PLAY では投手側のKがスイングを
+  // 押しっぱなしにすることも、投手側の十字キーがバントの方向を曲げることもない。
+  isSwingHeld: () => !isBattingHuman() || offensePad.isPressed('a'),
+  buntAimX: () => (isBattingHuman() ? offensePad.direction().x : 0),
+  // 押しバント（説明書p17「ファールラインぎりぎりに転がすのがコツ」。フェーズY-46）。
+  // **十字キー上下は打者側でどこにも割り当たっていなかった**ので、新しいキーは増えない
+  // （投球の「上下＝緩急／左右＝コース」と同じ形が、打撃側にもそのまま来る）。
+  // CPU打者はバントしないので、CPUのときは常に false（人間のキー状態を流用しない）。
+  buntPush: () => isBattingHuman() && offensePad.direction().y > 0,
+  // 打席内の立ち位置（説明書p14。フェーズO-36）。**バントの狙う方向と同じ十字キー左右**だが、
+  // 押し分ける必要は無い：立ち位置は打撃動作の外だけ、バントの方向は打撃動作の中だけ効く
+  // （＝原作の多目的ボタン方式と同じで、同じ入力の意味が場面で決まる）。
+  stanceMove: () => (isBattingHuman() ? (offensePad.direction().x as -1 | 0 | 1) : 0),
+  // CPU打者は「直前の球のコースへ芯を合わせる」＝**同じコースへ続けて投げると狙われる**
+  // （人間の投手側に「配球を散らす」という手が生まれる）。人間が打者のときは null。
+  cpuStance: () => (isBattingHuman() ? null : cpuStanceTarget()),
+  // 打者の能力値（長打力・打率）は人間/CPUを問わず同じように打球へ効く
+  batterProfile: currentBattingProfile,
+  // 投手の疲労（フェーズB-11）も同じく打球へ効く：球威が落ちたぶん打球初速が伸びる
+  pitcherFatigue: currentPitcherFatigue,
+  // 打席の左右（BOX）。立ち位置・構え・バットの到達範囲・引っ張り方向をまとめて反転する
+  batterSide: currentBatterSide,
+  // 好調（フェーズD-19）は見た目だけ＝原作どおりバットをクルクル回す。打球への効果は
+  // batterProfile が能力値として運ぶので、ここで二重には効かない。
+  batterHot: currentBatterIsHot,
+  onContact: (batted) => {
+    pitching.abortFlight();
+    // 接触＝この球は終わり（判定を経ずに打ち切られるため onJudged は呼ばれない）。
+    // ここでも次の球のためにCPU投手の狙いをリセットしておく（onJudged と同じ理由）。
+    cpuPitcher.reset();
+    const exitSpeed = Math.hypot(batted.vx, batted.vy, batted.vz);
+    sfx.hit(exitSpeed); // ヒットストップの尺(下記)内で鳴り切るよう短く設計済み（sfx.ts参照）
+    // 接触点でボールを止めて静止表示。カット（BATTED_BALL）は静止明けに送る
+    ball.scale.set(1, 1, 1);
+    ball.position.set(batted.x, batted.y, batted.z);
+    pendingBatted = batted;
+    hitStopRemaining = HIT_STOP_BASE_SEC + HIT_STOP_PER_SPEED * exitSpeed;
+  },
+});
+
+// 打席の左右（BOX）は打者が変わった瞬間に見た目へ反映する（フェーズB-9）。毎フレームの
+// batting.update でも追随するが、判定側（死球ゾーン・銃の命中ゾーン）は状態が変わった
+// その瞬間に切り替わるため、これが無いと「見た目は右打席・判定は左打席」の1フレームが
+// 生じる（実機の全フレーム監視で観測したので塞いだ）。
+// フェーズF-26-6で `subscribeActors` に統合した（購読を試合ごとに張り直す必要が出たため。
+// 呼ばれるのは batting の生成より後＝startGame の中なので、未初期化にはならない）。
+
+// ---- 試合のテンポ：打席の切れ目の「間」（フェーズE-23） ----
+//
+// 原作には打者が代わるとき・攻守が入れ替わるときに明確な「間」がある。従来は3アウト目の
+// 直後や三振の直後に何の予告もなく次の投球が始まっていた。
+//
+// **間は「状態の差分」から導出する**（AtBatMarker）。打席の終わり方は三振/四球/死球/打球/
+// けん制でのイニング終了と複数あり、終わりのイベントを個別に捕まえると必ず取りこぼす
+// （syncPlateAppearance が「1打席1回」の判定に状態を使っているのと同じ理由）。
+//
+// 間を消化するのは**でっかいモードにいる間だけ**。打球のプレー中（ちっちゃいモード）や
+// 死球・乱闘の最中に打順が動いても、でっかいモードへ戻った最初のフレームで差分として
+// 現れるので、そこで初めて間が開く（＝プレーの決着表示と二重に待たせない）。
+let interlude: { kind: InterludeKind; remaining: number } | null = null;
+let lastAtBatMarker: AtBatMarker | null = null;
+
+function interludeActive(): boolean {
+  return interlude !== null;
+}
+
+function atBatMarkerOf(ctx: GameContext): AtBatMarker {
+  return {
+    inning: ctx.inning,
+    half: ctx.half,
+    lineupIndex: ctx.rosters[battingTeam(ctx.half)].lineupIndex,
+    over: ctx.winner !== null,
+  };
+}
+
+/** その「間」に何を見せるか（ただ止まっている時間にしないための中身） */
+function interludeText(kind: InterludeKind, ctx: GameContext): string {
+  if (kind === 'inningChange') {
+    const half = ctx.half === 'top' ? 'オモテ' : 'ウラ';
+    // ラッキー7（フェーズD-19。説明書p17）は**この回に入る瞬間にだけ**言う。攻守交代の間は
+    // もともと「次はどの回か」を見せる場所なので、打線全員が好調になるという回の性質も
+    // ここに置くのが素直（②「間を延ばすときは間に見せるものとセットで設計する」）。
+    // 以降は打者カードの `ゼッコーチョー!` とバットの回転が、打席ごとに同じことを伝える。
+    if (isLuckyInning(ctx.inning)) return `ラッキーセブン!\n${ctx.inning}カイ ${half}`;
+    return `コウタイ\n${ctx.inning}カイ ${half}`;
+  }
+  // 打者交代：何番・どの守備位置の誰が打席に立つか（采配メニューの見出しと同じ粒度）
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  const position = currentBatterPosition(roster);
+  const name = roster.players[currentBatterId(roster)].name;
+  return `${roster.lineupIndex + 1}バン${position ? ` ${position}` : ''}\n${name}`;
+}
+
+function clearInterlude(): void {
+  if (!interlude) return;
+  interlude = null;
+  hud.showInterlude(null);
+}
+
+/**
+ * でっかいモードにいる間だけ毎フレーム呼ぶ。打席が切り替わっていれば「間」を開き、
+ * 進行中なら消化する。true を返している間は投球・けん制・盗塁・銃を止める。
+ */
+function updateInterlude(ctx: GameContext, dt: number): boolean {
+  const marker = atBatMarkerOf(ctx);
+  const kind = lastAtBatMarker ? interludeBetween(lastAtBatMarker, marker) : null;
+  lastAtBatMarker = marker;
+  if (kind) {
+    interlude = { kind, remaining: INTERLUDE_SEC[kind] };
+    hud.showInterlude(interludeText(kind, ctx));
+    // 次の打者が打席へ歩いて入る（間がちょうど終わる頃に打席に収まる）。
+    // 立ち位置（フェーズO-36）も打者ごとに仕切り直す：見た目は startEntrance が 0 へ戻し、
+    // CPUの材料（直前の球のコース）はここで捨てる＝**両方が同じ瞬間に初期化される**。
+    batting.startEntrance(INTERLUDE_SEC[kind]);
+    lastPitch = null;
+  }
+  if (!interlude) return false;
+  interlude.remaining -= dt;
+  if (interlude.remaining > 0) return true;
+  clearInterlude();
+  return false;
+}
+
+// 銃：銃モード中はWASDが照準（gun.update）、Kが発射（gun.fire）。
+// 命中はデッドボールと同じ処理だが、シリアス演出のため一瞬のヒットストップを挟んでから
+// HIT_BY_PITCH/DEAD_BALLを送る（打撃のヒットストップと同じ「手応え」の設計を踏襲）。
+// 命中ゾーンも打者と一緒に動く（右打者は画面左＝三塁側、左打者は画面右へ振らないと当たらない）
+const gun = createGunController({
+  pitcher,
+  // 銃は投手側（守備側）の操作（フェーズD-20）。撃たれる側のWASDで照準が動かない
+  // ＝CPUの予兆と同じ扱い（メインループ側の並び順のコメント参照）。
+  pad: defensePad,
+  reticle,
+  // 銃の部品（フェーズE-25-(e)）。投手は試合ごとに作り直さない1体なので、ここで一度
+  // 持たせるだけでよい（見えるかどうかは銃モードの側が決める）。
+  gun: createProp('Gun'),
+  // 銃は**投げる腕の手**に持つ（フェーズCC-50）＝投球の見た目と食い違わない
+  pitcherArm: currentPitchArm,
+  batterSide: currentBatterSide,
+  // 命中ゾーン＝死球ゾーンなので、打席内の立ち位置にも追従させる（フェーズO-36）＝
+  // 人間が撃つときも「いま打者が立っている場所」を狙うことになる。
+  batterStance: currentBatterStance,
+});
+
+const GUN_HIT_STOP_SEC = 0.3;
+let gunHitStopRemaining = 0;
+let pendingGunHit = false;
+
+function gunHitStopActive(): boolean {
+  return gunHitStopRemaining > 0;
+}
+
+/**
+ * 銃の発射（人間の K・CPUの予兆明けの両方から呼ぶ。フェーズF-26-2）。
+ *
+ * **経路を1本にまとめてある**：撃つ主体が人間かCPUかで、死球の扱い・残弾の消費・
+ * 乱闘への分岐が変わってはいけない（CPUに撃たれたときだけ乱闘に持ち込めない、
+ * といった非対称が生まれると、⑧で決めた「CPUも対等にスキルを持つ」が成立しない）。
+ */
+function fireGun(): void {
+  const result = gun.fire();
+  sfx.gunShot(); // 発射音は命中/外れを問わず鳴る
+  gameActor.send({ type: 'GUN_USED' });
+  if (result === 'hitByPitch') {
+    // 命中：一瞬の静止で「当たった」手応えを出してから死球処理・カット
+    // （DEAD_BALLへの遷移でdekkai.gunを離れるため、モード側の後始末はそちらに任せる）
+    sfx.gunHit(); // シリアス演出：発射音の上に低く重い一撃を追加
+    captureHbpRestoreSnapshot();
+    hud.gunHitFlash();
+    gun.exit();
+    gunHitStopRemaining = GUN_HIT_STOP_SEC;
+    pendingGunHit = true;
+    return;
+  }
+  // 外れ：通常の投球判定と同じ扱い（ストライク/ボール）。
+  // 発射後は命中/外れを問わず構えを解除する（毎回明示的にONにしてから撃つことを
+  // 徹底＝押しっぱなし事故防止・毎打席の明示的なリスク選択という既存方針と同じ理由。
+  // 三振で打席が変わっても銃モードが残り続けない）
+  gameActor.send({ type: 'PITCH_RESULT', judgement: result });
+  modeActor.send({ type: 'GUN_TOGGLE' });
+  gun.exit();
+}
+
+// ---- CPU投手の銃と予兆（フェーズF-26-2。CLAUDE.md ⑧） ----
+//
+// **撃つかどうかの規則は決定的**（`shouldCpuShoot`＝一塁が空いた強打者の打席）で、
+// **構えてから撃つまでに必ず「間」を置く**（`GUN_TELEGRAPH_SEC`）。予兆を挟むのは
+// 桜井ノウハウ「人に反応できない動作をするとすっっごい理不尽感がある」への対応で、
+// 打者側に回避手段が無い（CLAUDE.md ③）以上、**見えていることが唯一の救い**になる。
+// 予兆の間は全アクターを静止させる（ヒットストップと同じ扱い）。
+
+/** 予兆の残り時間。0より大きい間はメインループが全アクターを止める */
+let gunTelegraphRemaining = 0;
+/** CPU投手の銃は1打席1回まで（けん制・盗塁と同じ理由。syncPlateAppearance で戻す） */
+let cpuGunUsed = false;
+
+function gunTelegraphActive(): boolean {
+  return gunTelegraphRemaining > 0;
+}
+
+/**
+ * CPU投手が銃を構えるか判断し、構えるなら予兆を始める（true を返す）。
+ * でっかいモードの ready フェーズ（投球動作に入る前）でだけ呼ぶ。
+ */
+function tryCpuGun(ctx: GameContext): boolean {
+  const fielding = ctx.rosters[fieldingTeam(ctx.half)];
+  const batting = ctx.rosters[battingTeam(ctx.half)];
+  const batterId = currentBatterId(batting);
+  const decision = shouldCpuShoot({
+    ammo: gunRemainingOf(fielding, fielding.pitcher),
+    bases: ctx.bases,
+    // 長打力はスキルの補正込みで読む（`キンニク` で主砲に育った打者は撃たれるようになる）。
+    // **好調（フェーズD-19）も同じ経路で乗る**＝ゼッコーチョーの打者・ラッキー7の打線は
+    // 撃たれやすくなる（敬遠の定石として筋が通っており、規則は決定的なままなので読める）。
+    batterPower: effectiveBatting(batting, batterId, ctx.inning).power,
+    usedThisPlateAppearance: cpuGunUsed,
+  });
+  if (!decision) return false;
+  cpuGunUsed = true;
+  // 人間が撃つときと同じ銃モードへ入る（HUDの「▶ジュウ モード」もそのまま出る＝
+  // 相手が構えていることが、こちらが構えたときと同じ表示で分かる）
+  modeActor.send({ type: 'GUN_TOGGLE' });
+  gun.enter();
+  // 狙いは打者の中心（必中）。予兆の間ずっとレティクルが打者に乗っている＝
+  // 「どこを狙われているか」まで見えている状態で撃たれる
+  // 立ち位置（フェーズO-36）も込みで狙う＝**踏み込んでいる打者にも必中**
+  // （撃たれる側が離れて立っていれば、狙いもその位置へ動く）。
+  gun.aimAt(batterAimX(currentBatterSide(), currentBatterStance()));
+  sfx.gunAim();
+  hud.playBanner('gunAim', `${fielding.players[fielding.pitcher].name}\nジュウヲ カマエタ!`);
+  gunTelegraphRemaining = GUN_TELEGRAPH_SEC;
+  return true;
+}
+
+/**
+ * CPU投手の敬遠（フェーズQ-38。規則は `core/cpuPitcher.ts` の
+ * `shouldCpuIntentionalWalk`＝一塁が空いていて得点圏に走者がいる場面の強打者）。
+ *
+ * **銃（`tryCpuGun`）の後に見る**：どちらも「一塁を与えて強打者を避ける」手だが、
+ * 銃は撃たれた側が乱闘に持ち込める＝投手を退場させに行ける荒っぽい手で、敬遠は
+ * 誰にでもある基本の手。**残弾のあるスキル持ちは先に撃つ**ので、`ジュウ` を引いた
+ * 試合の見せ場が敬遠に食われない（F-26-2の銃が「敬遠の下位互換」にならない）。
+ *
+ * でっかいモードの ready フェーズ（投球動作に入る前）でだけ呼ぶ。**打席がその場で
+ * 終わる**ので「1打席1回」の枷は要らない（けん制・銃と違い、押した瞬間に打者が代わる）。
+ */
+function tryCpuIntentionalWalk(ctx: GameContext): boolean {
+  const batting = ctx.rosters[battingTeam(ctx.half)];
+  const batterId = currentBatterId(batting);
+  // 長打力はスキル・好調の補正込みで読む（銃の判断とまったく同じ経路）＝
+  // **ゼッコーチョーの打者・ラッキー7の打線は歩かされやすくなる**。
+  const decision = shouldCpuIntentionalWalk({
+    bases: ctx.bases,
+    batterPower: effectiveBatting(batting, batterId, ctx.inning).power,
+    nextBatterPower: effectiveBatting(batting, nextBatterId(batting), ctx.inning).power,
+  });
+  if (!decision) return false;
+  declareIntentionalWalk(fieldingTeam(ctx.half));
+  return true;
+}
+
+// 乱闘（v2＝フェーズG-27）：プレイヤーは打者側を操作（K=攻撃／J=ガード／前+J=投げ／
+// コマンド入力で必殺技）、投手側は決定的な固定スクリプトの簡易CPUが動かす
+// （brawlScene.ts内で完結。2P PLAY では投手側も人間＝D-20）。
+// 決着後は死球を巻き戻して同じ打席を継続し（gameActor.BRAWL_RESOLVED）、負けた側の現在の
+// 打者/投手をロスターから永久退場させて控え/ブルペンから自動交代する（セッション7で本実装）。
+// 交代が成立したときだけ、視覚合図として要員を色替えする（控え/ブルペンが尽きていた場合は
+// 没収試合が確定しており交代自体が成立していないため、色替えは出さない）。
+const SUBSTITUTE_PALETTE = [0x33aa88, 0xaa7733, 0x8833aa, 0x669900, 0xcc8822];
+let batterSubs = 0;
+let pitcherSubs = 0;
+
+const brawl = createBrawlController({
+  batter: brawlFighters.batter,
+  pitcher: brawlFighters.pitcher,
+  // 乱闘の打者側＝攻撃側のパッド／投手側＝守備側のパッド（フェーズD-20）。
+  // 1P PLAY では相手側が `NULL_PAD` になるので、CPUスクリプトがそのまま動く。
+  pads: { batter: offensePad, pitcher: defensePad },
+  isHuman: (side) => (side === 'batter' ? isBattingHuman() : isPitchingHuman()),
+  // 投げの空振り（フェーズG-27）は当たっていないので鳴らさない＝**音でも空振りが分かる**
+  // （鳴らすと、掴めたのかどうかが画面より先に音で誤って伝わる）
+  onHit: (hit) => {
+    if (!hit.whiffed) sfx.brawlHit(hit.guarded);
+  },
+  onResolved: (loser: BrawlSide) => {
+    sfx.ko(); // 決着イベント（桜井ノウハウ照合：最大音量クラスに設定、sfx.ts参照）
+    const preRestoreCtx = gameActor.getSnapshot().context;
+    const restore = pendingHbpRestore ?? {
+      count: preRestoreCtx.count,
+      bases: preRestoreCtx.bases,
+      baseRunners: preRestoreCtx.baseRunners,
+      battingLineupIndex: preRestoreCtx.rosters[battingTeam(preRestoreCtx.half)].lineupIndex,
+    };
+    pendingHbpRestore = null;
+    gameActor.send({ type: 'BRAWL_RESOLVED', loser, restore });
+
+    if (gameActor.getSnapshot().context.winner === null) {
+      if (loser === 'batter') {
+        batterSubs += 1;
+        setPlayerColor(batter, SUBSTITUTE_PALETTE[(batterSubs - 1) % SUBSTITUTE_PALETTE.length]);
+      } else {
+        pitcherSubs += 1;
+        setPlayerColor(pitcher, SUBSTITUTE_PALETTE[(pitcherSubs - 1) % SUBSTITUTE_PALETTE.length]);
+      }
+    }
+
+    modeActor.send({ type: 'BRAWL_END' });
+    brawl.exit();
+    hud.setBrawlHint(null);
+  },
+});
+
+// 采配メニュー（セッション9）：Start（ポーズ）で開く、乱闘の強制交代とは独立した任意の
+// 代打/継投。でっかいモードの ready フェーズ（投球動作中でない間）だけ開ける
+// （実際のプロ野球でも投球動作中の交代は無い）。メニューが開いている間はメインループを
+// 静止させ（menuOpenガード）、ゲーム側のA/B/銃キーもチーム選択と同じ理由で二重発火を防ぐ。
+let menuOpen = false;
+
+function canOpenManagerMenu(): boolean {
+  return (
+    gameStarted &&
+    !gameIsOver() &&
+    !hitStopActive() &&
+    !gunHitStopActive() &&
+    !gunTelegraphActive() &&
+    currentMode() === 'dekkai' &&
+    !isGunMode() &&
+    !pitching.isBusy()
+  );
+}
+
+// ---- けん制球（説明書p24「Bで"ちっちゃいモード"に切替→+で塁を指示→A」） ----
+
+/**
+ * けん制モードへ入れるか。投球動作中・銃モード中・ポーズ中は不可（采配メニューと同じ
+ * 「ready フェーズだけ」の条件）。走者がいなければ入る意味がないので入らない。
+ */
+function canStartPickoff(): boolean {
+  const bases = gameActor.getSnapshot().context.bases;
+  return (
+    gameStarted &&
+    !gameIsOver() &&
+    !hitStopActive() &&
+    !gunHitStopActive() &&
+    !gunTelegraphActive() &&
+    !menuOpen &&
+    // 打席の切れ目の「間」（フェーズE-23）の最中は投球も守備の仕掛けも受け付けない
+    !interludeActive() &&
+    currentMode() === 'dekkai' &&
+    !isGunMode() &&
+    !pitching.isBusy() &&
+    (bases.first || bases.second || bases.third)
+  );
+}
+
+function startPickoff(): void {
+  const ctx = gameActor.getSnapshot().context;
+  // 持ち越したリード（フェーズL-32）から始める＝**けん制モードに入り直しても
+  // 走者のリードは0に戻らない**（戻せると、投げずに入り直すだけで走者が耐えて
+  // 勝ち取った深いリードを無効化できてしまう）。
+  fieldPlay.startPickoff(ctx.baseRunners, ctx.outs, resolveCarriedLeads(ctx.baseRunners, carriedLeads));
+  modeActor.send({ type: 'PICKOFF' });
+}
+
+// CPU投手のけん制は1打席1回まで（core/cpuPitcher.ts shouldCpuPickoff の理由参照）。
+// CPU攻撃側の盗塁も同じく1打席1回まで（毎球走られるとテンポが壊れるのと、走者は
+// 1打席に何度も同じ塁を盗めないため）。
+// 打席が変わったかは「イニング・表裏・打者側チームの打順インデックス」の組で判定する
+// （打席の終わり方は三振/四球/死球/打球/イニング終了と複数あるため、終わりのイベントを
+// 個別に捕まえるより、状態から導出するほうが取りこぼしがない）。
+let cpuPickoffUsed = false;
+let cpuStealUsed = false;
+let lastPlateAppearanceKey = '';
+
+/**
+ * けん制・盗塁のプレーが終わった時点の各走者のリード（フェーズL-32）。
+ *
+ * **次の投球の盗塁のスタート位置**であり、けん制モードに入り直したときの開始位置でもある
+ * （`core/fielding.ts` の「リードの持ち越し」の節）。持つのはこの1か所だけで、有効なのは
+ * **同じ打席のあいだ・同じ走者がその塁にいるあいだ**：
+ * - 打席が変わったら捨てる（`syncPlateAppearance`）＝走者は塁に戻って構え直す。
+ * - 打球（ファウル含む）が起きたら捨てる（`onSettled`）＝同じ理由。
+ * - 走者が入れ替わった塁は `resolveCarriedLeads` が識別で弾く（＝捨て忘れても効かない）。
+ */
+let carriedLeads: CarriedLeads = {};
+
+/**
+ * 「球威が落ちた」ことを既に知らせた投手（フェーズB-11）。1人につき一度だけ出す。
+ * 交代した投手は再登板しないので、この集合が試合中に膨らみ続けることはない。
+ */
+const staminaDropAnnounced = new Set<string>();
+
+/**
+ * スタミナが半分を切って球威が落ち始めた瞬間を一度だけ知らせる（フェーズB-11）。
+ *
+ * **打席の切れ目でだけ見る**：投げた直後（飛行中）に出すと、次の球の判断材料ではなく
+ * 目の前のプレーの邪魔になる。打者が代わる「間」（フェーズE-23）に重なるので、
+ * 投手側なら継投を、打者側なら狙い目であることを落ち着いて読める
+ * （＝伸ばした「間」に見せるものを1つ足す形になっている）。
+ */
+function announceStaminaDrop(ctx: GameContext): void {
+  const roster = ctx.rosters[fieldingTeam(ctx.half)];
+  const id = roster.pitcher;
+  if (staminaDropAnnounced.has(id) || fatigueOf(roster, id) <= 0) return;
+  staminaDropAnnounced.add(id);
+  hud.playBanner('stamina', `${roster.players[id].name}\nキュウイ ダウン`);
+}
+
+/**
+ * CPU投手の自動継投（フェーズJ-30。規則は `core/cpuPitcher.ts` の `chooseCpuRelief`）。
+ *
+ * B-11で「CPUの采配はスコープ外」として入れなかったぶん、**試合後半はCPU投手の球威が
+ * 落ちたまま戻らず、人間が攻撃側のときだけ一方的に有利**という非対称が残っていた
+ * （1P PLAY だけの話＝2P PLAY にはCPUがいない）。
+ *
+ * **人間側は自動で代わらない**（采配は人間の取り分）ので、見るのは「投手側がCPUのとき」だけ。
+ * `announceStaminaDrop` と同じく**打席の切れ目でだけ**呼ばれるので、投げている最中に
+ * 投手がすり替わることはなく、E-23の「間」に重なって落ち着いて読める。
+ */
+function tryCpuRelief(ctx: GameContext): void {
+  if (isPitchingHuman()) return;
+  const side = fieldingTeam(ctx.half);
+  const roster = ctx.rosters[side];
+  const index = chooseCpuRelief(
+    {
+      remaining: remainingStaminaOf(roster, roster.pitcher),
+      // **疲れたぶんだけ質が落ちた姿**で比べる（フェーズZ-47）＝控えが格下なら続投する
+      quality: pitcherQualityOf(roster, roster.pitcher),
+    },
+    roster.bullpen.map((id, i) => ({
+      index: i,
+      remaining: remainingStaminaOf(roster, id),
+      reliever: pitcherRole(effectivePitching(roster, id)?.stamina ?? NEUTRAL_RATING) === 'reliever',
+      // 控えは投げていないので疲労0（V-43の持ち越しは人間側だけ）だが、読み方は同じ1本
+      quality: pitcherQualityOf(roster, id),
+    })),
+  );
+  if (index === null) return;
+  const incoming = roster.players[roster.bullpen[index]].name;
+  gameActor.send({ type: 'SUBSTITUTE_PITCHER', side, bullpenIndex: index });
+  // 交代したこと自体を見せる（打者側にとっては「相手の球威が戻った」という判断材料。
+  // 投手カードは refresh で追従するが、切り替わった瞬間は banner でないと見落とす）。
+  hud.playBanner('stamina', `${incoming}\nリリーフ`);
+}
+
+function syncPlateAppearance(ctx: GameContext): void {
+  const key = `${ctx.inning}-${ctx.half}-${ctx.rosters[battingTeam(ctx.half)].lineupIndex}`;
+  if (key === lastPlateAppearanceKey) return;
+  lastPlateAppearanceKey = key;
+  cpuPickoffUsed = false;
+  cpuStealUsed = false;
+  cpuGunUsed = false;
+  // 打席が変われば走者は塁に戻って構え直す＝持ち越したリード（フェーズL-32）も無効になる
+  carriedLeads = {};
+  // 継投を先に見る：代わった投手のスタミナで `announceStaminaDrop` を判断させたいので
+  // （交代した直後に前の投手の「キュウイ ダウン」が出ると、何が起きたのか読めない）。
+  tryCpuRelief(ctx);
+  announceStaminaDrop(gameActor.getSnapshot().context);
+  // 代打を一時効果より先に見る（フェーズX-45）：代打で打者が入れ替わるので、
+  // 逆順だと「退いた投手の札を切ってから代打を送る」ことになって1回ぶん無駄になる。
+  tryCpuPinchHit(gameActor.getSnapshot().context);
+  // 代走は代打の**後**に見る（フェーズGG-54）：どちらも控え（`roster.bench`）を食い合うので、
+  // 順序を決めておかないと「どちらが誰を取るか」が変わる。**代打を先にすると X-45 の
+  // 帰結が1つも動かない**（代打の条件のほうが狭い＝投手の打席・得点圏・能力差0.80）。
+  // 実際にはぶつからないことが多い＝EE-52の計測どおり16球団すべてで「打つ力best」と
+  // 「走力best」は別人なので、たいてい別々の控えが選ばれる。
+  tryCpuPinchRun(gameActor.getSnapshot().context);
+  tryCpuBattingEffect(gameActor.getSnapshot().context);
+}
+
+/**
+ * CPUの代打（フェーズX-45。規則は `core/cpuBatter.ts` の `chooseCpuPinchHitter`）。
+ *
+ * J-30が自動継投を入れて以降も、**攻撃側の采配だけはCPUが一度も行わなかった**
+ * （`SUBSTITUTE_BATTER` は人間の采配メニューからしか送られない）。1P PLAY で人間が
+ * 守備側のとき、CPUは得点圏に走者を置いても投手をそのまま打席に立たせていた。
+ *
+ * `tryCpuRelief` とまったく同じ形＝**打席の切れ目でだけ**呼び、**人間側は自動で
+ * 代わらない**（采配は人間の取り分）。能力値は `effectiveBatting` を通すので、
+ * **スキル（⑧）と好調（D-19）が乗った値**で比べる＝采配メニューが代打候補に好調の印を
+ * 出しているのと同じ材料を、CPUも同じだけ見ていることになる。
+ */
+function tryCpuPinchHit(ctx: GameContext): void {
+  if (isBattingHuman()) return;
+  const side = battingTeam(ctx.half);
+  const roster = ctx.rosters[side];
+  // 投手の打席ではブルペンが要る（守備位置Pを埋められないため。B-10）＝
+  // 采配メニューが「コウホ ナシ」を出すのと同じ1か所を見る。
+  if (!canPinchHit(roster)) return;
+  const index = chooseCpuPinchHitter({
+    pitcherAtBat: isPitcherAtBat(roster),
+    bases: ctx.bases,
+    batter: effectiveBatting(roster, currentBatterId(roster), ctx.inning),
+    bench: roster.bench.map((id, i) => {
+      const stats = effectiveBatting(roster, id, ctx.inning);
+      return { index: i, average: stats.average, power: stats.power };
+    }),
+  });
+  if (index === null) return;
+  const incoming = roster.players[roster.bench[index]].name;
+  gameActor.send({ type: 'SUBSTITUTE_BATTER', side, benchIndex: index });
+  // 交代したこと自体を見せる（`tryCpuRelief` の「リリーフ」と同じ扱い）。打者カードは
+  // refresh で追従するが、切り替わった瞬間はバナーでないと見落とす。
+  hud.playBanner('stamina', `${incoming}\nダイダ`);
+}
+
+/**
+ * CPUの代走（フェーズGG-54。規則は `core/cpuBatter.ts` の `chooseCpuPinchRunner`）。
+ *
+ * `tryCpuPinchHit` とまったく同じ形＝**打席の切れ目でだけ**呼び、**人間側は自動で
+ * 代わらない**（采配は人間の取り分）。
+ *
+ * **見るのは一塁の走者だけ**：R-39が「二塁→三塁の盗塁はどんな俊足でも刺される」ことを
+ * 確定させているので、**足を買っても帯をまたげるのは一塁しかない**
+ * （`npm run balance:pinchrun` の13段目(a)）。塁ごとの分岐ではなく、規則そのものが
+ * そう畳まれている（`chooseCpuPinchRunner` のコメント参照）。
+ *
+ * **走力とリードの渡し方は `cpuStealOptions`（R-39）と同じ**＝「代走を出すと判断した
+ * 前提」と「実際に走るときの計算」が同じ1本の式（`cpuStealDefenseSlack`）から出るので、
+ * 代えたのに走らない／代えなくても走れた、という食い違いが起きない。
+ */
+function tryCpuPinchRun(ctx: GameContext): void {
+  if (isBattingHuman()) return;
+  const side = battingTeam(ctx.half);
+  const roster = ctx.rosters[side];
+  const runnerId = ctx.baseRunners.first;
+  if (runnerId === null || !canPinchRun(roster, runnerId)) return;
+  const leads = resolveCarriedLeads(ctx.baseRunners, carriedLeads);
+  /** その足の走者が一塁から走ったときに守備に残る余裕（秒）＝R-39とまったく同じ式 */
+  const slackOf = (run: number): number =>
+    cpuStealDefenseSlack('first', {
+      speedOf: () => runnerSpeed(run),
+      leadOf: () => leads.first ?? STEAL_LEAD,
+    });
+  const runner = effectiveBatting(roster, runnerId, ctx.inning);
+  const index = chooseCpuPinchRunner({
+    runner: {
+      average: runner.average,
+      power: runner.power,
+      stealSlack: slackOf(runner.run),
+    },
+    bench: roster.bench.map((id, i) => {
+      const stats = effectiveBatting(roster, id, ctx.inning);
+      return {
+        index: i,
+        average: stats.average,
+        power: stats.power,
+        stealSlack: slackOf(stats.run),
+      };
+    }),
+    stealSlackLimit: CPU_STEAL_MAX_DEFENSE_SLACK_SEC,
+  });
+  if (index === null) return;
+  const incoming = roster.players[roster.bench[index]].name;
+  gameActor.send({ type: 'SUBSTITUTE_RUNNER', side, base: 'first', benchIndex: index });
+  // 塁の上の走者が入れ替わったことは状況パネルの走力のバー（FF-53）に出るが、
+  // **切り替わった瞬間はバナーでないと見落とす**（代打・リリーフと同じ扱い）。
+  hud.playBanner('stamina', `${incoming}\nダイソウ`);
+}
+
+/**
+ * CPU打者の一時効果（フェーズM-33。規則は `core/cpuBatter.ts` の
+ * `shouldCpuActivateBattingEffect`）。**打席の頭で一度だけ判断する**＝`tryCpuRelief` と
+ * 同じ場所で、同じ「打席の切れ目」の粒度に揃えてある。
+ *
+ * 人間側は自分で押す（温存の判断は人間の取り分＝F-26-8と同じ切り分け）。
+ */
+function tryCpuBattingEffect(ctx: GameContext): void {
+  const side = battingTeam(ctx.half);
+  if (isBattingHuman()) return;
+  const roster = ctx.rosters[side];
+  const playerId = currentBatterId(roster);
+  if (activatableEffect(roster, playerId, 'batting') === null) return;
+  if (!shouldCpuActivateBattingEffect(ctx.bases)) return;
+  gameActor.send({ type: 'EFFECT_ACTIVATED', side, playerId, role: 'batting' });
+  sfx.skillActivate();
+}
+
+// ---- 盗塁（説明書p13「投球中も走塁操作が可能」） ----
+
+/**
+ * 盗塁を仕掛けられる場面か（＝人間が攻撃側で、走者がいて、でっかいモードにいる）。
+ * 投球中かどうかはここでは見ない：投球前に押した場合は「ボールを持った投手の前で
+ * スタートを切る」＝けん制のにらみ合いへ移る（startSteal 参照）ので、どちらも成立する。
+ */
+function canStartSteal(): boolean {
+  const bases = gameActor.getSnapshot().context.bases;
+  return dekkaiOffenseOpen() && (bases.first || bases.second || bases.third);
+}
+
+/**
+ * でっかいモードで人間の攻撃側が拡張操作（盗塁・一時効果）を出せる場面か。
+ * **画面が止まっている間はどれも動かない**という `onGun` の共通ガードと同じ条件で、
+ * ヒントの出し分けもここを見る（見えている操作と効く操作を1か所から出す）。
+ */
+function dekkaiOffenseOpen(): boolean {
+  return (
+    gameStarted &&
+    !gameIsOver() &&
+    !hitStopActive() &&
+    !gunHitStopActive() &&
+    !gunTelegraphActive() &&
+    !menuOpen &&
+    !interludeActive() &&
+    currentMode() === 'dekkai' &&
+    !isGunMode()
+  );
+}
+
+/**
+ * CPU攻撃側の盗塁判断（`chooseCpuSteals`）に渡す、走者ごとの事情（フェーズR-39）。
+ *
+ * **どちらも既にこの場にある値**をそのまま渡すだけで、新しい状態は持たない：走力は
+ * 走者の速さの唯一の出どころ（`runnerSpeedOf`＝スキル・代走込みの派生ビュー）、リードは
+ * `startSteal` が実際のスタート位置として渡すのと**同じ `resolveCarriedLeads` の結果**。
+ * こうしておくと「走ると判断した前提」と「実際に走る位置」が構造的に食い違わない。
+ */
+function cpuStealOptions(ctx: GameContext): CpuStealOptions {
+  const leads = resolveCarriedLeads(ctx.baseRunners, carriedLeads);
+  return {
+    speedOf: (from) => {
+      const id = ctx.baseRunners[from];
+      return id === null ? runnerSpeed(NEUTRAL_RATING) : runnerSpeedOf(id);
+    },
+    leadOf: (from) => leads[from] ?? STEAL_LEAD,
+  };
+}
+
+/**
+ * 盗塁のスタートを切る（人間の攻撃側のB、またはCPU攻撃側の判断から呼ぶ）。
+ *
+ * **投球中（ワインドアップ〜飛行中）なら盗塁**：ちっちゃいモードへ切り替え、捕手が
+ * 投球を捕って投げるまでの時間との競争になる（fieldPlay.startSteal）。仕掛けた瞬間の
+ * 投球の残り時間（pitching.timeToCatcher）がそのまま走者の持ち時間なので、**モーションを
+ * 見てすぐ走れば間に合い、遅れれば刺される**。
+ *
+ * **投球前なら、けん制のにらみ合いへ**：投手はまだボールを持っているので、走り出した
+ * 走者はその塁へ投げられて刺される（実際の野球で「投手が投げるまで走れない」のと同じ）。
+ * 既存のけん制の経路（startPickoff＋進塁）をそのまま使う。
+ *
+ * target は人間なら十字キーの絶対塁指定（**無指定＝走れる走者全員のダブルスチール**。
+ * フェーズL-32）、CPUなら `chooseCpuSteals` が返す起点の塁の配列。
+ */
+function startSteal(target: BaseKey | null | Array<'first' | 'second' | 'third'>): void {
+  const ctx = gameActor.getSnapshot().context;
+  if (pitching.isPitchLive()) {
+    if (
+      !fieldPlay.startSteal(
+        ctx.baseRunners,
+        ctx.outs,
+        target,
+        pitching.timeToCatcher(),
+        // 直前のけん制で残ったリード（フェーズL-32）がスタート位置になる。
+        // 早めに帰塁していれば浅く（＝走れない）、耐えていれば深い（＝走れる）。
+        resolveCarriedLeads(ctx.baseRunners, carriedLeads),
+      )
+    ) {
+      return;
+    }
+    // 投球はこのまま裏で進み、カウントとして決着する（判定は盗塁の決着後に反映）。
+    // ボールメッシュはちっちゃいモード側（捕手への投球→塁への送球）が使う。
+    pitching.detachBall();
+    stealActive = true;
+    modeActor.send({ type: 'STEAL' });
+    return;
+  }
+  // 投球前：投手がボールを持ったままのけん制のにらみ合いに、走者だけが走り出した状態
+  // （持ち越したリードはこちらの入口でも同じように効く）
+  fieldPlay.startPickoff(ctx.baseRunners, ctx.outs, resolveCarriedLeads(ctx.baseRunners, carriedLeads));
+  fieldPlay.sendRunner();
+  modeActor.send({ type: 'PICKOFF' });
+}
+
+/**
+ * でっかいモードで人間の攻撃側にできる操作を知らせる（既存の「意思決定材料は隠さない」
+ * 方針。新しい操作は見えないと存在しないのと同じ）。
+ *
+ * 出るのは2つ：**盗塁**（走者がいるとき）と、**一時効果**（切れる札を持っているとき。
+ * フェーズM-33）。**両方同時に出る**＝どちらかを優先して隠すと、走者を置いた場面
+ * （＝一時効果を切りたい場面そのもの）で必ず片方が消える。ヒントの並びは配列なので、
+ * ちっちゃいモードが守備側・攻撃側の2本を並べるのと同じ形で足せる。
+ *
+ * 操作ヒントの表示チャンネルはちっちゃいモードのフィールドプレー（onPlayPrompt）と
+ * 共用なので、こちらはでっかいモードにいる間だけ出し、状態が変わったときにだけ呼ぶ。
+ */
+let dekkaiPromptShown = '';
+
+function syncStealPrompt(): void {
+  const open = !fieldPlay.isActive() && isBattingHuman() && dekkaiOffenseOpen();
+  const kinds: PlayPromptKind[] = [];
+  // 一時効果を先に出す：**押せる場面が圧倒的に少ない**札なので、案内が隠れると
+  // 存在ごと忘れられる（盗塁は走者がいる限りいつでも出る標準操作）。
+  // 押しバント（フェーズY-46）を先頭に出す：**バットを出している間だけの短い窓**で、
+  // かつ方向を外すと損をする操作なので、他の常時出るヒントに埋もれさせない
+  // （H-28の `ヒットエンドラン!` を短い窓の間だけ出すのと同じ扱い）。
+  // 出す条件は他の2つと同じ `open`＝**ちっちゃいモードのプレー中は出さない**
+  // （ヒントの表示チャンネルは1つなので、フィールドプレー側の案内と取り合わない）。
+  // 2ストライクでは文言だけ差し替える（フェーズAA-48。押せる操作は同じ）＝
+  // **ファウルが三振になるのはこのカウントだけ**なので、それ以外では1行も増えない
+  // （銃の残弾・持ち越したリード・ゼッコーチョーと同じ「無いときは出さない」扱い）。
+  if (open && batting.isBunting()) {
+    const twoStrikes = gameActor.getSnapshot().context.count.strikes >= STRIKES_FOR_OUT - 1;
+    kinds.push(twoStrikes ? 'buntTwoStrikes' : 'bunt');
+  }
+  if (open && battingEffectReady() !== null) kinds.push('battingEffect');
+  if (open && canStartSteal()) kinds.push('steal');
+  // 中身が変わったときだけ書き換える（毎フレームHUDを組み直さないための既存の作法）
+  const key = kinds.join(',');
+  if (key === dekkaiPromptShown) return;
+  dekkaiPromptShown = key;
+  const player = offensePlayerNow();
+  hud.showPlayPrompt(
+    kinds.map((kind) => ({ kind, player: isTwoPlayer(controllers) ? player : null })),
+  );
+}
+
+/**
+ * ちっちゃいモードのヒント（守備側・攻撃側の対）を、HUDに出す行の並びへ落とす
+ * （フェーズD-20）。**誰への案内かはここで決める**：シーン側は「守備側の案内／攻撃側の
+ * 案内」しか知らず、それがどちらのプレイヤーのものかを知っているのは main.ts だけ
+ * （能力値の解決を main.ts に集約しているのと同じ分担）。
+ *
+ * 1P PLAY では `player: null` を渡す＝行頭のラベルもキー名の読み替えも付かない
+ * ＝D-20より前とまったく同じ表示になる。
+ */
+function promptLines(prompt: PlayPrompt): PlayPromptLine[] {
+  const twoPlayer = isTwoPlayer(controllers);
+  const lines: PlayPromptLine[] = [];
+  const add = (kind: PlayPromptKind | null, player: PlayerSlot | null): void => {
+    if (kind === null) return;
+    lines.push({ kind, player: twoPlayer ? player : null });
+  };
+  add(prompt.defense, defensePlayerNow());
+  add(prompt.offense, offensePlayerNow());
+  return lines;
+}
+
+// ---- ちっちゃいモードの追従カメラ（フェーズE-24） ----
+
+/** 走者を指す印の投影に使う高さ（足元ではなく体のあたりを指す）。 */
+const RUNNER_MARKER_HEIGHT = 0.6;
+/** 画面外マーカーを画面端からどれだけ内側に置くか（画面の3%内側） */
+const EDGE_MARKER_MARGIN = 0.06;
+/** 投影の作業用ベクトル（毎フレーム確保しないよう使い回す） */
+const projected = new THREE.Vector3();
+
+/**
+ * 追従カメラと画面外マーカーを1フレーム分進める（フェーズE-24）。
+ *
+ * **フィールドプレーの更新より後に呼ぶ**（動いた後のボール・走者の位置で追う）。
+ * プレー外では focus が null になり、リグはそれを「次のプレーは瞬時に合わせる」の
+ * 合図として使う＝モードの切り替えが瞬時カット（原作準拠）であることと辻褄が合う。
+ */
+function syncChicchaiCamera(dt: number): void {
+  const focus = fieldPlay.cameraFocus();
+  chicchaiRig.update(focus, dt);
+  if (focus === null || currentMode() !== 'chicchai') {
+    hud.showRunnerMarkers([]);
+    return;
+  }
+  const markers: EdgeMarker[] = [];
+  for (const p of fieldPlay.markedRunners()) {
+    projected.set(p.x, RUNNER_MARKER_HEIGHT, p.z).project(chicchaiCamera);
+    const marker = edgeMarker(projected, EDGE_MARKER_MARGIN);
+    if (marker) markers.push(marker);
+  }
+  hud.showRunnerMarkers(markers);
+}
+
+// ---- ローグライトのスキル抽選（フェーズF-26-1。CLAUDE.md ⑧） ----
+//
+// **その回の攻撃が始まる前に、攻撃側が1つ引く**（1回表・1回裏も含むので両チーム9回ずつで
+// 完全に対称）。イニングの表裏が切り替わった最初のフレームで検出する＝E-23の「間」を
+// 状態の差分から導出しているのと同じ考え方で、抽選のイベントを個別に捕まえに行かない。
+//
+// 人間側は3択画面（試合を止める。采配メニューと同じ扱い）、CPU側は決定的な規則で即決し、
+// **何を取ったかは必ずバナーで見せる**（相手の手の内を隠すと、こちらの采配の判断材料が
+// 欠ける＝既存の「意思決定材料は隠さない」方針）。
+let draftOpen = false;
+/** 最後に抽選を起こしたイニングの表裏（同じ回で二重に引かないための目印） */
+let lastDraftMarker: string | null = null;
+
+function draftMarkerOf(ctx: GameContext): string {
+  return `${ctx.inning}-${ctx.half}`;
+}
+
+/**
+ * CPU側の抽選を決定的に解決する（乱数は引かない。規則は skills.ts の cpuChooseSkill）。
+ *
+ * **リロールも決定的な規則で使う**（フェーズU-42。`shouldCpuReroll`＝★2以上が1枚も
+ * 無ければ引き直す）。**CPUは温存しない**（F-26-8と同じ）＝規則が言うたびに切り、
+ * 回数券が尽きたら黙る。`SKILL_DRAFT_REROLLED` は残りが無ければ何も起こさないので、
+ * ここは「言う限り送る」だけでよい（送った回数と実際に減った回数は状態の側が決める）。
+ */
+function resolveCpuDraft(ctx: GameContext, side: TeamSide): void {
+  let current = ctx;
+  let pending = current.pendingDraft;
+  if (!pending) return;
+  while (rerollsLeftOf(current, side) > 0 && shouldCpuReroll(pending.draft)) {
+    gameActor.send({ type: 'SKILL_DRAFT_REROLLED', side });
+    const next = gameActor.getSnapshot().context;
+    // 引き直せなかった（＝候補が作れない等で状態が動かなかった）ら、そこで打ち切る
+    if (next.rerollsUsed[side] === current.rerollsUsed[side]) break;
+    current = next;
+    if (!current.pendingDraft) return;
+    pending = current.pendingDraft;
+  }
+  const roster = current.rosters[side];
+  const picked = cpuChooseSkill(pending.draft, skillHoldersOf(roster));
+  if (!picked) {
+    // 付けられる選手がいない＝提示を畳むだけ（存在しない選手IDを送って握りつぶさせる
+    // のではなく、意図を明示して畳む）
+    gameActor.send({ type: 'SKILL_GRANTED', side, playerId: '', skillId: pending.draft.options[0] });
+    return;
+  }
+  gameActor.send({
+    type: 'SKILL_GRANTED',
+    side,
+    playerId: picked.holderId,
+    skillId: picked.skillId,
+  });
+  hud.playBanner(
+    'stamina',
+    `アイテ ノ スキル\n${roster.players[picked.holderId].name} ${skillDef(picked.skillId).name}`,
+  );
+}
+
+/**
+ * でっかいモードにいる間だけ毎フレーム呼ぶ。イニングの表裏が変わっていれば抽選を起こす。
+ * **true を返している間は3択画面が開いている**＝呼び出し側は全アクターを静止させる。
+ */
+function syncSkillDraft(ctx: GameContext): boolean {
+  if (draftOpen) return true;
+  if (gameIsOver()) return false;
+  const marker = draftMarkerOf(ctx);
+  if (marker === lastDraftMarker) return false;
+  lastDraftMarker = marker;
+
+  gameActor.send({ type: 'SKILL_DRAFT_DRAWN' });
+  const drawn = gameActor.getSnapshot().context;
+  const pending = drawn.pendingDraft;
+  // 候補が1つも作れなければ（全員の枠が埋まった等）抽選そのものが起きない
+  if (!pending) return false;
+
+  // その回の攻撃側を操作しているのが人間なら3択画面、CPUなら決定的な規則で即決する
+  // （フェーズD-20：2P PLAY では両チームとも人間が引く＝⑧の対等がそのまま人対人になる）。
+  const player = playerOfSide(controllers, pending.side);
+  if (player === null) {
+    resolveCpuDraft(drawn, pending.side);
+    return false;
+  }
+
+  draftOpen = true;
+  const roster = drawn.rosters[pending.side];
+  runSkillDraft(app, pads[player], {
+    draft: pending.draft,
+    roster,
+    teamName: roster.team.name,
+    lineages: drawn.lineages,
+    rerollsLeft: rerollsLeftOf(drawn, pending.side),
+    // リロール（フェーズU-42）＝**引き直すのは状態の側**（乱数も回数券も gameMachine が
+    // 持つ）。UIは押されたことだけを伝え、新しい3択と残り回数を受け取る。
+    // 引き直せなければ `null` を返す＝UIは何も変えない（回数券も減らない）。
+    reroll: () => {
+      // **直前の状態と比べる**（画面を開いた時点ではない）＝2回目以降のリロールでも
+      // 「実際に引き直せたか」を正しく見分けられる
+      const before = gameActor.getSnapshot().context;
+      gameActor.send({ type: 'SKILL_DRAFT_REROLLED', side: pending.side });
+      const next = gameActor.getSnapshot().context;
+      if (next.rerollsUsed[pending.side] === before.rerollsUsed[pending.side]) return null;
+      if (!next.pendingDraft || next.pendingDraft.side !== pending.side) return null;
+      return {
+        draft: next.pendingDraft.draft,
+        left: rerollsLeftOf(next, pending.side),
+      };
+    },
+  }).then((choice) => {
+    gameActor.send({
+      type: 'SKILL_GRANTED',
+      side: pending.side,
+      playerId: choice.playerId,
+      skillId: choice.skillId,
+    });
+    draftOpen = false;
+  });
+  return true;
+}
+
+// ---- ラン：試合をまたぐ蓄積（フェーズF-26-6。CLAUDE.md ⑧） ----
+//
+// **5試合の勝ち抜き**。試合が決着するたびにここへ戻ってきて、勝っていれば次の相手を
+// 選んで**アクターを作り直す**（1試合＝1組のアクター。上の「ステートマシン起動」参照）。
+// 持ち越すのは `TeamRoster.skills` だけで、投球数・退場・好調・カウントは新しい試合の
+// ぶんが最初から組み直される（＝毎試合スタミナも控えも全員そろった状態から始まる）。
+
+/** 1試合を始めるのに要るものすべて（`MATCH_SETUP` に渡す内容＋球場） */
+interface GameSetup {
+  away: TeamId;
+  home: TeamId;
+  plans: Partial<Record<TeamSide, RosterPlan>>;
+  seed: number;
+  skills: Partial<Record<TeamSide, CarriedSkills>>;
+  /**
+   * 消費型スキルの使用回数（フェーズF-26-8）。**人間側だけが持ち越す**：CPU側は毎試合
+   * `preloadedSkills` で組み直される新しいロスターなので、使った回数は残らない
+   * （相手は「ここまでの試合数ぶんの蓄積」であって、同じ選手が5試合を戦い抜くわけではない）。
+   */
+  uses: Partial<Record<TeamSide, CarriedUses>>;
+  /**
+   * リロールをここまでに使った回数（フェーズU-42）。**両側とも持ち越す**：人間側は
+   * ランの記録から、CPU側は `preloadedSkills` が過去の試合ぶんの蓄積を作るときに
+   * 使ったぶんから（＝人間とまったく同じ資源のもとで蓄積している＝⑧の「CPUも対等」）。
+   */
+  rerolls: Partial<Record<TeamSide, number>>;
+  /**
+   * 前の試合までに投げた球数（フェーズV-43の疲労の持ち越し）。**人間側だけが持ち越す**
+   * ＝`uses` とまったく同じ理由で、CPU側は毎試合 `preloadedSkills` が組み直す新しい
+   * ロスターなので前の試合の球数が残らない（相手は「ここまでの試合数ぶんの蓄積」であって、
+   * 同じ投手陣が5試合を投げ抜くわけではない）。**CPUのローテーション（R-39）は
+   * `cpuStarterIndex` が先発型4人を順に回すので、そもそも連投しない。**
+   */
+  fatigue: Partial<Record<TeamSide, CarriedFatigue>>;
+  park: BallparkId;
+}
+
+/**
+ * ランの今の試合を `MATCH_SETUP` に渡せる形へ落とす。
+ *
+ * **相手のスキルはここで組み立てる**（`preloadedSkills`）＝「相手もここまでの試合数ぶん
+ * 蓄積している」（⑧のCPU対等）を、gameMachine ではなくランの側の規則として持つ。
+ * 人間側は前の試合から持ち越したものをそのまま渡す。
+ */
+function gameSetupOf(state: RunState): GameSetup {
+  const cpuSide = opponent(state.side);
+  const preloaded = preloadedSkills({
+    team: state.current.opponent,
+    seed: state.current.seed,
+    game: state.game,
+  });
+  return {
+    away: state.side === 'away' ? state.teamId : state.current.opponent,
+    home: state.side === 'home' ? state.teamId : state.current.opponent,
+    // 試合前の采配（C-15）。人間側は自分で決めたもの、**CPU側は先発だけ規則で決める**
+    // （フェーズR-39の `cpuRosterPlan`＝先発型4人を試合ごとに回す。打順は計測の結論で
+    // 名鑑どおり）。それまでCPUは毎試合かならず名鑑の先頭の投手を先発させていた。
+    plans: { [state.side]: state.plan, [cpuSide]: cpuRosterPlan(state.game) },
+    seed: state.current.seed,
+    skills: {
+      [state.side]: state.skills,
+      [cpuSide]: preloaded.skills,
+    },
+    uses: { [state.side]: state.uses },
+    rerolls: { [state.side]: state.rerollsUsed, [cpuSide]: preloaded.rerollsUsed },
+    fatigue: { [state.side]: state.fatigue },
+    park: state.current.park,
+  };
+}
+
+/**
+ * 試合をまたいで残ってはいけない一時状態を全部畳む。**アクターの外にある「この試合の
+ * 覚え書き」がここに集まっている**（1打席1回の使用済みフラグ・間・抽選の目印・
+ * 決着待ちの保留）ので、新しい試合を始める前にまとめて戻す。
+ */
+function resetPerGameState(): void {
+  winAnnounced = false;
+  resultPauseRemaining = 0;
+  lastDraftMarker = null;
+  lastAtBatMarker = null;
+  clearInterlude();
+  lastPlateAppearanceKey = '';
+  cpuPickoffUsed = false;
+  cpuStealUsed = false;
+  cpuGunUsed = false;
+  staminaDropAnnounced.clear();
+  stealActive = false;
+  carriedLeads = {};
+  pendingPitch = null;
+  pendingBatted = null;
+  pendingGunHit = false;
+  pendingHbpRestore = null;
+  hitStopRemaining = 0;
+  gunHitStopRemaining = 0;
+  gunTelegraphRemaining = 0;
+  dekkaiPromptShown = '';
+  hud.showPlayPrompt([]);
+  gun.exit();
+  // 乱闘の交代で色替えした要員を既定色へ戻す（新しい試合は名鑑どおりの顔ぶれから）
+  batterSubs = 0;
+  pitcherSubs = 0;
+  setPlayerColor(batter, BATTER_COLOR);
+  setPlayerColor(pitcher, PITCHER_COLOR);
+}
+
+/**
+ * 1試合を始める。**アクターを作り直して購読を張り直す**のがランの要点で、
+ * `MATCH_SETUP` が「まだ1球も投げていないときだけ効く」（`isPreGame`）という既存の
+ * 成立条件も、作りたてのアクターなら必ず満たされる。
+ */
+function startGame(setup: GameSetup): void {
+  gameActor.stop();
+  modeActor.stop();
+  gameActor = createActor(gameMachine).start();
+  modeActor = createActor(modeMachine).start();
+  subscribeActors();
+  resetPerGameState();
+  applyBallpark(setup.park);
+  gameActor.send({
+    type: 'MATCH_SETUP',
+    away: setup.away,
+    home: setup.home,
+    plans: setup.plans,
+    seed: setup.seed,
+    skills: setup.skills,
+    uses: setup.uses,
+    rerolls: setup.rerolls,
+    fatigue: setup.fatigue,
+  });
+  refresh();
+}
+
+/**
+ * チーム選択の結果から試合を始める（起動時と、ラン／2Pの試合が終わった後の再挑戦）。
+ *
+ * **1P PLAY はラン（5試合の勝ち抜き。フェーズF-26-6）、2P PLAY は1試合完結**
+ * （2026-07-31 ユーザー判断）。ランは「人間側が1つだけ」を前提に組んである
+ * （扉で次の相手を選ぶ・相手はCPU規則で蓄積済み・持ち越すのは人間側のスキルだけ）ので、
+ * 両側が人間の 2P PLAY をそこへ通すと意味が壊れる。**2P はランを作らない**
+ * （`run = null`）＝スコアボードの `ラン n/5` の行も出ない。
+ */
+function startMatch(selection: MatchSelection): void {
+  controllers = controllersFor(selection.mode, selection.humanSide);
+  if (selection.mode === '2p') {
+    run = null;
+    twoPlayerMatch = { away: selection.away, home: selection.home };
+    startGame({
+      away: selection.away,
+      home: selection.home,
+      // 試合前の采配は**両側ぶん**（フェーズC-15の `plans` は最初から両側を持てる形）
+      plans: selection.plans,
+      // シードは実プレイなので時刻から（系統の絞り込み・絶好調選手がここから決まる）
+      seed: Date.now(),
+      skills: {},
+      uses: {},
+      // 2P PLAY はランの外＝1試合完結（D-20）なので、リロールの回数券は**両者とも満タン**
+      // から始まる（`REROLLS_PER_RUN` をその1試合で使い切る）。
+      rerolls: {},
+      // 同じ理由で**投手も両者とも無傷**（V-43の疲労の持ち越しはランの仕組み）。
+      fatigue: {},
+      park: selection.park,
+    });
+  } else {
+    twoPlayerMatch = null;
+    run = createRun({
+      // ランのシード（フェーズF-26-1と同じく**実プレイだけ時刻から取る**）。ここから
+      // 5試合ぶんの相手・球場・系統・好調・抽選がすべて決まる。
+      seed: Date.now(),
+      teamId: selection.humanSide === 'away' ? selection.away : selection.home,
+      side: selection.humanSide,
+      plan: selection.plans[selection.humanSide] ?? DEFAULT_ROSTER_PLAN,
+      opponent: selection.humanSide === 'away' ? selection.home : selection.away,
+      park: selection.park,
+    });
+    startGame(gameSetupOf(run));
+  }
+  gameStarted = true;
+  hudRoot.style.display = '';
+}
+
+
+/** ランの成果（「ムラセ: キンニク ネバリ」の並び）。終了画面で見せる */
+function runBuildLines(): string[] {
+  if (!run) return [];
+  const roster = gameActor.getSnapshot().context.rosters[run.side];
+  return Object.keys(roster.skills)
+    .filter((id) => roster.skills[id].length > 0)
+    .map((id) => {
+      const names = roster.skills[id].map((skillId) => skillDef(skillId).name).join(' ');
+      return `${roster.players[id]?.name ?? id}: ${names}`;
+    });
+}
+
+/**
+ * 2P PLAY の試合結果（フェーズD-20）。**ランの外＝1試合完結**なので、勝った側を見せて
+ * チーム選択へ戻すだけ（勝敗・持ち越し・扉は無い）。
+ */
+async function openMatchEndScreen(): Promise<void> {
+  const card = twoPlayerMatch;
+  if (!card) return;
+  runScreenOpen = true;
+  const ctx = gameActor.getSnapshot().context;
+  const winner = ctx.winner;
+  // 勝った側がどちらのプレイヤーだったかを出す（攻守は表裏で入れ替わるので、
+  // 「どちらが勝ったか」は球団名だけでは読み取りにくい）。
+  const winnerPlayer = winner === null ? null : playerOfSide(controllers, winner);
+  await matchEnd(app, anyPad, {
+    headline:
+      winnerPlayer === null
+        ? 'ヒキワケ'
+        : `${winnerPlayer === 'p1' ? '1P' : '2P'} ノ カチ!`,
+    score: `${ctx.rosters.away.team.short} ${ctx.score.away} - ${ctx.score.home} ${ctx.rosters.home.team.short}`,
+    lines: [
+      `1P: ${ctx.rosters[sideOfPlayer(controllers, 'p1') ?? 'away'].team.name}`,
+      `2P: ${ctx.rosters[sideOfPlayer(controllers, 'p2') ?? 'home'].team.name}`,
+    ],
+  });
+  hudRoot.style.display = 'none';
+  const selection = await runTeamSelect(app, pads);
+  startMatch(selection);
+  runScreenOpen = false;
+}
+
+/**
+ * 試合の決着をランに反映して、次の相手を選ばせる（勝ったとき）か、ランを終える。
+ * **開いている間は `runScreenOpen` で全アクターを止める**（采配メニュー・抽選画面と同じ扱い）。
+ */
+async function openRunScreen(): Promise<void> {
+  // 2P PLAY はランの外（フェーズD-20）＝こちらの経路で結果を見せる
+  if (run === null) {
+    await openMatchEndScreen();
+    return;
+  }
+  const finished = run;
+  runScreenOpen = true;
+  const ctx = gameActor.getSnapshot().context;
+  const won = ctx.winner === finished.side;
+  // **勝敗を記録する前に問う**（記録した後は「負けた」という事実が勝ち数の差にしか残らない）
+  const outcome = runOutcomeAfter(finished, won);
+  // 持ち越すのは**この試合を戦い抜いたロスターのスキル**（退場者のぶんも含めて残す＝
+  // 乱闘で退場した選手も次の試合には戻ってくるので、そのスキルも一緒に戻る）。
+  const carried = ctx.rosters[finished.side].skills;
+  // 消費型のチャージも一緒に持ち越す（F-26-8）＝**ラン全体で使い切り**。ここを渡さないと
+  // 試合ごとに全回復し、「温存する／しない」の判断が成立しなくなる。
+  const carriedUses = ctx.rosters[finished.side].skillUses;
+  // リロールの回数券も同じく持ち越す（フェーズU-42）＝**ラン全体で使い切り**。
+  // 真実は「使った数」の側なので、試合中に増えた `rerollsUsed` をそのまま書き戻す。
+  const carriedRerolls = ctx.rerollsUsed[finished.side];
+  // 投手の疲れ（フェーズV-43）。**この試合の投球数から休養ぶんを引いた残り**で、
+  // 投げなかった投手は前の試合の持ち越しが減るだけ＝`restedPitchCounts` 1本で
+  // 「積む」と「戻す」が閉じる。ここを渡さないと毎試合全快し、先発を選び直せる意味
+  // （＝毎試合エースが支配戦略にならないこと）が消える。
+  const carriedFatigue = restedPitchCounts(ctx.rosters[finished.side]);
+  const state = withGameResult(finished, won);
+  run = state;
+  // 勝ち数はHUDのスコアボードにも出ているので、記録したその場で描き直す（アクターの
+  // 状態は変わらないため購読は走らない＝これが無いと勝った試合のぶんだけ表示が遅れる）。
+  refresh();
+
+  if (outcome === 'continue') {
+    const doors = runDoors(state);
+    // 次の相手が持ってくるスキルの数（＝相手も同じだけ蓄積している、の可視化）。
+    // どちらの扉でも試合数は同じなので、代表して先頭の扉で数える。
+    const preview = preloadedSkills({
+      team: doors[0].opponent,
+      seed: doors[0].seed,
+      game: state.game + 1,
+    });
+    const index = await runNextSelect(app, pads.p1, {
+      headline: `${state.game}シアイメ カチ!`,
+      score: `${ctx.rosters.away.team.short} ${ctx.score.away} - ${ctx.score.home} ${ctx.rosters.home.team.short}`,
+      progress: `ツギハ ${state.game + 1}/${RUN_GAMES} シアイメ`,
+      opponentSkills: skillCount(preview.skills),
+      // 温存の判断（フェーズU-42）はここでする＝次の試合へ何回持っていけるかを見せる
+      rerollsLeft: rerollsLeft(carriedRerolls),
+      doors,
+    });
+    // 試合と試合の間の采配（フェーズV-43）＝**先発の選び直しと打順の組み直し**。
+    // **扉を選んだ後**に置く：誰に投げさせるかは「次の相手・球場」が決まってからでないと
+    // 決められない（C-15が采配を球団・球場の後に置いたのとまったく同じ理由）。
+    // 残量も能力値も**次の試合と同じ手順で組んだ1つのロスター**から読む（`nextGameRoster`）
+    // ＝画面の数字と試合の中身が一致する（投手陣＝DD-51／打線＝EE-52）。
+    const door = doors[index];
+    const plan = await runRosterPlanSelect(app, pads.p1, {
+      teamId: state.teamId,
+      plan: state.plan,
+      carried: { skills: carried, uses: carriedUses, fatigue: carriedFatigue },
+      headline: `${state.game + 1}シアイメ`,
+    });
+    run = withNextGame(state, door, carried, carriedUses, carriedRerolls, carriedFatigue, plan);
+    startGame(gameSetupOf(run));
+    runScreenOpen = false;
+    return;
+  }
+
+  await runEnd(app, pads.p1, {
+    cleared: outcome === 'clear',
+    game: state.game,
+    wins: state.wins,
+    total: RUN_GAMES,
+    build: runBuildLines(),
+  });
+  // 新しいランはチーム選択からやり直す（保存はしない＝セッション内だけのラン）。
+  hudRoot.style.display = 'none';
+  const selection = await runTeamSelect(app, pads);
+  startMatch(selection);
+  runScreenOpen = false;
+}
+
+// ---- 入力ハンドラ（フェーズD-20：プレイヤーごとに1回ずつ登録する） ----
+//
+// **押したのが誰かで役割が決まる**（`roleOfPlayer`）。D-20より前は「人間は1人」だったので
+// `isPitchingHuman()` を見れば押した人の役割まで決まったが、2P PLAY では同じキー（A）が
+// 1Pには投球・2Pには打撃を意味する。押下ハンドラをプレイヤーごとに登録し、その人の役割で
+// 分岐させることで、**同じ場面で2人が別々の操作を同時にできる**（投げながら振れる）。
+
+function onStart(player: PlayerSlot): void {
+  if (menuOpen || draftOpen || runScreenOpen || !canOpenManagerMenu()) return;
+  // 采配メニューは「押した人がいま担っている役割」の交代だけを扱う（相手の采配は触れない）。
+  // 2P PLAY では**先に押したほうが開く**（開いている間は全アクター静止＝Start=ポーズ）。
+  const role = roleOfPlayer(controllers, currentHalf(), player);
+  if (role === null) return;
+  menuOpen = true;
+  const ctx = gameActor.getSnapshot().context;
+  const side = role === 'batting' ? battingTeam(ctx.half) : fieldingTeam(ctx.half);
+  // イニングを渡すのはラッキー7（フェーズD-19）のため＝7回は候補も現打者も全員が
+  // 好調として並ぶ（好調の理由がどれであれ、代打の判断材料としては同じもの）。
+  runManagerMenu(app, pads[player], {
+    role,
+    roster: ctx.rosters[side],
+    inning: ctx.inning,
+    // 敬遠（フェーズQ-38）は守備側の采配なので、投手側のメニューにだけ並ぶ。
+    // 相手のロスターそのものは渡さない（采配は自分の側だけ、という既存の切り分け）＝
+    // 表示に要る名前と塁状況だけを渡す。
+    intentionalWalk: role === 'pitching' ? intentionalWalkTarget(ctx) : undefined,
+    // 代走（フェーズGG-54）は攻撃側の采配なので、打者側のメニューにだけ並ぶ。
+    // 敬遠と同じ整理で、**塁の上に誰がいるかは `baseRunners` の側にある**ので渡す。
+    pinchRun: role === 'batting' ? pinchRunTargets(ctx) : undefined,
+  }).then((choice) => {
+    if (choice) {
+      if (choice.kind === 'intentionalWalk') {
+        declareIntentionalWalk(side);
+      } else if (choice.kind === 'pinchRun') {
+        gameActor.send({
+          type: 'SUBSTITUTE_RUNNER',
+          side,
+          base: choice.base,
+          benchIndex: choice.index,
+        });
+      } else if (role === 'batting') {
+        gameActor.send({ type: 'SUBSTITUTE_BATTER', side, benchIndex: choice.index });
+      } else {
+        gameActor.send({ type: 'SUBSTITUTE_PITCHER', side, bullpenIndex: choice.index });
+      }
+    }
+    menuOpen = false;
+  });
+}
+
+/**
+ * 采配メニューに出す代走の対象（フェーズGG-54）＝**塁にいて、かつロスターから引ける走者**。
+ *
+ * 並びは一塁→二塁→三塁で、**FF-53の状況パネルの走力の行・L-32のリードの行と同じ順**
+ * （同じ走者について3つの材料が、どの画面でも同じ並びで出る）。
+ *
+ * **無名の走者（`ANONYMOUS_RUNNER`）は外す**：テストが真偽値の塁状況だけを送ってきた
+ * 経路では走者の識別が無く、代走を送る相手にできない（`substituteRunnerAt` も同じ理由で
+ * 弾くので、ここで外すのは「押せない行を並べない」ため）。
+ */
+function pinchRunTargets(ctx: GameContext): PinchRunTarget[] {
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  const targets: PinchRunTarget[] = [];
+  for (const base of ['first', 'second', 'third'] as const) {
+    const runnerId = ctx.baseRunners[base];
+    if (runnerId === null || roster.players[runnerId] === undefined) continue;
+    targets.push({ base, runnerId });
+  }
+  return targets;
+}
+
+/** 采配メニューに出す敬遠の相手（フェーズQ-38）＝今の打者・次打者・塁状況 */
+function intentionalWalkTarget(ctx: GameContext): IntentionalWalkTarget {
+  const batting = ctx.rosters[battingTeam(ctx.half)];
+  return {
+    batterName: batting.players[currentBatterId(batting)].name,
+    nextBatterName: batting.players[nextBatterId(batting)].name,
+    bases: ctx.bases,
+  };
+}
+
+/**
+ * 敬遠を宣言する（フェーズQ-38。人間の采配メニューからも、CPUの判断からも通る1本）。
+ *
+ * **投げないので投球数は増えない**（`PITCH_THROWN` を送らない＝B-11のスタミナは減らず、
+ * けん制球・銃と同じ扱い）。押し出しの得点・打順の進行・カウントのリセットは
+ * `gameMachine` の `applyWalk` が四球とまったく同じ経路で面倒を見る。
+ *
+ * 見せ方は四球と同じバナー1枚（文言だけ `ケイエン`）＝**何が起きたのかが1行で分かる**。
+ * この後は打者が代わるので、E-23の「打者の仕切り直し」の間がそのまま入る。
+ */
+function declareIntentionalWalk(side: TeamSide): void {
+  sfx.walk();
+  hud.playBanner('walk', 'ケイエン');
+  gameActor.send({ type: 'INTENTIONAL_WALK', side });
+}
+
+function onA(player: PlayerSlot): void {
+  if (!gameStarted || gameIsOver() || hitStopActive() || gunHitStopActive()) return;
+  // 画面を止めている間（采配メニュー・スキル抽選・ランの画面）は試合側の操作を受け付けない。
+  // **抽選・ランの画面は D-20 以前は素通ししていた**：人間が1人のときは「抽選を閉じるK」と
+  // 「投球のK」が同じ人の同じキーだったので、閉じた瞬間に投げ始めるのは自然に見えていた。
+  // 2P PLAY では**相手が抽選を選んでいる間に自分のキーが試合へ届く**ことになり、
+  // 実機で「抽選中に押した投球が、画面を閉じた瞬間に始まっていた」のを踏んだ。
+  if (menuOpen || draftOpen || runScreenOpen) return;
+  // CPUの銃の予兆（フェーズF-26-2）の最中は、静止しているので何も受け付けない
+  if (gunTelegraphActive()) return;
+  const role = roleOfPlayer(controllers, currentHalf(), player);
+  if (role === null) return;
+  switch (currentMode()) {
+    case 'dekkai':
+      // 打者の仕切り直し・攻守交代の「間」（フェーズE-23）が明けるまで投球も銃も撃てない
+      if (interludeActive()) break;
+      if (isGunMode()) {
+        // 銃は投手側（守備側）だけが撃てる。CPUが投手のときの発射は予兆明けに
+        // メインループが自分で撃つ（fireGun）ので、打者側のKはここで弾く。
+        if (role !== 'pitching') break;
+        fireGun();
+      } else if (role === 'pitching') {
+        // 投手側のA＝投球開始
+        pitching.startPitch();
+      } else {
+        // 打者側のA＝スイング
+        if (pitching.isPitchLive()) batting.trySwing();
+      }
+      break;
+    case 'chicchai':
+      if (role === 'pitching') {
+        // 飛行中は十字キーの方向へファインプレイ（説明書p23：上=ジャンプ/左右=横っとび/
+        // 下=ダイビング）、確保中は十字キーで塁指定した方向へ送球
+        fieldPlay.action();
+      } else if (hitAndRunOpen()) {
+        // ヒットエンドラン（フェーズH-28）：盗塁を仕掛けた球がまだ生きている間だけ、
+        // 攻撃側のAは「帰塁」ではなく**スイング**になる（原作の多目的ボタン方式の延長）。
+        // 代償は「その間は帰塁できない」ことで、投球が終われば下の帰塁へ戻る。
+        batting.trySwing();
+      } else {
+        // 攻撃側のAは「帰塁」（説明書p19：十字キーで帰る塁を指定。
+        // 無指定なら直近に仕掛けた走者。次の塁を踏んだ走者は戻れない）
+        fieldPlay.recallRunner();
+      }
+      break;
+    case 'deadBall':
+      // 乱闘を選ばない（説明書に無いオリジナル要素。CLAUDE.md ③）。**2P PLAY では
+      // 打者側だけが決める**＝殴られた側の選択なので、投げた側が勝手に断るのはおかしい
+      // （1P PLAY では従来どおりどちらの役割でも押せる。人間が投手側のときに断れなく
+      // なると、CPU打者は乱闘を選ばないので死球のたびに画面が止まってしまう）。
+      if (isTwoPlayer(controllers) && role !== 'batting') break;
+      modeActor.send({ type: 'BRAWL_DECLINED' });
+      break;
+    case 'brawl':
+      // 十字キーで選んだ技（上=特殊技、左右=パンチ、それ以外=ジャブ）を繰り出す。
+      // **押した人が操作している側の技**（フェーズD-20：2P PLAY では投手側も人間）。
+      sfx.brawlAttack();
+      brawl.attack(role === 'pitching' ? 'pitcher' : 'batter');
+      break;
+  }
+}
+
+function onB(player: PlayerSlot): void {
+  if (!gameStarted || gameIsOver() || hitStopActive() || gunHitStopActive()) return;
+  if (menuOpen || draftOpen || runScreenOpen) return; // 上の onA と同じ理由
+  // CPUの銃の予兆（フェーズF-26-2）の最中は、静止しているので何も受け付けない
+  if (gunTelegraphActive()) return;
+  const role = roleOfPlayer(controllers, currentHalf(), player);
+  if (role === null) return;
+  const mode = currentMode();
+  if (mode === 'deadBall') {
+    // 乱闘に持ち込むのは殴られた打者側の選択（上の BRAWL_DECLINED と同じ理由で、
+    // 2P PLAY のときだけ打者側に限る）。
+    if (isTwoPlayer(controllers) && role !== 'batting') return;
+    sfx.brawlStart();
+    modeActor.send({ type: 'BRAWL_START' });
+    brawl.enter(brawlLoadouts());
+  } else if (mode === 'brawl') {
+    // 乱闘v2（フェーズG-27）：**前を入れながらB＝投げ**（ガードを崩す唯一の手段）。
+    // 前を入れていなければ何も起きない＝そのままガード（押しっぱなしを update が拾う）。
+    brawl.grab(role === 'pitching' ? 'pitcher' : 'batter');
+  } else if (mode === 'chicchai') {
+    if (role === 'pitching') {
+      // 守備側のBは「ランダンプレイ」（説明書p25：十字キーで塁を指示。
+      // 無指定なら一塁へ。ボールを持った野手がその塁へダッシュし、途中で塁間の走者に
+      // 触れればタッチアウト）
+      fieldPlay.startRundown();
+    } else {
+      // 攻撃側のBは「走塁進塁」（フォースされていない走者から1人選んで送る）
+      fieldPlay.sendRunner();
+    }
+  } else if (mode === 'dekkai' && role === 'pitching' && canStartPickoff()) {
+    // 投手側のBは「けん制球」（説明書p24：Bでちっちゃいモードへ切り替え、
+    // そこで塁を指定してAで送球する）。
+    startPickoff();
+  } else if (mode === 'dekkai' && role === 'batting' && canStartSteal()) {
+    // 打者側のBは「盗塁」（説明書p13：投球中も走塁操作が可能。走り出すと
+    // ちっちゃいモードに変わる）。十字キーは進塁する塁の絶対指定＝走塁と同じ操作体系。
+    const { x, y } = pads[player].direction();
+    startSteal(baseFromPadDirection(x, y));
+  }
+}
+
+function onGun(player: PlayerSlot): void {
+  // 拡張ボタン（CLAUDE.md ①）の共通ガード。画面が止まっている間はどの機能も動かさない。
+  if (
+    !gameStarted ||
+    gameIsOver() ||
+    hitStopActive() ||
+    gunHitStopActive() ||
+    gunTelegraphActive() ||
+    menuOpen ||
+    draftOpen ||
+    runScreenOpen
+  ) {
+    return;
+  }
+  const role = roleOfPlayer(controllers, currentHalf(), player);
+  if (role === null) return;
+  // ちっちゃいモードでは同じGが「ドロップキック」になる（フェーズF-26-4）。銃は
+  // でっかいモードの投手側、ドロップキックはちっちゃいモードの走者側なので、
+  // **同じキーでも同時に両方が意味を持つ場面が無い**（A/Bが場面で機能を変える
+  // 原作の多目的ボタン方式と同じ切り分け）。持っていない選手のときは何も起きない。
+  if (currentMode() === 'chicchai') {
+    // 蹴るのは走者＝攻撃側だけ（フェーズD-20：2P PLAY では守備側のGは何も起こさない）
+    if (role === 'batting') fieldPlay.dropkick();
+    // **守備側のGは一時効果**（フェーズM-33。`ケモノガエリ`）。Gの4つの場面のうち
+    // ここだけが空いていた（でっかい投手側＝銃／でっかい打者側＝一時効果／ちっちゃい
+    // 走者側＝蹴り）。**打球を見てから切れる**のがこの札の値打ちなので、押す場所も
+    // 打球が飛んでいる画面の側に置く。持っていない／切れる相手がいなければ何も起きない。
+    else activateFieldingEffect();
+    return;
+  }
+  // でっかいモードの打者側のGは**一時効果**（フェーズM-33。`シニモノグルイ`・
+  // `ゼッタイヨチ`）。銃は投手側なので**同じキーでも同時に両方の意味を持つ場面が無い**
+  // （A/Bが場面で機能を変える原作の多目的ボタン方式と同じ切り分け）。
+  //
+  // **投球動作中でも切れる**（銃と違ってモードに入らないので、下の `isBusy` のガードを
+  // 通さない）。ここを塞ぐと、CPU投手が投げ始めるまでの短い隙にしか押せない＝実機では
+  // ほぼ押せなかった（実際に踏んだ）。切れる時間を打席いっぱいに開けても、
+  // **効果は打席という単位のまま**（成否は「どの打席で切るか」で決まり、
+  // フレーム単位の押し勝ちにはならない＝AVは当たりやすさには効かないという⑥の前提）。
+  if (interludeActive() || currentMode() !== 'dekkai') return;
+  if (role === 'batting') {
+    activateBattingEffect();
+    return;
+  }
+  // ここから下は投手側（守備側）の銃だけ。
+  // 投球動作中（ワインドアップ〜捕球）のモード切替は禁止。
+  // 飛行中に銃モードへ入れると、判定前のKで銃の仮処理が二重発火するため。
+  if (pitching.isBusy()) return;
+  const game = gameActor.getSnapshot().context;
+  const enteringGun = !isGunMode();
+  // ONに入れるのは**スキル `ジュウ` を持つ投手に残弾があるときだけ**（フェーズF-26-2）。
+  // 引いていない試合ではGキーは何も起こさない＝銃は常設の機能ではなくなった。
+  if (enteringGun && !canShootGun(game.rosters[fieldingTeam(game.half)])) return;
+  modeActor.send({ type: 'GUN_TOGGLE' });
+  if (enteringGun) gun.enter();
+  else gun.exit();
+}
+
+// **2人ぶんまとめて登録する**。1P PLAY では2P側の押下も届くが、`roleOfPlayer` が
+// null を返すのでどのハンドラも即座に戻る（＝キーが効かない）。
+for (const player of PLAYER_SLOTS) {
+  pads[player].onPress('start', () => onStart(player));
+  pads[player].onPress('a', () => onA(player));
+  pads[player].onPress('b', () => onB(player));
+  pads[player].onPress('gun', () => onGun(player));
+}
+
+// ---- メインループ ----
+// 2P/CPU操作分離のチーム選択（runTeamSelect）が完了するまでループを開始しない
+// （選択画面がプレイヤーの入力をブロックする、原作にはない追加の起動前ステップ）。
+
+runTeamSelect(app, pads).then((selection) => {
+  // 選んだモード（フェーズD-20）・16球団のカード（フェーズB-12/C-13）・球場（C-14）・
+  // 試合前の采配（C-15）から**試合を始める**（1P PLAY はラン＝フェーズF-26-6、
+  // 2P PLAY は1試合完結）。ロスターの真実は gameMachine のコンテキスト側にあるので、
+  // 名鑑からロスターを組むのも向こうに任せ、こちらは「どの球団か」「どの球場か」
+  // 「どんな采配か」と、ランが持ち越すスキルだけを渡す（startMatch → startGame）。
+  startMatch(selection);
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => {
+    const dt = clock.getDelta();
+
+    // 采配メニュー・抽選画面・ランの画面の表示中は全アクター静止（Start=ポーズの文言どおり）。
+    // メニュー自体の入力はrunManagerMenuが登録したpad.onPressハンドラで完結する。
+    if (menuOpen || draftOpen || runScreenOpen) {
+      renderer.render(scene, activeCamera);
+      return;
+    }
+
+    // 試合が決着したらランの分岐点（フェーズF-26-6）。決着の表示を読み切る「間」を置いて
+    // から、次の相手を選ぶ画面（勝ち）かランの終了画面（負け・クリア）へ移る。
+    // **ここで止めるので、決着後は全アクターが静止する**（従来は勝敗確定後も各コントローラーが
+    // 空回りし続けていた＝どのみち gameIsOver() で何も起きないが、止めたほうが素直）。
+    if (gameIsOver()) {
+      resultPauseRemaining -= dt;
+      if (resultPauseRemaining <= 0) void openRunScreen();
+      renderer.render(scene, activeCamera);
+      return;
+    }
+
+    // ヒットストップ中は全アクター静止（打者はインパクトのポーズで止まる）
+    if (hitStopActive()) {
+      hitStopRemaining -= dt;
+      if (!hitStopActive() && pendingBatted) {
+        const ctx = gameActor.getSnapshot().context;
+        // ヒットエンドラン（フェーズH-28）：盗塁のプレーが動いているなら、新しい
+        // プレーを始めるのではなく**そのプレーを打球へ引き継ぐ**（走者はスタートを
+        // 切った位置のまま走り続ける）。引き継いだ時点で打席は終わるので、
+        // 保留していた1球（pendingPitch）は捨てる＝打たれた球はカウントに数えない。
+        if (stealActive && fieldPlay.convertToBattedBall(pendingBatted, currentBatterRunnerId())) {
+          stealActive = false;
+          pendingPitch = null;
+        } else {
+          fieldPlay.launch(
+            pendingBatted,
+            ctx.baseRunners,
+            currentBatterRunnerId(),
+            ctx.outs,
+            // 打球の瞬間も走者はリードを取っている（フェーズY-46）。渡すのは盗塁・けん制と
+            // **同じ `resolveCarriedLeads` の結果**で、持ち越しが無い塁は標準のリードに
+            // 落ちる（＝この1行が「見送れば3.5m・打てば0m」の食い違いを閉じている）。
+            resolveCarriedLeads(ctx.baseRunners, carriedLeads),
+          );
+        }
+        pendingBatted = null;
+        // 盗塁からの引き継ぎではすでにちっちゃいモードにいる（chicchai は BATTED_BALL を
+        // 受け取らないので、送っても何も起きない＝経路を分けずに済む）。
+        modeActor.send({ type: 'BATTED_BALL' });
+        // このフレームで初めてちっちゃいモードが描かれるので、ここで追従カメラを打球に
+        // 合わせておく（フェーズE-24）。呼ばないと前のプレーのカメラ位置で1フレーム
+        // 描かれてしまい、瞬時カットが「一瞬ずれた画」から始まることになる。
+        syncChicchaiCamera(0);
+      }
+      renderer.render(scene, activeCamera);
+      return;
+    }
+
+    // 銃命中のヒットストップ中も同様に全体静止（マズルフラッシュも含め静止したまま見せる）
+    if (gunHitStopActive()) {
+      gunHitStopRemaining -= dt;
+      if (!gunHitStopActive() && pendingGunHit) {
+        pendingGunHit = false;
+        gameActor.send({ type: 'HIT_BY_PITCH' });
+        modeActor.send({ type: 'DEAD_BALL' });
+      }
+      renderer.render(scene, activeCamera);
+      return;
+    }
+
+    // CPU投手の銃の予兆（フェーズF-26-2）も全体静止。**gun.update より前に置く**のが
+    // 要点で、後ろに置くと静止しているはずの間に人間（＝この場面では打者側）のWASDが
+    // gun.update に流れ込み、**撃たれる側が相手の照準を動かせてしまう**。
+    // 消化しきったフレームでそのまま撃つ（人間のKと同じ fireGun を通る）。
+    if (gunTelegraphActive()) {
+      gunTelegraphRemaining -= dt;
+      if (!gunTelegraphActive()) {
+        gunTelegraphRemaining = 0; // 端数の負値を残さない（次の予兆の計時が読みにくくなる）
+        fireGun();
+      }
+      renderer.render(scene, activeCamera);
+      return;
+    }
+
+    // 投球操作はでっかいモード（通常）でのみ受け付ける。銃モード中のWASDは照準（gun.update）が使う。
+    // 接触判定は pitching.update 内の onFlightStep → batting.checkContact で行うため、
+    // スイングタイマーを進める batting.update は必ずその後に呼ぶ。
+    // controlActive（ready フェーズのプレート移動）は人間が投手側のときだけ有効にする
+    // （CPUが投手側のときはcpuPitcherがリリース位置を直接セットするため、この経路は使わない）。
+    const gunModeActive = currentMode() === 'dekkai' && isGunMode() && !gameIsOver();
+    pitching.update(
+      dt,
+      currentMode() === 'dekkai' && !isGunMode() && !gameIsOver() && isPitchingHuman(),
+    );
+    // **銃は投球の後に更新する**（フェーズE-25-(e)）：どちらも投手の姿勢を書くので、
+    // 構えを最後に書かせないと投球側の「構え（idle）」に毎フレーム上書きされて銃を
+    // 構えられない（野手の捕球・走者のバイクと同じ後勝ちの形）。銃モードへ入れるのは
+    // 投球動作中でないときだけ（`pitching.isBusy()` のガード）なので、投球の見た目が
+    // これで途切れることはない。
+    gun.update(dt, gunModeActive);
+
+    if (currentMode() === 'dekkai' && !isGunMode() && !gameIsOver()) {
+      const ctx = gameActor.getSnapshot().context;
+      // スキル抽選（フェーズF-26-1）。イニングの表裏が変わった最初のフレームで起こす＝
+      // **その回の1球目より必ず前**。3択画面が開いている間は下の処理をすべて止める
+      // （投球・けん制・盗塁が裏で進むと、選んでいる最中に試合が動いてしまう）。
+      if (syncSkillDraft(ctx)) {
+        renderer.render(scene, activeCamera);
+        return;
+      }
+      // 打席が変わったらCPUのけん制・盗塁の「1打席1回」を仕切り直す（攻守どちらの
+      // 経路でも打席は進むので、投球AIの分岐の外で毎フレーム見る）。
+      syncPlateAppearance(ctx);
+
+      // 打者の仕切り直し・攻守交代の「間」（フェーズE-23）。開いている間はCPU投手も
+      // 投げない（人間側の入力は各ハンドラの interludeActive() ガードで止めている）。
+      if (!updateInterlude(ctx, dt)) {
+        // でっかいモードのCPU投球AI（セッション9）：CPUが投手側で、まだ投球動作に入って
+        // いない（ready）間だけ毎フレーム呼ぶ。狙いを決めて「間」を消化し、経過したら自動で
+        // ワインドアップを開始する（startPitchはreadyフェーズ以外では何もしない安全設計）。
+        if (!isPitchingHuman() && !pitching.isBusy()) {
+          // 銃（フェーズF-26-2）はけん制・投球より先に判断する。撃つと決まればその打席は
+          // 死球で終わるので、以降の判断は要らない（構えた次のフレームからは上の
+          // gunTelegraphActive の分岐が全体を静止させ、予兆明けにそのまま撃つ）。
+          if (tryCpuGun(ctx)) {
+            // 敬遠（フェーズQ-38）は銃の次・けん制より先に見る。歩かせると決まれば
+            // その打席はそこで終わる（＝けん制も投球も要らない）。
+          } else if (tryCpuIntentionalWalk(ctx)) {
+            // けん制（説明書p24）は投球より先に判断する。走者がいる打席で1回だけ、短い「間」の
+            // 後にちっちゃいモードへ切り替えて走者とにらみ合う（実際に投げるかは
+            // chooseCpuPickoffThrow が、そのときのリードの深さで決める）。
+            // **塁を離れている走者がいるときだけ**けん制する（フェーズJJ-57）。
+            // 渡すのは盗塁のスタート位置とまったく同じ `resolveCarriedLeads` の結果＝
+            // 「走ろうとしている走者」と「見に行く相手」が同じ1か所から出る。
+          } else if (
+            cpuPitcher.tryPickoff(
+              dt,
+              ctx.bases,
+              cpuPickoffUsed,
+              resolveCarriedLeads(ctx.baseRunners, carriedLeads),
+            )
+          ) {
+            cpuPickoffUsed = true;
+            startPickoff();
+          } else if (cpuPitcher.updateReady(dt, ctx.count)) {
+            pitching.startPitch();
+          }
+        }
+
+        // CPU攻撃側の盗塁（説明書p13）＝人間が守備側。投球の残り時間が
+        // CPU_STEAL_JUMP_SEC まで縮んだフレームで走り出す（＝完璧な送球なら刺せる
+        // スタートの遅さ。人間の捕手がK+塁指定を出せば刺せる。core/fielding.ts参照）。
+        if (
+          !isBattingHuman() &&
+          !cpuStealUsed &&
+          !stealActive &&
+          pitching.isPitchLive() &&
+          pitching.timeToCatcher() <= CPU_STEAL_JUMP_SEC
+        ) {
+          // **ダブルスチールもする**（フェーズL-32。ユーザー判断：CPUも仕掛ける）。
+          // 走者の指定は塁の配列でそのまま渡す＝十字キーを経由しないので、CPUの規則が
+          // 人間のパッドの状態に左右されない。
+          //
+          // **走者の足と持ち越したリードを渡す**（フェーズR-39）＝俊足の球団だけが
+          // よく走る。どちらも既にこの場にある値で、走力は打者と同じ `effectiveBatting`
+          // （＝スキル・好調の補正を通った派生ビュー）、リードは盗塁のスタート位置に
+          // 渡しているものと**同じ `resolveCarriedLeads` の結果**なので、
+          // 「走ると決めた前提」と「実際に走る位置」が食い違わない。
+          const from = chooseCpuSteals(ctx.bases, cpuStealOptions(ctx));
+          if (from.length > 0) {
+            cpuStealUsed = true;
+            startSteal(from);
+          }
+        }
+      }
+    } else {
+      // でっかいモードを離れたら「間」は持ち越さない（打球のプレー・死球・乱闘・銃モード
+      // へ移る経路は間の最中には無いが、残ったまま凍りつくことのないよう明示的に畳む）。
+      clearInterlude();
+    }
+
+    batting.update(dt);
+    // 盗塁のヒントはフィールドプレーの更新より先に出す：プレーが始まった最初のフレームで
+    // 「でっかいモード用のヒントを消す→フィールドプレーが自分のヒントを出す」の順にしないと、
+    // 出したばかりのヒントを消してしまう（どちらも表示チャンネルは1つ）。
+    syncStealPrompt();
+    fieldPlay.update(dt);
+    // 追従カメラ・画面外マーカーはフィールドプレーの更新の後（＝動いた後の位置）で決める
+    syncChicchaiCamera(dt);
+
+    const brawlActive = currentMode() === 'brawl' && !gameIsOver();
+    brawl.update(dt, brawlActive);
+    if (brawlActive) {
+      const view = brawl.view();
+      hud.updateBrawl(view.batter, view.pitcher);
+      // 技表も**毎フレーム組み直す**（体力・コンボと同じ扱い）。乱闘に入った瞬間に一度だけ
+      // 渡す形だと、渡す順番（モード遷移・装備の確定・HUDの更新）のどれか1つでも前後した
+      // ときに黙って既定の文言に戻る＝実機で実際に踏んだ。導出しておけば必ず今の装備と一致する。
+      hud.setBrawlHint(brawlHintText());
+    }
+
+    renderer.render(scene, activeCamera);
+  });
+});
