@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   type AtBatMarker,
   CALL_BANNER_SEC,
+  CONTACT_FOLLOW_SEC,
+  CPU_BRAWL_DECISION_SEC,
   CPU_PITCH_INTERVAL_SEC,
+  FOUL_RESULT_PAUSE_SEC,
   GUN_TELEGRAPH_SEC,
   INTERLUDE_SEC,
   PITCH_SETTLE_SEC,
@@ -78,11 +81,23 @@ describe('テンポの定数（原作の実測値を入れ替えても壊して�
     expect(GUN_TELEGRAPH_SEC).toBeLessThan(INTERLUDE_SEC.inningChange);
   });
 
+  it('ファウルの見せ時間はほかの帰結より長い（打球がどこへ行ったかを見てから戻る。WW-71）', () => {
+    expect(FOUL_RESULT_PAUSE_SEC).toBeGreaterThan(PLAY_RESULT_PAUSE_SEC);
+  });
+
+  it('打った瞬間からカットまでは短い（打球が飛び出すのを見せるだけ＝待たせない。WW-71）', () => {
+    // 守備のプレーは接触の瞬間から始まるので、ここが長いとカットの後で球が大きく巻き戻って見える
+    expect(CONTACT_FOLLOW_SEC).toBeLessThan(0.25);
+  });
+
   it('すべての「間」は正の値（0にすると原作より速い従来の挙動に戻る）', () => {
     for (const sec of [
       PITCH_SETTLE_SEC,
       CPU_PITCH_INTERVAL_SEC,
       PLAY_RESULT_PAUSE_SEC,
+      FOUL_RESULT_PAUSE_SEC,
+      CONTACT_FOLLOW_SEC,
+      CPU_BRAWL_DECISION_SEC,
       CALL_BANNER_SEC,
       GUN_TELEGRAPH_SEC,
       INTERLUDE_SEC.batterChange,

@@ -1056,11 +1056,10 @@ export function createBattingController(opts: {
       // bunting を畳むので、打球を作るときには読めなくなる。この事実が要るのは
       // ちっちゃいモードでファウルが確定したとき（2ストライク後は三振）。
       const wasBunt = bunting;
-      // 打球が出たらこの球の動作は終了（バントで出したままのバットもここで畳む）。
-      // 姿勢はヒットストップ中の見栄えのため即座には戻さず、次のフレームの update が
-      // swingT===null を見て構えへ戻す。
-      swingT = null;
-      bunting = false;
+      // 打球が出ても**スイングは振り抜くまで続ける**（フェーズWW-71）。打った瞬間に全体を
+      // 止めるヒットストップをやめ、打球がバットから飛び出すところを見せてからカットする
+      // ようにしたので、姿勢もそこで止めない。もう当たらないことは `contacted` が保証し、
+      // 打撃動作の後始末（バントのバットを畳む等）はカットの瞬間の `endPitch` が担う。
       onContact(createBattedBall(launch, cross.x, wasBunt));
     },
 

@@ -40,7 +40,7 @@ import {
   sideOfPlayer,
 } from './core/players';
 import type { TeamId } from './core/teams';
-import { type BattedBall, type BattingProfile, callAfterSwing } from './core/batting';
+import { type BattedBall, type BattingProfile, GRAVITY, callAfterSwing } from './core/batting';
 import {
   type BatterSide,
   type PitchArm,
@@ -115,10 +115,12 @@ import {
   withNextGame,
 } from './core/run';
 import { isLuckyInning } from './core/condition';
-import { type EdgeMarker, dekkaiBallScale, edgeMarker } from './core/camera';
+import { type EdgeMarker, BALL_RADIUS, dekkaiBallScale, edgeMarker } from './core/camera';
 import {
   type AtBatMarker,
   type InterludeKind,
+  CONTACT_FOLLOW_SEC,
+  CPU_BRAWL_DECISION_SEC,
   GAME_RESULT_PAUSE_SEC,
   GUN_TELEGRAPH_SEC,
   INTERLUDE_SEC,
@@ -141,7 +143,7 @@ import {
   runnerSpeed,
 } from './core/fielding';
 import { type Ballpark, type BallparkId, DEFAULT_BALLPARK, ballparkById } from './core/ballpark';
-import type { BrawlLoadouts, BrawlSide } from './core/brawl';
+import { type BrawlLoadouts, type BrawlSide, shouldCpuStartBrawl } from './core/brawl';
 import {
   chooseCpuPinchHitter,
   chooseCpuPinchRunner,
@@ -216,7 +218,7 @@ import { preloadStadiumModel } from './entities/stadium';
 import { createBall } from './entities/ball';
 import { createReticle } from './entities/reticle';
 import { type PlayPromptLine, createHud } from './ui/hud/hud';
-import { preloadPixelFont } from './ui/hud/pixelText';
+import { preloadPixelFont, setPixelText } from './ui/hud/pixelText';
 // ドットフォント（DotGothic16・SIL OFL 1.1）。日本語は使う字のぶんだけ小分けで読み込まれる
 import '@fontsource/dotgothic16/400.css';
 import { setOutlineViewport } from './render/toon';
@@ -519,9 +521,7 @@ function installMusicToggle(): void {
     padding: calc(4px * var(--ui-scale, 1)) calc(10px * var(--ui-scale, 1));
     background: rgba(6, 10, 36, 0.9);
     border: 2px solid #f4f4f4;
-    color: #ffe066;
-    font-family: 'DotGothic16', 'MS Gothic', monospace;
-    font-size: calc(16px * var(--ui-scale, 1));
+    line-height: 0;
     pointer-events: none;
     opacity: 0;
     transition: opacity 250ms;
@@ -532,7 +532,8 @@ function installMusicToggle(): void {
     if (e.code !== 'KeyM' || e.repeat) return;
     const next = !audioSettings().music;
     setAudioSettings({ music: next });
-    toast.textContent = next ? '♪ BGM オン' : '♪ BGM オフ（Mで戻す）';
+    // 文字はドット文字の canvas で描く（DOMの文字はにじむ。フェーズWW-71）
+    setPixelText(toast, next ? '♪ BGM オン' : '♪ BGM オフ（Mで戻す）', { color: '#ffe066' });
     toast.style.opacity = '1';
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
@@ -1073,6 +1074,50 @@ function brawlHintText(): string {
   return lines.join('\n');
 }
 
+// ---- 死球のあと：乱闘に持ち込むかは打たれた打者側だけが決める（フェーズWW-71） ----
+
+/** 直前の死球が銃によるものか（CPUの打者は銃で撃たれたら必ずやり返す＝`shouldCpuStartBrawl`） */
+let hbpByGun = false;
+/** CPUの打者が決めるまでの残り時間（`CPU_BRAWL_DECISION_SEC`） */
+let cpuBrawlDecisionRemaining = 0;
+
+/** 死球の画面へ入る（普通の死球・銃の命中の両方がここを通る） */
+function enterDeadBall(byGun: boolean): void {
+  hbpByGun = byGun;
+  cpuBrawlDecisionRemaining = CPU_BRAWL_DECISION_SEC;
+  modeActor.send({ type: 'DEAD_BALL' });
+}
+
+/** 乱闘を始める（人間の打者のJ・CPUの打者の判断の両方がここを通る） */
+function startBrawl(): void {
+  sfx.brawlStart();
+  modeActor.send({ type: 'BRAWL_START' });
+  brawl.enter(brawlLoadouts());
+}
+
+/** 乱闘を見送って一塁へ歩く */
+function declineBrawl(): void {
+  modeActor.send({ type: 'BRAWL_DECLINED' });
+}
+
+/**
+ * **CPUの打者が乱闘するかを決める**（死球の画面にいる間、毎フレーム呼ぶ）。
+ * 打者側が人間なら何もしない（人間が J/K で決める）。「間」を置いてから決めるので、
+ * 人間の投手は `デッドボール！` を読んでから結果を見ることになる（`CPU_BRAWL_DECISION_SEC`）。
+ */
+function updateCpuBrawlDecision(dt: number): void {
+  if (isBattingHuman()) return;
+  cpuBrawlDecisionRemaining -= dt;
+  if (cpuBrawlDecisionRemaining > 0) return;
+  cpuBrawlDecisionRemaining = 0;
+  const loadouts = brawlLoadouts();
+  if (shouldCpuStartBrawl({ byGun: hbpByGun, batter: loadouts.batter, pitcher: loadouts.pitcher })) {
+    startBrawl();
+  } else {
+    declineBrawl();
+  }
+}
+
 function captureHbpRestoreSnapshot(): void {
   const ctx = gameActor.getSnapshot().context;
   pendingHbpRestore = {
@@ -1176,7 +1221,7 @@ function applyPitchCall(call: PitchCall, swung: boolean): void {
     sfx.hitByPitch();
     captureHbpRestoreSnapshot();
     gameActor.send({ type: 'HIT_BY_PITCH' });
-    modeActor.send({ type: 'DEAD_BALL' });
+    enterDeadBall(false);
     return;
   }
   // 捕手が受けた球（見逃し・空振り）はミットの音。空振りの風切りは振り出した瞬間に鳴っている
@@ -1528,16 +1573,33 @@ const fieldPlay = createFieldPlayController({
   },
 });
 
-// ヒットストップ：バット接触の瞬間に全体を短時間静止させ、打った手応えを出す
-// （桜井ノウハウ照合の改善対応。静止後のカット自体は瞬時＝原作準拠を維持）。
-// 静止時間は打球初速に比例して延ばす（強い当たりほど重い手応え）。
-const HIT_STOP_BASE_SEC = 0.05;
-const HIT_STOP_PER_SPEED = 0.0015;
-let hitStopRemaining = 0;
+// 打った瞬間からカットまで（フェーズWW-71）。**それまでのヒットストップ（全体の静止）を
+// やめ、打球がバットから飛び出すところを見せてからカットする**（テストプレイ「切り替わる
+// 前に一時停止したみたいになる」）。静止のすぐ後に画面が切り替わるので、手応えではなく
+// 引っかかりに見えていた。この間は打者が振り抜き、球は打った向きへ飛んでいく（見た目
+// だけ）。守備のプレーは従来どおり**接触の瞬間の状態から**始まる＝判定は1つも動かない。
+// 入力はこの間も止める（打ってからカットまでの一瞬に押したキーが次の画面へ漏れない）。
+let contactFollowRemaining = 0;
 let pendingBatted: BattedBall | null = null;
+/** カットまでの間に見せる球の位置と速度（`pendingBatted` の接触の瞬間から積分する。見た目だけ） */
+let contactBall: { x: number; y: number; z: number; vx: number; vy: number; vz: number } | null =
+  null;
 
 function hitStopActive(): boolean {
-  return hitStopRemaining > 0;
+  return contactFollowRemaining > 0;
+}
+
+/** カットまでの球を1フレーム進める（重力だけの放物線。空気抵抗・跳ね返りは見せる長さに要らない） */
+function advanceContactBall(dt: number): void {
+  if (!contactBall) return;
+  const b = contactBall;
+  b.vy -= GRAVITY * dt;
+  b.x += b.vx * dt;
+  b.y = Math.max(BALL_RADIUS, b.y + b.vy * dt);
+  b.z += b.vz * dt;
+  const k = dekkaiBallScale(b);
+  ball.scale.set(k, k, k);
+  ball.position.set(b.x, b.y, b.z);
 }
 
 const batting = createBattingController({
@@ -1577,17 +1639,18 @@ const batting = createBattingController({
     // ここでも次の球のためにCPU投手の狙いをリセットしておく（onJudged と同じ理由）。
     cpuPitcher.reset();
     const exitSpeed = Math.hypot(batted.vx, batted.vy, batted.vz);
-    sfx.hit(exitSpeed); // ヒットストップの尺(下記)内で鳴り切るよう短く設計済み（sfx.ts参照）
-    // 接触点でボールを止めて静止表示。カット（BATTED_BALL）は静止明けに送る。
-    // ヒットストップの間もまだでっかいモードのカメラなので、**拡大率も投球中と同じ
-    // 距離補正で書く**（フェーズNN-61。素の1.0倍に戻すと、接触の瞬間だけ球が実寸＝
-    // 本塁の見かけより小さく縮んで見える）。**残像（PP-63）はここで戻す**＝打った球は
-    // もう投球ではないので伸ばさない（等倍にすれば球なので、向きは戻さなくても同じ形）。
+    sfx.hit(exitSpeed); // 打球音の芯は最初の0.1秒に集めてある（sfx.ts参照）
+    // 接触点から球を飛ばし始める。カット（BATTED_BALL）は `CONTACT_FOLLOW_SEC` の後に送る。
+    // この間もまだでっかいモードのカメラなので、**拡大率も投球中と同じ距離補正で書く**
+    // （フェーズNN-61。素の1.0倍に戻すと、接触の瞬間だけ球が実寸＝本塁の見かけより
+    // 小さく縮んで見える）。**残像（PP-63）はここで戻す**＝打った球はもう投球ではないので
+    // 伸ばさない（等倍にすれば球なので、向きは戻さなくても同じ形）。
     const k = dekkaiBallScale(batted);
     ball.scale.set(k, k, k);
     ball.position.set(batted.x, batted.y, batted.z);
     pendingBatted = batted;
-    hitStopRemaining = HIT_STOP_BASE_SEC + HIT_STOP_PER_SPEED * exitSpeed;
+    contactBall = { x: batted.x, y: batted.y, z: batted.z, vx: batted.vx, vy: batted.vy, vz: batted.vz };
+    contactFollowRemaining = CONTACT_FOLLOW_SEC;
   },
 });
 
@@ -1818,11 +1881,12 @@ function tryCpuIntentionalWalk(ctx: GameContext): boolean {
 // （brawlScene.ts内で完結。2P PLAY では投手側も人間＝D-20）。
 // 決着後は死球を巻き戻して同じ打席を継続し（gameActor.BRAWL_RESOLVED）、負けた側の現在の
 // 打者/投手をロスターから永久退場させて控え/ブルペンから自動交代する（セッション7で本実装）。
-// 交代が成立したときだけ、視覚合図として要員を色替えする（控え/ブルペンが尽きていた場合は
-// 没収試合が確定しており交代自体が成立していないため、色替えは出さない）。
-const SUBSTITUTE_PALETTE = [0x33aa88, 0xaa7733, 0x8833aa, 0x669900, 0xcc8822];
-let batterSubs = 0;
-let pitcherSubs = 0;
+//
+// **交代はバナーで知らせ、ユニフォームは塗り替えない**（フェーズWW-71。テストプレイ
+// 「乱闘が終わった後にピッチャーのユニフォームの色が変わる」）。セッション7は交代の合図として
+// でっかいモードの投手・打者を別の色（緑・茶・紫…）に塗っていたが、**でっかいモードの
+// 投手・打者は1体ずつを全員で使い回している**ので、塗った色がその後の全投手・全打者に
+// 残り、**守備側の色（青）でも攻撃側の色（赤）でもない3チーム目**に見えていた。
 
 const brawl = createBrawlController({
   batter: brawlFighters.batter,
@@ -1846,15 +1910,25 @@ const brawl = createBrawlController({
       battingLineupIndex: preRestoreCtx.rosters[battingTeam(preRestoreCtx.half)].lineupIndex,
     };
     pendingHbpRestore = null;
+    // 退場する選手（交代の告知に名前を出す）。打者は死球の直前の打順から引く
+    // （`brawlLoadouts` と同じ理由＝死球で打順はもう1つ進んでいる）
+    const loserTeam =
+      loser === 'batter' ? battingTeam(preRestoreCtx.half) : fieldingTeam(preRestoreCtx.half);
+    const loserRoster = preRestoreCtx.rosters[loserTeam];
+    const loserId =
+      loser === 'batter' ? loserRoster.lineup[restore.battingLineupIndex] : loserRoster.pitcher;
     gameActor.send({ type: 'BRAWL_RESOLVED', loser, restore });
 
-    if (gameActor.getSnapshot().context.winner === null) {
-      if (loser === 'batter') {
-        batterSubs += 1;
-        setPlayerColor(batter, SUBSTITUTE_PALETTE[(batterSubs - 1) % SUBSTITUTE_PALETTE.length]);
-      } else {
-        pitcherSubs += 1;
-        setPlayerColor(pitcher, SUBSTITUTE_PALETTE[(pitcherSubs - 1) % SUBSTITUTE_PALETTE.length]);
+    const after = gameActor.getSnapshot().context;
+    if (after.winner === null) {
+      const roster = after.rosters[loserTeam];
+      const subId =
+        loser === 'batter' ? roster.lineup[restore.battingLineupIndex] : roster.pitcher;
+      if (subId !== loserId) {
+        hud.playBanner(
+          'ejected',
+          `${loserRoster.players[loserId]?.name ?? ''} 退場\n代わって ${roster.players[subId]?.name ?? ''}`,
+        );
       }
     }
 
@@ -2612,15 +2686,14 @@ function resetPerGameState(): void {
   pendingBatted = null;
   pendingGunHit = false;
   pendingHbpRestore = null;
-  hitStopRemaining = 0;
+  contactFollowRemaining = 0;
+  contactBall = null;
   gunHitStopRemaining = 0;
   gunTelegraphRemaining = 0;
   dekkaiPromptShown = '';
   hud.showPlayPrompt([]);
   gun.exit();
-  // 乱闘の交代で色替えした要員を既定色へ戻す（新しい試合は名鑑どおりの顔ぶれから）
-  batterSubs = 0;
-  pitcherSubs = 0;
+  // 投手・打者を既定色へ戻す（WW-71で乱闘の色替えはやめたが、色は試合ごとに必ず揃えておく）
   setPlayerColor(batter, BATTER_COLOR);
   setPlayerColor(pitcher, PITCHER_COLOR);
 }
@@ -3004,12 +3077,12 @@ function onA(player: PlayerSlot): void {
       }
       break;
     case 'deadBall':
-      // 乱闘を選ばない（説明書に無いオリジナル要素。CLAUDE.md ③）。**2P PLAY では
-      // 打者側だけが決める**＝殴られた側の選択なので、投げた側が勝手に断るのはおかしい
-      // （1P PLAY では従来どおりどちらの役割でも押せる。人間が投手側のときに断れなく
-      // なると、CPU打者は乱闘を選ばないので死球のたびに画面が止まってしまう）。
-      if (isTwoPlayer(controllers) && role !== 'batting') break;
-      modeActor.send({ type: 'BRAWL_DECLINED' });
+      // 乱闘を選ばない（説明書に無いオリジナル要素。CLAUDE.md ③）。**決めるのは殴られた
+      // 打者側だけ**（フェーズWW-71。テストプレイ「ぶつけておいて、乱闘するかを投手の側が
+      // 判断できるのはおかしい」）。1P PLAY で人間が投手のときは何も押せず、CPUの打者が
+      // `shouldCpuStartBrawl` で決める（メインループの `updateCpuBrawlDecision`）。
+      if (role !== 'batting') break;
+      declineBrawl();
       break;
     case 'brawl':
       // 十字キーで選んだ技（上=特殊技、左右=パンチ、それ以外=ジャブ）を繰り出す。
@@ -3029,12 +3102,9 @@ function onB(player: PlayerSlot): void {
   if (role === null) return;
   const mode = currentMode();
   if (mode === 'deadBall') {
-    // 乱闘に持ち込むのは殴られた打者側の選択（上の BRAWL_DECLINED と同じ理由で、
-    // 2P PLAY のときだけ打者側に限る）。
-    if (isTwoPlayer(controllers) && role !== 'batting') return;
-    sfx.brawlStart();
-    modeActor.send({ type: 'BRAWL_START' });
-    brawl.enter(brawlLoadouts());
+    // 乱闘に持ち込むのは殴られた打者側だけ（上の onA と同じ理由。フェーズWW-71）
+    if (role !== 'batting') return;
+    startBrawl();
   } else if (mode === 'brawl') {
     // 乱闘v2（フェーズG-27）：**前を入れながらB＝投げ**（ガードを崩す唯一の手段）。
     // 前を入れていなければ何も起きない＝そのままガード（押しっぱなしを update が拾う）。
@@ -3166,10 +3236,17 @@ runTeamSelect(app, pads).then((selection) => {
       return;
     }
 
-    // ヒットストップ中は全アクター静止（打者はインパクトのポーズで止まる）
+    // 打ってからカットまで（フェーズWW-71）。**止めずに見せる**：打者は振り抜き、打球は
+    // バットから飛び出していく。ほかのアクター（投手・野手・CPUの判断）は進めない＝
+    // 守備のプレーは接触の瞬間の状態から始まる（判定は従来のヒットストップと同じ）。
     if (hitStopActive()) {
-      hitStopRemaining -= dt;
+      contactFollowRemaining -= dt;
+      batting.update(dt);
+      advanceContactBall(dt);
       if (!hitStopActive() && pendingBatted) {
+        contactBall = null;
+        // 振り抜きの後始末（バントのバットを畳む等）。ここでカットするので構えへ戻る姿は映らない
+        batting.endPitch();
         const ctx = gameActor.getSnapshot().context;
         // ヒットエンドラン（フェーズH-28）：盗塁のプレーが動いているなら、新しい
         // プレーを始めるのではなく**そのプレーを打球へ引き継ぐ**（走者はスタートを
@@ -3209,7 +3286,7 @@ runTeamSelect(app, pads).then((selection) => {
       if (!gunHitStopActive() && pendingGunHit) {
         pendingGunHit = false;
         gameActor.send({ type: 'HIT_BY_PITCH' });
-        modeActor.send({ type: 'DEAD_BALL' });
+        enterDeadBall(true);
       }
       renderFrame();
       return;
@@ -3228,6 +3305,9 @@ runTeamSelect(app, pads).then((selection) => {
       renderFrame();
       return;
     }
+
+    // 死球のあと、CPUの打者が乱闘するかを決める（フェーズWW-71）
+    if (currentMode() === 'deadBall' && !gameIsOver()) updateCpuBrawlDecision(dt);
 
     // 投球操作はでっかいモード（通常）でのみ受け付ける。銃モード中のWASDは照準（gun.update）が使う。
     // 接触判定は pitching.update 内の onFlightStep → batting.checkContact で行うため、

@@ -198,7 +198,10 @@ export type BannerKind =
   | 'stamina'
   // CPU投手が銃を構えた（フェーズF-26-2）。**避けられない一撃の予兆**なので、決着の
   // どのバナーよりも強く出す（ホームランと同じ大きさ・赤系のフラッシュ）。
-  | 'gunAim';
+  | 'gunAim'
+  // 乱闘の負けで退場した選手と、代わって入った選手（フェーズWW-71）。それまでは
+  // ユニフォームを別の色に塗って知らせていた（その色が以後の全選手に残っていた）。
+  | 'ejected';
 
 /** 乱闘の体力ゲージ1本ぶんの表示（真実は `core/brawl.ts` の `BrawlState` の側） */
 export interface BrawlGaugeView {
@@ -642,6 +645,8 @@ const BANNER_STYLE: Record<
     durationMs: GUN_TELEGRAPH_SEC * 1000,
     flashColor: '#7a0000',
   },
+  // 退場と交代。打席の決着と同じ大きさ（誰が消えて誰が入ったかは采配に直結する）
+  ejected: { color: '#ff8866', scale: 2, durationMs: 1800 },
 };
 
 /**
@@ -1113,9 +1118,15 @@ export function createHud(root: HTMLElement): Hud {
         // ヒントに1Pのキー名を固定で書くと、2Pには押せないキーを案内することになる）。
         const batterPlayer = playerOfSide(controllers, battingTeam(game.half));
         const twoPlayer = isTwoPlayer(controllers);
-        const who = twoPlayer && batterPlayer ? `${PLAYER_LABEL[batterPlayer]}が決める\n` : '';
-        const keys = twoPlayer && batterPlayer === 'p2' ? '（[1]=はい / [2]=いいえ）' : '（J=はい / K=いいえ）';
-        message.setText(`${who}乱闘する？\n${keys}`);
+        if (!batterPlayer) {
+          // 打者側がCPU（1P PLAYで人間が投手）：**投手の側は決められない**（フェーズWW-71）。
+          // CPUの打者が決めるまで待つ（`CPU_BRAWL_DECISION_SEC`）ことだけを出す
+          message.setText('打者の出方を待つ…');
+        } else {
+          const who = twoPlayer ? `${PLAYER_LABEL[batterPlayer]}が決める\n` : '';
+          const keys = batterPlayer === 'p2' ? '（[1]=はい / [2]=いいえ）' : '（J=はい / K=いいえ）';
+          message.setText(`${who}乱闘する？\n${keys}`);
+        }
         message.el.style.display = 'block';
       } else if (modeState === 'brawl') {
         // 乱闘v2（フェーズG-27）：**操作と技表は main.ts が組んで渡す**（`setBrawlHint`）。

@@ -67,7 +67,7 @@ import { type PracticeMode, PRACTICE_MODES, practiceHumanSide } from '../debug/p
 import type { TeamSide } from '../core/rules';
 import { type TeamId, TEAMS, pitcherRowPitching, teamById } from '../core/teams';
 import type { VirtualPad } from '../input/keyboard';
-import { PIXEL_FONT_FAMILY } from './hud/pixelText';
+import { PIXEL_FONT_FAMILY, setPixelText } from './hud/pixelText';
 import { sfx } from '../audio/sfx';
 
 /** 押したときに音を鳴らしてから本来の処理をする（メニューの操作音） */
@@ -102,6 +102,18 @@ export interface MatchSelection {
    */
   practice?: PracticeMode;
 }
+
+/**
+ * 文字の色（フェーズWW-71）。**文字は canvas のドット文字で描く**（`setPixelText`）ので、
+ * CSS の `color` ではなくここから渡す（DOMの文字はブラウザが縁をぼかし、画数の多い漢字が
+ * にじんでいた。テストプレイ「漢字がにじむ」）。
+ */
+const TEXT_COLOR = '#ffffff';
+const ACTIVE_COLOR = '#ffe066';
+const TITLE_COLOR = '#ffe066';
+const HINT_COLOR = '#b8c0d8';
+/** 見出しの影（格子の2倍の字に1点＝旧CSSの2px） */
+const TITLE_SHADOWS = [{ dx: 1, dy: 1, color: '#10101c' }] as const;
 
 /** 球団グリッドの列数（16球団を4×4で並べる） */
 const COLUMNS = 4;
@@ -424,22 +436,29 @@ function createPlanEditor(opts: {
         const active = step === 'starter' && i === cursor;
         const chosen = i === editor.plan.starterIndex;
         const id = staffPlayerId(teamId, i);
-        cell.textContent = describeStaffPitcher(
-          staff[i][0],
-          effectivePitching(roster, id) ?? pitcherRowPitching(staff[i]),
-          remainingStaminaOf(roster, id),
+        setPixelText(
+          cell,
+          describeStaffPitcher(
+            staff[i][0],
+            effectivePitching(roster, id) ?? pitcherRowPitching(staff[i]),
+            remainingStaminaOf(roster, id),
+          ),
+          { color: active ? ACTIVE_COLOR : TEXT_COLOR, lineHeight: 22 },
         );
         cell.style.borderColor = active ? '#ffe066' : chosen ? '#7fd4ff' : 'transparent';
-        cell.style.color = active ? '#ffe066' : '#fff';
       });
-      orderList.textContent = [
-        lineupHeaderRow(),
-        ...editor.plan.order.map((_, slot) => {
-          // ▶＝カーソル、◆＝入れ替える1人目として選んだ打順
-          const mark = picked === slot ? '◆ ' : step === 'order' && slot === cursor ? '▶ ' : '　 ';
-          return `${mark}${describeLineupRow(roster, slot)}`;
-        }),
-      ].join('\n');
+      setPixelText(
+        orderList,
+        [
+          lineupHeaderRow(),
+          ...editor.plan.order.map((_, slot) => {
+            // ▶＝カーソル、◆＝入れ替える1人目として選んだ打順
+            const mark = picked === slot ? '◆ ' : step === 'order' && slot === cursor ? '▶ ' : '　 ';
+            return `${mark}${describeLineupRow(roster, slot)}`;
+          }),
+        ].join('\n'),
+        { color: TEXT_COLOR, lineHeight: 24 },
+      );
     },
     press(step, cursor) {
       if (step === 'starter') {
@@ -519,10 +538,20 @@ export function runTeamSelect(
     logo.style.cssText = 'display: flex; flex-direction: column; align-items: center;';
     const logoName = document.createElement('div');
     logoName.style.cssText = LOGO_STYLE;
-    logoName.textContent = GAME_TITLE;
+    // 題名：格子の4倍の字・字間1点・2段の影（真下の朱色で厚み、右下の濃紺で落ち影）
+    setPixelText(logoName, GAME_TITLE, {
+      scale: 4,
+      color: '#ffd23a',
+      letterSpacing: 1,
+      lineHeight: 18,
+      shadows: [
+        { dx: 1, dy: 2, color: '#10101c' },
+        { dx: 0, dy: 1, color: '#c2411c' },
+      ],
+    });
     const logoSub = document.createElement('div');
     logoSub.style.cssText = LOGO_SUB_STYLE;
-    logoSub.textContent = GAME_TITLE_ROMAN;
+    setPixelText(logoSub, GAME_TITLE_ROMAN, { color: '#9fb4e8', letterSpacing: 7 });
     logo.append(logoName, logoSub);
 
     const title = document.createElement('div');
@@ -533,55 +562,31 @@ export function runTeamSelect(
     const modeGrid = document.createElement('div');
     modeGrid.style.cssText = PARK_GRID_STYLE;
     modeGrid.style.gridTemplateColumns = 'calc(448px * var(--ui-scale, 1))';
-    const modeCells = MODES.map((m) => {
+    /** 枠を1つ作る（中身の文字は render() が `setPixelText` で書く） */
+    const makeCell = (parent: HTMLElement): HTMLElement => {
       const cell = document.createElement('div');
       cell.style.cssText = CELL_BASE_STYLE;
-      cell.style.whiteSpace = 'pre';
-      cell.style.lineHeight = '1.5';
-      cell.textContent = `${m.label}\n${m.note}`;
-      modeGrid.appendChild(cell);
+      parent.appendChild(cell);
       return cell;
-    });
+    };
+    const modeCells = MODES.map(() => makeCell(modeGrid));
 
     // デバッグモードの中身（フェーズPP-64）。モード選択と同じ1列の縦並び＝
     // 押し方（W/S→K）が変わらないので、覚え直すものが無い。
     const practiceGrid = document.createElement('div');
     practiceGrid.style.cssText = PARK_GRID_STYLE;
     practiceGrid.style.gridTemplateColumns = 'calc(480px * var(--ui-scale, 1))';
-    const practiceCells = PRACTICE_MODES.map((m) => {
-      const cell = document.createElement('div');
-      cell.style.cssText = CELL_BASE_STYLE;
-      cell.style.whiteSpace = 'pre';
-      cell.style.lineHeight = '1.5';
-      cell.textContent = `${m.label}
-${m.note}`;
-      practiceGrid.appendChild(cell);
-      return cell;
-    });
+    const practiceCells = PRACTICE_MODES.map(() => makeCell(practiceGrid));
 
     const grid = document.createElement('div');
     grid.style.cssText = GRID_STYLE;
-    const cells = TEAMS.map((team) => {
-      const cell = document.createElement('div');
-      cell.style.cssText = CELL_BASE_STYLE;
-      cell.textContent = team.name;
-      grid.appendChild(cell);
-      return cell;
-    });
+    const cells = TEAMS.map(() => makeCell(grid));
 
     // 球場（フェーズC-14）。**距離を名前と一緒に出す**のは、球場選びが
     // 「長打力の球団か俊足の球団か」の判断そのものだから（説明書p24-25）。
     const parkGrid = document.createElement('div');
     parkGrid.style.cssText = PARK_GRID_STYLE;
-    const parkCells = BALLPARKS.map((p) => {
-      const cell = document.createElement('div');
-      cell.style.cssText = CELL_BASE_STYLE;
-      cell.style.whiteSpace = 'pre';
-      cell.style.lineHeight = '1.5';
-      cell.textContent = `${p.name}\n中堅 ${p.center}m\n両翼 ${p.wing}m`;
-      parkGrid.appendChild(cell);
-      return cell;
-    });
+    const parkCells = BALLPARKS.map(() => makeCell(parkGrid));
 
     const { staffGrid, orderList } = planEditor;
 
@@ -622,7 +627,7 @@ ${m.note}`;
       grid.style.display = onTeamGrid ? 'grid' : 'none';
       parkGrid.style.display = step === 'park' ? 'grid' : 'none';
       planEditor.render(step === 'starter' || step === 'order' ? step : null, cursor);
-      title.textContent =
+      const titleText =
         step === 'mode'
           ? 'モードを選択'
           : step === 'practice'
@@ -638,25 +643,34 @@ ${m.note}`;
                   : step === 'starter'
                     ? `${planOwnerLabel()}先発投手を選択`
                     : `${planOwnerLabel()}打順を決定`;
-      modeCells.forEach((cell, i) => {
-        const active = step === 'mode' && i === cursor;
+      setPixelText(title, titleText, {
+        scale: 2,
+        color: TITLE_COLOR,
+        lineHeight: 20,
+        shadows: TITLE_SHADOWS,
+      });
+      // 枠の色も文字の色も「カーソルが乗っているか」だけで決まる（段ごとの差は中身だけ）
+      const paintCell = (cell: HTMLElement, text: string, active: boolean, lineHeight = 24): void => {
         cell.style.borderColor = active ? '#ffe066' : 'transparent';
-        cell.style.color = active ? '#ffe066' : '#fff';
+        setPixelText(cell, text, {
+          color: active ? ACTIVE_COLOR : TEXT_COLOR,
+          align: 'center',
+          lineHeight,
+        });
+      };
+      modeCells.forEach((cell, i) => {
+        paintCell(cell, `${MODES[i].label}\n${MODES[i].note}`, step === 'mode' && i === cursor);
       });
       practiceCells.forEach((cell, i) => {
-        const active = step === 'practice' && i === cursor;
-        cell.style.borderColor = active ? '#ffe066' : 'transparent';
-        cell.style.color = active ? '#ffe066' : '#fff';
+        const m = PRACTICE_MODES[i];
+        paintCell(cell, `${m.label}\n${m.note}`, step === 'practice' && i === cursor);
       });
       cells.forEach((cell, i) => {
-        const active = onTeamGrid && i === cursor;
-        cell.style.borderColor = active ? '#ffe066' : 'transparent';
-        cell.style.color = active ? '#ffe066' : '#fff';
+        paintCell(cell, TEAMS[i].name, onTeamGrid && i === cursor, 20);
       });
       parkCells.forEach((cell, i) => {
-        const active = step === 'park' && i === cursor;
-        cell.style.borderColor = active ? '#ffe066' : 'transparent';
-        cell.style.color = active ? '#ffe066' : '#fff';
+        const p = BALLPARKS[i];
+        paintCell(cell, `${p.name}\n中堅 ${p.center}m\n両翼 ${p.wing}m`, step === 'park' && i === cursor);
       });
 
       // 決まった側だけを出す（先攻を選ぶ段階では、まだ何も決まっていない）
@@ -680,15 +694,14 @@ ${m.note}`;
       if (step === 'starter' || step === 'order') {
         lines.push(`操作: ${planOwnerLabel()}${teamName(planTeamId())}`);
       }
-      card.textContent = lines.join('\n');
-      card.style.whiteSpace = 'pre';
+      setPixelText(card, lines.join('\n'), { color: TEXT_COLOR, align: 'center', lineHeight: 24 });
 
       // 2P PLAY のときは、その段を動かすキーがどちらのパッドのものかを添える
       // （1P PLAY ではこれまでどおり何も付かない）。
       const owner = ownerOf(step);
       const keys = owner === 'p2' ? '矢印/テンキー' : owner === 'p1' ? '1P' : '';
       const prefix = mode === '2p' && keys !== '' ? `[${keys}] ` : '';
-      hint.textContent =
+      const hintText =
         prefix +
         (step === 'mode'
           ? 'W/S：選択　K：決定　M：BGMオン/オフ'
@@ -703,6 +716,7 @@ ${m.note}`;
                   ? 'W/S：選択　K：選手を選ぶ　Shift：決定　J：戻る'
                   : 'W/S：選択　K：入れ替え　J：取り消し'
                 : 'WASD：選択　K：決定　J：戻る');
+      setPixelText(hint, hintText, { color: HINT_COLOR });
     }
 
     /** グリッドの移動。端では止まる（一巡させると今どこにいるか見失いやすい） */
@@ -963,15 +977,25 @@ export function runRosterPlanSelect(
 
     function render(): void {
       editor.render(step, cursor);
-      title.textContent =
-        step === 'starter' ? `${opts.headline} 先発投手を選択` : '打順を決定';
-      card.textContent = `${TEAMS.find((t) => t.id === opts.teamId)?.name ?? ''}`;
-      hint.textContent =
+      setPixelText(
+        title,
+        step === 'starter' ? `${opts.headline} 先発投手を選択` : '打順を決定',
+        { scale: 2, color: TITLE_COLOR, lineHeight: 20, shadows: TITLE_SHADOWS },
+      );
+      setPixelText(card, `${TEAMS.find((t) => t.id === opts.teamId)?.name ?? ''}`, {
+        color: TEXT_COLOR,
+        align: 'center',
+        lineHeight: 24,
+      });
+      setPixelText(
+        hint,
         step === 'starter'
           ? 'WASD：選択　K：決定'
           : !editor.picking()
             ? 'W/S：選択　K：選手を選ぶ　Shift：決定　J：戻る'
-            : 'W/S：選択　K：入れ替え　J：取り消し';
+            : 'W/S：選択　K：入れ替え　J：取り消し',
+        { color: HINT_COLOR },
+      );
     }
 
     function moveCursor(dx: number, dy: number): void {

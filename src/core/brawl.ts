@@ -576,6 +576,45 @@ export function chooseCpuBrawlAction(
   return { kind: 'attack', move: 'jab' };
 }
 
+// ---- 乱闘に持ち込むか（フェーズWW-71） ----
+
+/**
+ * 乱闘の装備の強さ（体力×威力×必殺技の数）。**CPUの打者が乱闘するかの判断**に使う
+ * （`shouldCpuStartBrawl`）。必殺技1つを「体力・威力の15%ぶん」と数える＝装備の中身が
+ * 読めれば、ぶつける前に「この打者は乱闘してくるか」が分かる。
+ */
+export const SPECIAL_MOVE_STRENGTH_BONUS = 0.15;
+
+export function loadoutStrength(loadout: FighterLoadout): number {
+  return (
+    loadout.maxHp *
+    loadout.powerScale *
+    (1 + SPECIAL_MOVE_STRENGTH_BONUS * commandMoves(loadout).length)
+  );
+}
+
+/**
+ * **CPUの打者が乱闘に持ち込むか**（フェーズWW-71。決定的・乱数不使用）。
+ *
+ * 乱闘に持ち込むかを決めるのは**殴られた打者側だけ**（テストプレイ「ぶつけておいて、
+ * 乱闘するかどうかを投手の側が判断できるのはおかしい」）。人間の打者は自分で決め、
+ * CPU の打者はこの規則で決める（2026-09-23 ユーザー判断）：
+ *
+ * 1. **銃で撃たれたら必ずやり返す**（銃は狙って当てる手なので、黙って一塁へ歩く理由が無い）。
+ * 2. **普通の死球は、装備が投手以上のときだけ**（負ければ退場＝勝てる見込みがあるときだけ）。
+ *
+ * 規則が決まっているので、**人間の投手はぶつける前に読める**（打者の乱闘の装備を見れば
+ * 乱闘になるかが分かる）＝銃の予兆（F-26-2）・敬遠（Q-38）と同じ「読めるCPU」。
+ */
+export function shouldCpuStartBrawl(opts: {
+  byGun: boolean;
+  batter: FighterLoadout;
+  pitcher: FighterLoadout;
+}): boolean {
+  if (opts.byGun) return true;
+  return loadoutStrength(opts.batter) >= loadoutStrength(opts.pitcher);
+}
+
 /**
  * 決着した側（敗者）を返す。まだ決着していなければ null。
  * 万一同一フレームで両者が同時に沈んだ場合は、より深く削られた側

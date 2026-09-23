@@ -157,7 +157,7 @@ import {
   clampFocus,
   followFocus,
 } from '../core/camera';
-import { PLAY_RESULT_PAUSE_SEC } from '../core/tempo';
+import { FOUL_RESULT_PAUSE_SEC, PLAY_RESULT_PAUSE_SEC } from '../core/tempo';
 // 送球の腕（フェーズHH-55）。**この層は名鑑の語彙（ARM）を知らない**＝main.ts が
 // `fielderThrowArm` で畳んだものを受け取るだけ（走力・捕球半径と同じ切り分け）。
 import { type PitchArm, NEUTRAL_PITCH_ARM } from '../core/pitch';
@@ -457,6 +457,22 @@ const CATCH_MIN_PLAY_SEC = 0.3;
  * 近づき続ける限り待つ形にしても決着しないことは起きない。
  */
 const RESTING_PICKUP_GRACE_SEC = 2.5;
+/**
+ * 決着後の余韻（フェーズWW-71）で、走っていた野手が止まり切るまでの秒数。**見た目だけ**の
+ * 値（判定からは一度も読まない）。急停止させると決着の瞬間に全員が固まって一時停止に見える。
+ */
+const AFTERMATH_COAST_SEC = 0.6;
+/**
+ * ファウルで元の塁へ戻る走者・守備位置へ戻る野手の速さ（走力・野手の足の何倍か）。
+ * 小走り＝プレーがもう終わっていることが動きで分かる
+ */
+const AFTERMATH_JOG_SCALE = 0.55;
+/** 決着してから、ボールを持った野手が投手へ返し始めるまで（見た目だけ） */
+const AFTERMATH_TOSS_DELAY_SEC = 0.45;
+/** 投手へ返す山なりの送球の速さ m/s（見た目だけ。本物の送球 `THROW_SPEED` よりずっと緩い） */
+const AFTERMATH_TOSS_SPEED = 15;
+/** 余韻の間、走者がこの距離まで塁に寄ったら止める（m） */
+const AFTERMATH_STOP_DISTANCE = 0.05;
 /** CPU守備が確保後に送球するまでの反応時間（人間の1.5秒待ちより短く即応させる） */
 const CPU_POSSESSED_REACTION_SEC = 0.25;
 /**
@@ -1194,6 +1210,24 @@ export function createFieldPlayController(opts: {
   let runnerVisuals: RunnerVisual[] = [];
   let outcome: FieldPlayOutcome | null = null;
   let pauseT = 0;
+  /**
+   * 決着してからの経過秒（フェーズWW-71の「余韻」）。決着後も画面は止めず、ボール・野手・
+   * 走者を**見た目だけ**動かし続ける（判定はもう何もしない）。
+   */
+  let aftermathT = 0;
+  /** 決着した瞬間にボールが誰の手にも無かったか（＝ファウル・安打の球は転がり続ける） */
+  let ballFreeAtFinish = false;
+  /**
+   * 余韻の間に**ボールを投手へ返す**山なりの送球（見た目だけ。フェーズWW-71）。
+   * アウトが決まった後に野手の手の中で止まったままだと、その間の画面が静止画になる。
+   */
+  let returnToss: { from: Vec2; to: Vec2; t: number; dur: number } | null = null;
+  let returnTossDone = false;
+  /**
+   * 直前のフレームの一斉移動の向き（フェーズWW-71）。決着後の野手はこの向きのまま惰性で
+   * 止まっていく＝**走っていた野手が決着の瞬間に急停止して固まる**（一時停止に見える）を避ける。
+   */
+  let lastGroupDir: Vec2 = { x: 0, z: 0 };
   let elapsed = 0;
   /** ボールが静止してからの経過秒（RESTING_PICKUP_GRACE_SEC との比較用） */
   let restingT = 0;
@@ -1714,6 +1748,17 @@ export function createFieldPlayController(opts: {
     }
   }
 
+  /** 目標へ最大 `step` だけ近づける（行き過ぎない。決着後の余韻で守備位置へ戻るのに使う） */
+  function walkToward(p: Vec2, target: Vec2, step: number): void {
+    const dx = target.x - p.x;
+    const dz = target.z - p.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist <= CPU_SEEK_EPSILON) return;
+    const k = Math.min(step, dist) / dist;
+    p.x += dx * k;
+    p.z += dz * k;
+  }
+
   /** 場外へ出ないよう位置を丸める（一斉移動でも各自が個別にクランプされる） */
   function clampToField(p: Vec2): void {
     const r = Math.hypot(p.x, p.z);
@@ -1782,6 +1827,7 @@ export function createFieldPlayController(opts: {
       p.z += moveDir.z * FIELDER_SPEED * d;
       clampToField(p);
     }
+    lastGroupDir = moveDir;
   }
 
   /**
@@ -2032,6 +2078,11 @@ export function createFieldPlayController(opts: {
 
   function cleanup(): void {
     phase = null;
+    aftermathT = 0;
+    ballFreeAtFinish = false;
+    lastGroupDir = { x: 0, z: 0 };
+    returnToss = null;
+    returnTossDone = false;
     soundPhase = null;
     playKind = 'batted';
     pickoffTimer = 0;
@@ -2060,12 +2111,121 @@ export function createFieldPlayController(opts: {
   }
 
   function finish(result: FieldPlayOutcome): void {
+    // 決着した瞬間にボールが誰の手にも無ければ、余韻の間も転がり続ける（ファウル・安打）。
+    // 捕られた球・送球が着いた球は野手の手の中のまま（`phase` を書き換える前に見る）
+    ballFreeAtFinish =
+      holderId === null && throwState === null && ballState !== null && phase === 'flying';
     outcome = result;
     phase = 'resolved';
-    // 帰結確定後、でっかいモードへカット復帰するまでの見せ時間（フェーズE-23）
-    pauseT = PLAY_RESULT_PAUSE_SEC;
+    // 帰結確定後、でっかいモードへカット復帰するまでの見せ時間（フェーズE-23）。
+    // **ファウルは長め**（打球がどこへ行ったかを見てから戻る。フェーズWW-71）
+    pauseT = result.kind === 'foul' ? FOUL_RESULT_PAUSE_SEC : PLAY_RESULT_PAUSE_SEC;
+    aftermathT = 0;
+    returnToss = null;
+    returnTossDone = false;
     tagUpChanceOpen = false;
     clearPlayPrompt();
+    // ファウルは**プレーが無かったことになる**ので、走っていた走者は元の塁へ、打者走者は
+    // 打席へ歩いて戻る（見た目だけ。決着はもう `outcome` に入っている）
+    if (result.kind === 'foul') {
+      for (const v of runnerVisuals) {
+        if (v.out) continue;
+        v.target =
+          v.origin === 'batter'
+            ? { ...BASE_POSITIONS.home }
+            : { ...BASE_POSITIONS[v.origin as 'first' | 'second' | 'third'] };
+      }
+    }
+  }
+
+  /**
+   * 決着後の余韻（フェーズWW-71）。**見た目だけ**を動かし続ける＝判定は一切しない
+   * （捕球・送球・タッチ・進塁の確定はすべて `finish` までに済んでいる）。
+   *
+   * それまでは決着の瞬間に全員がその場で固まり、1秒止まった画を見せてから戻っていた
+   * ＝**「間」ではなく一時停止**に見えていた（テストプレイの指摘）。
+   */
+  function updateAftermath(d: number): void {
+    aftermathT += d;
+    // ボール：誰の手にも無ければ転がり続ける（フェンスで跳ね返るのも同じ物理）。
+    // 野手の手の中にあれば、少し置いてから**投手へ山なりに返す**（アウトの後の球回し）
+    if (ballFreeAtFinish && ballState) {
+      if (!ballState.resting) {
+        ballState = stepBattedBall(ballState, d, ballpark());
+        syncBall(ballState);
+      }
+    } else if (returnToss) {
+      returnToss.t = Math.min(returnToss.dur, returnToss.t + d);
+      const k = returnToss.t / returnToss.dur;
+      const x = returnToss.from.x + (returnToss.to.x - returnToss.from.x) * k;
+      const z = returnToss.from.z + (returnToss.to.z - returnToss.from.z) * k;
+      // 山なり（最高点は距離の1/8。球回しの軽い送球に見える高さ）
+      const span = distance(returnToss.from, returnToss.to);
+      const y = THROW_BALL_HEIGHT + 4 * (span / 8) * k * (1 - k);
+      ball.position.set(x, y, z);
+      if (k >= 1) {
+        returnToss = null;
+        returnTossDone = true;
+        holderId = 'P';
+      }
+    } else if (holderId !== null) {
+      const p = fielderPos[holderId];
+      ball.position.set(p.x, THROW_BALL_HEIGHT, p.z);
+      if (
+        !returnTossDone &&
+        holderId !== 'P' &&
+        aftermathT >= AFTERMATH_TOSS_DELAY_SEC &&
+        !isFielderDown(holderId)
+      ) {
+        const to = fielderPos.P;
+        const span = distance(p, to);
+        if (span > 1) {
+          returnToss = { from: { ...p }, to: { ...to }, t: 0, dur: span / AFTERMATH_TOSS_SPEED };
+          throwPose = {
+            id: holderId,
+            sec: THROW_POSE_SEC,
+            arm: throwArmFor(holderId),
+            yaw: Math.atan2(to.x - p.x, to.z - p.z),
+          };
+          holderId = null;
+        }
+      }
+    }
+    // 野手：決着した瞬間の一斉移動の向きのまま惰性で止まり、それから**守備位置へ歩いて戻る**
+    // （プレーが終わったことが動きで分かる。急停止させると全員が固まって一時停止に見える）
+    const coast = Math.max(0, 1 - aftermathT / AFTERMATH_COAST_SEC);
+    for (const id of CONTROLLABLE_FIELDERS) {
+      if (id === holderId || isFinePlayBusy(id) || isFielderDown(id)) continue;
+      if (throwPose && throwPose.id === id) continue;
+      const p = fielderPos[id];
+      if (coast > 0) {
+        p.x += lastGroupDir.x * FIELDER_SPEED * coast * d;
+        p.z += lastGroupDir.z * FIELDER_SPEED * coast * d;
+        clampToField(p);
+        continue;
+      }
+      walkToward(p, FIELDER_HOME_POSITIONS[id], FIELDER_SPEED * AFTERMATH_JOG_SCALE * d);
+    }
+    // 塁に入っていた野手も、送球が済んだら守備位置へ戻る
+    if (coast <= 0) {
+      for (const id of Object.keys(BASE_COVER_ASSIGNMENTS) as FielderId[]) {
+        if (id === holderId || isFielderDown(id)) continue;
+        if (throwPose && throwPose.id === id) continue;
+        walkToward(fielderPos[id], FIELDER_HOME_POSITIONS[id], FIELDER_SPEED * AFTERMATH_JOG_SCALE * d);
+      }
+    }
+    syncFielderMeshes();
+    // 走者：走っていた走者は行き先の塁まで走り切る（ファウルなら元の塁へ小走りで戻る）
+    const jog = outcome?.kind === 'foul' ? AFTERMATH_JOG_SCALE : 1;
+    for (const v of runnerVisuals) {
+      if (v.out || v.stumbleSec > 0) continue;
+      const remaining = distance(v.pos, v.target);
+      if (remaining <= AFTERMATH_STOP_DISTANCE) continue;
+      const t = Math.min(1, (runSpeed(v) * jog * d) / remaining);
+      v.pos = { x: v.pos.x + (v.target.x - v.pos.x) * t, z: v.pos.z + (v.target.z - v.pos.z) * t };
+      placeRunner(v);
+    }
+    syncRunnerPoses();
   }
 
   function decideFallback(b: BattedBall, restingSeconds: number): FieldPlayOutcome | null {
@@ -3647,6 +3807,8 @@ export function createFieldPlayController(opts: {
       syncPlayPrompt();
 
       if (phase === 'resolved') {
+        // 決着後も画面は止めない（フェーズWW-71）：見た目だけ動かし続けてから戻る
+        updateAftermath(d);
         pauseT -= d;
         if (pauseT <= 0 && outcome) {
           const settled = outcome;
