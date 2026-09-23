@@ -3,6 +3,9 @@ import { type BaseRunners, type Bases, EMPTY_BASES } from '../src/core/rules';
 import { type BattedBall, createBattedBall, stepBattedBall } from '../src/core/batting';
 import { CATCH_Z, RELEASE_Z, SPEED_NEUTRAL, SPEED_SLOW } from '../src/core/pitch';
 import { TEAMS, fielderRowStats } from '../src/core/teams';
+// 守備側の入口（`shouldCpuPickoff`）と攻撃側の入口（`canTakeLeadOff`）が噛み合って
+// いることを固定するため（フェーズKK-58）。
+import { shouldCpuPickoff } from '../src/core/cpuPitcher';
 import {
   type CpuStealOptions,
   type FielderId,
@@ -50,6 +53,7 @@ import {
   applyForcedResult,
   baseFromPadDirection,
   canCatch,
+  canTakeLeadOff,
   chooseCpuFinePlay,
   chooseCpuPickoffThrow,
   chooseCpuSteals,
@@ -1333,6 +1337,63 @@ describe('盗塁（説明書p13：投球中も走塁操作が可能）', () => {
         stealSafeJumpSec('first'),
         10,
       );
+    });
+  });
+
+  /**
+   * フェーズKK-58：**攻撃側から「リードを取りに行く」入口**。
+   *
+   * II-56（人間の走者はけん制モード中に押している間だけリードする）と JJ-57（CPUは
+   * リード>0の走者がいるときだけけん制する）が輪になり、**塁についたままの走者は
+   * 永久に塁を離れられなくなっていた**。ここが守備側の `shouldCpuPickoff` と対になる
+   * 攻撃側の入口で、輪を切っているのはこの関数ひとつ。
+   */
+  describe('canTakeLeadOff（攻撃側からにらみ合いへ入る。フェーズKK-58）', () => {
+    const first = { first: true, second: false, third: false };
+
+    it('走者がいて、まだ使っておらず、投手が投球動作に入っていなければ入れる', () => {
+      expect(canTakeLeadOff(first, false, false)).toBe(true);
+    });
+
+    it('走者がいなければ入らない（にらみ合う相手がいない）', () => {
+      expect(canTakeLeadOff(EMPTY_BASES, false, false)).toBe(false);
+    });
+
+    it('どの塁の走者でも入れる（三塁走者だけでもリードは取れる）', () => {
+      expect(canTakeLeadOff({ first: false, second: true, third: false }, false, false)).toBe(true);
+      expect(canTakeLeadOff({ first: false, second: false, third: true }, false, false)).toBe(true);
+    });
+
+    /**
+     * 1打席1回（CPU投手のけん制と対称）。**入っただけで消費する**ので、この関数は
+     * 「リードを取れたか」を引数に取らない＝バイクの点火・ドロップキック・引き返しと
+     * 同じ「空振りでも1回」。
+     */
+    it('その打席で一度使っていれば入れない', () => {
+      expect(canTakeLeadOff(first, true, false)).toBe(false);
+    });
+
+    /**
+     * 投球動作中のJは従来どおり盗塁（A-7）＝**同じキーが同時に2つの意味を持たない**。
+     * 門番を `canStartPickoff`（守備側の入口）と揃えてあるので、捕球後の settle にも
+     * 割り込まない。
+     */
+    it('投手が投球動作に入っていれば入れない（そのJは盗塁のもの）', () => {
+      expect(canTakeLeadOff(first, false, true)).toBe(false);
+    });
+
+    /**
+     * KK-58 が切った輪そのもの：**入口を通ってリードを取れば、JJ-57 のけん制が
+     * 発火するようになる**（リード0のままでは撃たれない＝JJ-57 のユーザー要望は不変）。
+     * 攻撃側の入口と守備側の入口が噛み合っていることを、両方の純粋関数で固定する。
+     */
+    it('入ってリードを取れば、CPUのけん制（JJ-57）が発火する側へ回る', () => {
+      // 入る前：塁についたままなので、CPUは見に来ない（＝リードを取る機会が無い）
+      expect(shouldCpuPickoff(first, false, {})).toBe(false);
+      // その状況でも攻撃側からは入れる（ここが KK-58 で開いた唯一の入口）
+      expect(canTakeLeadOff(first, false, false)).toBe(true);
+      // 取ったリードが持ち越されれば、次の球からは JJ-57 の条件を満たす
+      expect(shouldCpuPickoff(first, false, { first: 4.0 })).toBe(true);
     });
   });
 });

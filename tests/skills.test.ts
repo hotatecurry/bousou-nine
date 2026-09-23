@@ -119,10 +119,12 @@ describe('SKILLS: 名鑑の約束', () => {
     }
   });
 
-  it('表示名はカタカナ8文字以内（3択画面とカードの幅がデータで崩れない）', () => {
+  it('表示名は全角8文字以内（3択画面とカードの幅がデータで崩れない）', () => {
     for (const id of ALL_SKILL_IDS) {
       expect(SKILLS[id].name.length).toBeLessThanOrEqual(SKILL_NAME_MAX_LENGTH);
-      expect(SKILLS[id].name).toMatch(/^[ァ-ヶー]+$/);
+      // ブラッシュアップで漢字かな交じりにした（外来語はカタカナのまま）。**半角を混ぜない**
+      // ＝全角だけなら文字数がそのまま表示幅（全角1文字＝半角2つ）になり、幅の約束が崩れない
+      expect(SKILLS[id].name).toMatch(/^[\u3040-\u30ff\u4e00-\u9fff々ー・]+$/);
     }
   });
 

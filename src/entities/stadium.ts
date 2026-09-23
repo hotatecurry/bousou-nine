@@ -24,6 +24,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import stadiumModelUrl from '../assets/stadium.glb?url';
+import { toToonMaterial } from '../render/toon';
 
 /**
  * 部品の名前（`assets-src/stadium.blend` のオブジェクト名と一致させる）。
@@ -93,7 +94,10 @@ export async function preloadStadiumModel(): Promise<void> {
       const mesh = obj as THREE.Mesh;
       if (!mesh.isMesh) return;
       const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      for (const material of materials) prims.push({ geometry: mesh.geometry, material });
+      // トゥーン調（光源を使わない空のドームはそのまま＝`toToonMaterial` が素通しする）
+      for (const material of materials) {
+        prims.push({ geometry: mesh.geometry, material: toToonMaterial(material) });
+      }
     });
     if (prims.length === 0) {
       throw new Error(`preloadStadiumModel: ${part} にメッシュが無い`);

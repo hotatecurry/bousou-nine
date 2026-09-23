@@ -23,6 +23,7 @@ import { teamById } from '../core/teams';
 import type { VirtualPad } from '../input/keyboard';
 import { applyPanelChrome } from './hud/hud';
 import { createPixelLabel } from './hud/pixelText';
+import { sfx } from '../audio/sfx';
 
 // 抽選画面と同じ暗幕（同じ「試合を止めて選ぶ画面」の家族）
 const OVERLAY_STYLE = `
@@ -43,7 +44,7 @@ function describeDoor(door: RunDoor, selected: boolean): string {
   return [
     `${selected ? '▶ ' : '　 '}${teamById(door.opponent).name}`,
     `　　 ${park.name} ${park.center}m/${park.wing}m`,
-    `　　 ケイトウ: ${lineages}`,
+    `　　 系統: ${lineages}`,
   ].join('\n');
 }
 
@@ -55,11 +56,11 @@ export function runNextSelect(
   root: HTMLElement,
   pad: VirtualPad,
   opts: {
-    /** 「1シアイメ カチ!」 */
+    /** 「1試合目 勝利！」 */
     headline: string;
     /** 「ウィンズ 5 - 3 ロケッツ」 */
     score: string;
-    /** 「ツギハ 2/5 シアイメ」 */
+    /** 「次は 2/5試合目」 */
     progress: string;
     /**
      * 次の相手が持ってくるスキルの数（フェーズF-26-6）。**相手も同じだけ蓄積している**
@@ -84,16 +85,15 @@ export function runNextSelect(
     const overlay = document.createElement('div');
     overlay.style.cssText = OVERLAY_STYLE;
 
-    const title = createPixelLabel('', { fontSize: 10, scale: 3, color: '#ffe066' });
+    const title = createPixelLabel('', { scale: 2, color: '#ffe066' });
     applyPanelChrome(title.el);
     title.el.style.marginBottom = '10px';
 
-    const list = createPixelLabel('', { fontSize: 9, scale: 3, color: '#f8f8f8' });
+    const list = createPixelLabel('', { scale: 1, color: '#f8f8f8' });
     applyPanelChrome(list.el);
 
-    const hint = createPixelLabel('W/S:センタク K:ケッテイ', {
-      fontSize: 7,
-      scale: 2,
+    const hint = createPixelLabel('W/S:選択 K:決定', {
+      scale: 1,
       color: '#cccccc',
     });
     Object.assign(hint.el.style, {
@@ -111,10 +111,10 @@ export function runNextSelect(
       const doors = opts.doors.map((door, i) => describeDoor(door, i === cursor)).join('\n');
       list.setText(
         [
-          `${opts.progress}　アイテノ スキル ${opts.opponentSkills}コ`,
-          ...(opts.rerollsLeft > 0 ? [`ヒキナオシ ノコリ ${opts.rerollsLeft}カイ`] : []),
+          `${opts.progress}　相手のスキル ${opts.opponentSkills}個`,
+          ...(opts.rerollsLeft > 0 ? [`引き直し 残り${opts.rerollsLeft}回`] : []),
           '',
-          'ツギノ アイテヲ エラベ',
+          '次の相手を選択',
           doors,
         ].join('\n'),
       );
@@ -125,9 +125,16 @@ export function runNextSelect(
       render();
     }
 
-    const offUp = pad.onPress('up', () => move(-1));
-    const offDown = pad.onPress('down', () => move(1));
+    const offUp = pad.onPress('up', () => {
+      sfx.menuMove();
+      move(-1);
+    });
+    const offDown = pad.onPress('down', () => {
+      sfx.menuMove();
+      move(1);
+    });
     const offA = pad.onPress('a', () => {
+      sfx.menuConfirm();
       offUp();
       offDown();
       offA();
@@ -150,7 +157,7 @@ export function matchEnd(
   root: HTMLElement,
   pad: VirtualPad,
   opts: {
-    /** 「1P ノ カチ!」／「ヒキワケ」 */
+    /** 「1Pの勝ち！」／「引き分け」 */
     headline: string;
     /** 「ウィンズ 5 - 3 ロケッツ」 */
     score: string;
@@ -163,8 +170,7 @@ export function matchEnd(
     overlay.style.cssText = OVERLAY_STYLE;
 
     const title = createPixelLabel('', {
-      fontSize: 10,
-      scale: 4,
+      scale: 3,
       color: '#ffe066',
       align: 'center',
     });
@@ -172,13 +178,12 @@ export function matchEnd(
     title.el.style.marginBottom = '10px';
     title.setText(`${opts.headline}\n${opts.score}`);
 
-    const list = createPixelLabel('', { fontSize: 9, scale: 3, color: '#f8f8f8' });
+    const list = createPixelLabel('', { scale: 1, color: '#f8f8f8' });
     applyPanelChrome(list.el);
     list.setText(opts.lines.join('\n'));
 
-    const hint = createPixelLabel('K デ チーム センタクヘ', {
-      fontSize: 7,
-      scale: 2,
+    const hint = createPixelLabel('Kでチーム選択へ', {
+      scale: 1,
       color: '#cccccc',
     });
     Object.assign(hint.el.style, {
@@ -214,7 +219,7 @@ export function runEnd(
     game: number;
     wins: number;
     total: number;
-    /** 「ムラセ: キンニク ネバリ」の並び（呼び出し側がロスターから起こす） */
+    /** 「村瀬: 筋肉 粘り」の並び（呼び出し側がロスターから起こす） */
     build: readonly string[];
   },
 ): Promise<void> {
@@ -223,8 +228,7 @@ export function runEnd(
     overlay.style.cssText = OVERLAY_STYLE;
 
     const title = createPixelLabel('', {
-      fontSize: 10,
-      scale: 4,
+      scale: 3,
       color: opts.cleared ? '#ffe066' : '#ff6666',
       align: 'center',
     });
@@ -232,19 +236,18 @@ export function runEnd(
     title.el.style.marginBottom = '10px';
     title.setText(
       opts.cleared
-        ? `ラン クリア!\n${opts.total}レンショウ`
-        : `ハイタイ\n${opts.game}シアイメ ${opts.wins}カツ`,
+        ? `ランクリア！\n${opts.total}連勝`
+        : `敗退\n${opts.game}試合目 ${opts.wins}勝`,
     );
 
-    const list = createPixelLabel('', { fontSize: 9, scale: 3, color: '#f8f8f8' });
+    const list = createPixelLabel('', { scale: 1, color: '#f8f8f8' });
     applyPanelChrome(list.el);
     list.setText(
-      ['ソダテタ スキル', ...(opts.build.length > 0 ? opts.build : ['　 ナシ'])].join('\n'),
+      ['育てたスキル', ...(opts.build.length > 0 ? opts.build : ['　 なし'])].join('\n'),
     );
 
-    const hint = createPixelLabel('K デ アタラシイ ラン', {
-      fontSize: 7,
-      scale: 2,
+    const hint = createPixelLabel('Kで新しいラン', {
+      scale: 1,
       color: '#cccccc',
     });
     Object.assign(hint.el.style, {

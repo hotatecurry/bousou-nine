@@ -64,28 +64,28 @@ describe('打者カード（フェーズD-18）', () => {
     const roster = createTeamRoster(AWAY_TEAM);
     const lines = batterCardText(roster).split('\n');
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toBe('ダシャ 1バン CF');
-    // 名前と、原作の名鑑と同じ記号（AV/HR）での打率・本塁打数
+    expect(lines[0]).toBe('打者 1番 中堅');
+    // 名前と打率・本塁打数（ブラッシュアップで原作の記号 AV/HR から日本語の見出しにした）
     const batter = roster.players[roster.lineup[0]];
     expect(lines[1]).toBe(
-      `ムラセ AV${formatAverage(batter.batting.average)} HR${displayHomeRuns(batter.batting.power)}` +
-        ` ソウ${ratingBar(batter.batting.run)}`,
+      `村瀬 打率${formatAverage(batter.batting.average)} 本塁打${displayHomeRuns(batter.batting.power)}` +
+        ` 走力${ratingBar(batter.batting.run)}`,
     );
-    expect(lines[2]).toBe('ダイダ ノコリ3');
+    expect(lines[2]).toBe('代打 残り3');
   });
 
   it('打順が進むとその打者のカードになる（9番は投手）', () => {
     const roster = createTeamRoster(AWAY_TEAM);
-    expect(batterCardText(setLineupIndex(roster, 3)).split('\n')[0]).toBe('ダシャ 4バン 1B');
+    expect(batterCardText(setLineupIndex(roster, 3)).split('\n')[0]).toBe('打者 4番 一塁');
     // 4番（主砲）は1番より本塁打が多く見える＝カードが打者の違いを伝えている
     const homeRuns = (slot: number) =>
       displayHomeRuns(roster.players[roster.lineup[slot]].batting.power);
     const slugger = batterCardText(setLineupIndex(roster, 3)).split('\n')[1];
     expect(slugger).toBe(
-      `アカツカ AV.275 HR${homeRuns(3)} ソウ${ratingBar(roster.players[roster.lineup[3]].batting.run)}`,
+      `赤塚 打率.275 本塁打${homeRuns(3)} 走力${ratingBar(roster.players[roster.lineup[3]].batting.run)}`,
     );
     expect(homeRuns(3)).toBeGreaterThan(homeRuns(0));
-    expect(batterCardText(setLineupIndex(roster, 8)).split('\n')[0]).toBe('ダシャ 9バン P');
+    expect(batterCardText(setLineupIndex(roster, 8)).split('\n')[0]).toBe('打者 9番 投手');
   });
 
   it('代打を送るとカードの名前と数字が入れ替わり、残り人数が減る', () => {
@@ -94,13 +94,13 @@ describe('打者カード（フェーズD-18）', () => {
     expect(ok).toBe(true);
     const lines = batterCardText(next).split('\n');
     // 代打は退いた選手の守備位置を引き継ぐ（フェーズB-10）ので見出しは変わらない
-    expect(lines[0]).toBe('ダシャ 1バン CF');
+    expect(lines[0]).toBe('打者 1番 中堅');
     const pinch = next.players[next.lineup[0]];
     expect(lines[1]).toBe(
-      `ウチヤマ AV${formatAverage(pinch.batting.average)} HR${displayHomeRuns(pinch.batting.power)}` +
-        ` ソウ${ratingBar(pinch.batting.run)}`,
+      `内山 打率${formatAverage(pinch.batting.average)} 本塁打${displayHomeRuns(pinch.batting.power)}` +
+        ` 走力${ratingBar(pinch.batting.run)}`,
     );
-    expect(lines[2]).toBe('ダイダ ノコリ2');
+    expect(lines[2]).toBe('代打 残り2');
   });
 
   it('守備位置を持たない打者（投手の打席への代打）では打順だけを出す', () => {
@@ -108,7 +108,7 @@ describe('打者カード（フェーズD-18）', () => {
     const { roster: next, ok } = substituteBatterAt(roster, 0);
     expect(ok).toBe(true);
     // 投手の打席への代打は自動継投を伴い、この1打席だけ守備位置を持たない
-    expect(batterCardText(next).split('\n')[0]).toBe('ダシャ 9バン');
+    expect(batterCardText(next).split('\n')[0]).toBe('打者 9番');
   });
 });
 
@@ -128,7 +128,7 @@ describe('打者カードの走力（フェーズFF-53）', () => {
     const stats = effectiveBatting(roster, roster.lineup[0]);
     const line = batterCardText(roster).split('\n')[1];
     // 表（`batterStatCells`）の3つ目の列＝同じ選手が画面をまたいで同じ見え方をする
-    expect(line.endsWith(` ソウ${batterStatCells(stats)[2]}`)).toBe(true);
+    expect(line.endsWith(` 走力${batterStatCells(stats)[2]}`)).toBe(true);
   });
 
   it('走力の違う打者はバーの長さが違う（列が飾りになっていない）', () => {
@@ -136,7 +136,7 @@ describe('打者カードの走力（フェーズFF-53）', () => {
     const bars = roster.lineup.map(
       (id) => batterCardText(setLineupIndex(roster, roster.lineup.indexOf(id))).split('\n')[1],
     );
-    expect(new Set(bars.map((line) => line.slice(line.indexOf('ソウ')))).size).toBeGreaterThan(1);
+    expect(new Set(bars.map((line) => line.slice(line.indexOf('走力')))).size).toBeGreaterThan(1);
   });
 
   it('スキルで走力が上がればバーも伸びる（表示はレーティングからの導出）', () => {
@@ -145,10 +145,10 @@ describe('打者カードの走力（フェーズFF-53）', () => {
     const faster = grantSkill(roster, roster.lineup[8], 'chita').roster;
     const bar = (r: TeamRoster) => {
       const line = batterCardText(r).split('\n')[1];
-      return line.slice(line.indexOf('ソウ'));
+      return line.slice(line.indexOf('走力'));
     };
     expect(bar(faster)).not.toBe(bar(roster));
-    expect(bar(faster)).toBe(`ソウ${ratingBar(effectiveBatting(faster, faster.lineup[8]).run)}`);
+    expect(bar(faster)).toBe(`走力${ratingBar(effectiveBatting(faster, faster.lineup[8]).run)}`);
   });
 
   it('好調（D-19）では走力のバーは動かない（好調が動かすのは打撃だけ）', () => {
@@ -157,7 +157,7 @@ describe('打者カードの走力（フェーズFF-53）', () => {
     const slot = roster.lineup.findIndex((id) => roster.hot.includes(id));
     const hot = batterCardText(setLineupIndex(roster, slot), 1).split('\n')[1];
     const plain = batterCardText(setLineupIndex(base, slot)).split('\n')[1];
-    expect(hot.slice(hot.indexOf('ソウ'))).toBe(plain.slice(plain.indexOf('ソウ')));
+    expect(hot.slice(hot.indexOf('走力'))).toBe(plain.slice(plain.indexOf('走力')));
   });
 });
 
@@ -179,7 +179,7 @@ describe('打者カードの好調（フェーズD-19）', () => {
     expect(slot).toBeGreaterThanOrEqual(0);
     const lines = batterCardText(setLineupIndex(roster, slot), 1).split('\n');
     expect(lines).toHaveLength(4);
-    expect(lines[3]).toBe('ゼッコーチョー!');
+    expect(lines[3]).toBe('絶好調！');
     // 数字も一緒に動いている（表示はレーティングからの導出。⑥）
     const plain = batterCardText(setLineupIndex(base, slot)).split('\n')[1];
     expect(lines[1]).not.toBe(plain);
@@ -187,8 +187,8 @@ describe('打者カードの好調（フェーズD-19）', () => {
 
   it('ラッキー7（7回）は好調でない打者のカードにも出る', () => {
     const roster = createTeamRoster(AWAY_TEAM);
-    expect(batterCardText(roster, LUCKY_INNING).split('\n')).toContain('ゼッコーチョー!');
-    expect(batterCardText(roster, LUCKY_INNING - 1).split('\n')).not.toContain('ゼッコーチョー!');
+    expect(batterCardText(roster, LUCKY_INNING).split('\n')).toContain('絶好調！');
+    expect(batterCardText(roster, LUCKY_INNING - 1).split('\n')).not.toContain('絶好調！');
   });
 
   it('イニングを渡さない呼び出しは従来とまったく同じ文言', () => {
@@ -202,9 +202,9 @@ describe('投手カード（フェーズD-18）', () => {
     const roster = createTeamRoster(HOME_TEAM);
     const lines = pitcherCardText(roster).split('\n');
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toBe('トウシュ イワブチ');
+    expect(lines[0]).toBe('投手 岩渕');
     const era = roster.players[roster.pitcher].pitching!.era;
-    expect(lines[1]).toBe(`ERA${formatEra(era)} キュウエン ノコリ${BULLPEN_SIZE}`);
+    expect(lines[1]).toBe(`防御率${formatEra(era)} 救援 残り${BULLPEN_SIZE}`);
     // 無傷は10目盛りすべて埋まっている（B-11のゲージをそのままカードへ移した）
     expect(lines[2]).toBe('スタミナ ■■■■■■■■■■');
   });
@@ -220,7 +220,7 @@ describe('投手カード（フェーズD-18）', () => {
     const spent = pitcherCardText(throwPitches(roster, max)).split('\n');
     expect(spent).toHaveLength(4);
     expect(spent[2]).toBe('スタミナ □□□□□□□□□□');
-    expect(spent[3]).toBe('キュウイダウン');
+    expect(spent[3]).toBe('球威ダウン');
     // 疲労で行が増えてもいちばん長い行の長さは変わらない＝カードの幅が変わらない
     // （全角/半角の差でピクセル幅とは一致しないが、警告を別行にした狙いはこれで固定できる）
     const longest = (lines: string[]) => Math.max(...lines.map((l) => l.length));
@@ -233,9 +233,9 @@ describe('投手カード（フェーズD-18）', () => {
     expect(ok).toBe(true);
     const lines = pitcherCardText(next).split('\n');
     const reliever = next.players[next.pitcher];
-    expect(lines[0]).toBe('トウシュ ホソヤ');
+    expect(lines[0]).toBe('投手 細谷');
     expect(lines[1]).toBe(
-      `ERA${formatEra(reliever.pitching!.era)} キュウエン ノコリ${BULLPEN_SIZE - 1}`,
+      `防御率${formatEra(reliever.pitching!.era)} 救援 残り${BULLPEN_SIZE - 1}`,
     );
     expect(lines[2]).toBe('スタミナ ■■■■■■■■■■');
   });
@@ -245,9 +245,9 @@ describe('投手カード（フェーズD-18）', () => {
     const fielder = roster.lineup[0];
     const broken: TeamRoster = { ...roster, pitcher: fielder };
     const lines = pitcherCardText(broken).split('\n');
-    expect(lines[0]).toBe('トウシュ アイハラ');
+    expect(lines[0]).toBe('投手 相原');
     // 防御率の欄は落とし、残りの情報はそのまま出す
-    expect(lines[1]).toBe(`キュウエン ノコリ${BULLPEN_SIZE}`);
+    expect(lines[1]).toBe(`救援 残り${BULLPEN_SIZE}`);
     expect(lines[2]).toBe('スタミナ ■■■■■■■■■■');
   });
 });
@@ -298,17 +298,17 @@ describe('スコアボード・勝敗表示（フェーズC-13）', () => {
     expect(scoreboardText(ctx).split('\n')).toHaveLength(3);
     const withRun = scoreboardText(ctx, { game: 3, wins: 2, total: 5 }).split('\n');
     expect(withRun).toHaveLength(4);
-    expect(withRun[0]).toBe('ラン 3/5 2カツ');
+    expect(withRun[0]).toBe('ラン 3/5 2勝');
   });
 
   it('勝敗表示は球団名で出る', () => {
     const actor = startGame('winds', 'rockets');
     // 9回裏を待たずに決着させる（没収試合＝相手の勝ち）
     actor.send({ type: 'FORFEIT', loser: 'home' });
-    expect(winnerText(actor.getSnapshot().context)).toBe('ウィンズ ノ カチ!');
+    expect(winnerText(actor.getSnapshot().context)).toBe('ウィンズの勝ち！');
     const away = startGame('winds', 'rockets');
     away.send({ type: 'FORFEIT', loser: 'away' });
-    expect(winnerText(away.getSnapshot().context)).toBe('ロケッツ ノ カチ!');
+    expect(winnerText(away.getSnapshot().context)).toBe('ロケッツの勝ち！');
   });
 
   it('試合前なら選び直せるが、1球投げた後のチーム変更は効かない', () => {
@@ -335,6 +335,14 @@ describe('スコアボード・勝敗表示（フェーズC-13）', () => {
  * 銃の行（フェーズF-26-2）。銃はスキル `ジュウ` に吸収されたので、**取っていない試合では
  * 行そのものが出ない**（＝D-18で詰めたパネルの高さの前提を、取っていない間は動かさない）。
  */
+/**
+ * 状況パネルの幅の予算（半角換算）。D-18 で「決着バナーと重ならない」ように詰めた幅＝
+ * 当時の操作の行（`◆ソウサ:トウキュウ  Start:サクセン`）の表示幅。ブラッシュアップで
+ * 文言が漢字になって操作の行そのものは短くなったが、**パネルが越えてはいけない幅**は
+ * この数字のまま＝リードの行・走力の行が足されてもここを超えない。
+ */
+const D18_SITUATION_PANEL_WIDTH = 35;
+
 describe('状況パネルのリードの行（フェーズL-32）', () => {
   it('持ち越したリードが無ければ行そのものが出ない（平常時はL-32の前と同じ高さ）', () => {
     expect(leadLine(undefined)).toBe('');
@@ -360,7 +368,7 @@ describe('状況パネルのリードの行（フェーズL-32）', () => {
     const width = (s: string): number =>
       [...s].reduce((w, c) => w + (c.charCodeAt(0) < 0x80 ? 1 : 2), 0);
     const longest = leadLine({ first: 6, second: 6, third: 6 }).replace('\n', '');
-    expect(width(longest)).toBeLessThan(width('◆ソウサ:トウキュウ  Start:サクセン'));
+    expect(width(longest)).toBeLessThan(D18_SITUATION_PANEL_WIDTH);
   });
 });
 
@@ -402,20 +410,20 @@ describe('状況パネルの走者の走力の行（フェーズFF-53）', () =>
   it('塁の番号と走力のバーが、リードの行と同じ並びで出る', () => {
     const game = withRunners({ first: 0 });
     const runner = game.rosters.away.players[game.rosters.away.lineup[0]];
-    expect(runnerSpeedLine(game)).toBe(`\nソウ 1:${ratingBar(runner.batting.run)}`);
+    expect(runnerSpeedLine(game)).toBe(`\n走力 1:${ratingBar(runner.batting.run)}`);
   });
 
   it('複数の走者を塁の順に並べる（ダブルスチールでどちらを走らせるかの材料）', () => {
     const game = withRunners({ first: 3, second: 0 });
     const bar = (slot: number) =>
       ratingBar(game.rosters.away.players[game.rosters.away.lineup[slot]].batting.run);
-    expect(runnerSpeedLine(game)).toBe(`\nソウ 1:${bar(3)} 2:${bar(0)}`);
+    expect(runnerSpeedLine(game)).toBe(`\n走力 1:${bar(3)} 2:${bar(0)}`);
   });
 
   it('満塁は3人目を字下げして次の行へ送る（パネルの横幅を広げないため）', () => {
     const lines = runnerSpeedLine(withRunners({ first: 0, second: 1, third: 2 })).split('\n');
     expect(lines).toHaveLength(3); // 先頭の空文字（改行から始まる）＋2行
-    expect(lines[1].startsWith('ソウ 1:')).toBe(true);
+    expect(lines[1].startsWith('走力 1:')).toBe(true);
     expect(lines[2].startsWith('　　 3:')).toBe(true);
     // 続きの行の字下げは見出しとちょうど同じ幅＝塁の番号が縦に揃う
     expect(width(lines[1].split('1:')[0])).toBe(width(lines[2].split('3:')[0]));
@@ -425,7 +433,7 @@ describe('状況パネルの走者の走力の行（フェーズFF-53）', () =>
     const longest = runnerSpeedLine(withRunners({ first: 0, second: 1, third: 2 }))
       .split('\n')
       .reduce((a, b) => (width(a) >= width(b) ? a : b));
-    expect(width(longest)).toBeLessThan(width('◆ソウサ:トウキュウ  Start:サクセン'));
+    expect(width(longest)).toBeLessThan(D18_SITUATION_PANEL_WIDTH);
   });
 
   it('スキルで走力が上がった走者はバーも伸びる（判定と表示が同じ出どころ）', () => {
@@ -439,7 +447,7 @@ describe('状況パネルの走者の走力の行（フェーズFF-53）', () =>
     };
     expect(runnerSpeedLine(faster)).not.toBe(before);
     expect(runnerSpeedLine(faster)).toBe(
-      `\nソウ 1:${ratingBar(effectiveBatting(faster.rosters.away, id).run)}`,
+      `\n走力 1:${ratingBar(effectiveBatting(faster.rosters.away, id).run)}`,
     );
   });
 
@@ -453,7 +461,7 @@ describe('状況パネルの走者の走力の行（フェーズFF-53）', () =>
       runs: 0,
       bases: { first: true, second: false, third: false },
     });
-    expect(runnerSpeedLine(actor.getSnapshot().context)).toBe(`\nソウ 1:${ratingBar(0.5)}`);
+    expect(runnerSpeedLine(actor.getSnapshot().context)).toBe(`\n走力 1:${ratingBar(0.5)}`);
   });
 
   it('攻撃側のロスターから引く（裏の攻撃では後攻の走者を出す）', () => {
@@ -472,7 +480,7 @@ describe('状況パネルの走者の走力の行（フェーズFF-53）', () =>
     });
     const game = actor.getSnapshot().context;
     expect(runnerSpeedLine(game)).toBe(
-      `\nソウ 2:${ratingBar(home.players[home.lineup[0]].batting.run)}`,
+      `\n走力 2:${ratingBar(home.players[home.lineup[0]].batting.run)}`,
     );
   });
 });
@@ -490,19 +498,19 @@ describe('状況パネルの銃の行（フェーズF-26-2）', () => {
   });
 
   it('スキルを持つ投手のときは残弾が出る', () => {
-    expect(gunLine(withGun(), false)).toBe('\nジュウ ノコリ 3');
+    expect(gunLine(withGun(), false)).toBe('\n銃 残り3');
   });
 
   it('銃モード中は構えていることが分かる表記になる', () => {
-    expect(gunLine(withGun(), true)).toBe('\n▶ジュウ モード (ノコリ 3)');
+    expect(gunLine(withGun(), true)).toBe('\n▶銃モード（残り3）');
   });
 
   it('撃つと残弾の表示が減り、撃ち切っても行は残る（弾切れが見える）', () => {
     let roster = withGun();
     roster = recordGunShot(roster);
-    expect(gunLine(roster, false)).toBe('\nジュウ ノコリ 2');
+    expect(gunLine(roster, false)).toBe('\n銃 残り2');
     roster = recordGunShot(recordGunShot(roster));
-    expect(gunLine(roster, false)).toBe('\nジュウ ノコリ 0');
+    expect(gunLine(roster, false)).toBe('\n銃 残り0');
   });
 
   it('継投で銃を持たない投手になれば行ごと消える（残弾は投手個人のもの）', () => {
@@ -512,7 +520,7 @@ describe('状況パネルの銃の行（フェーズF-26-2）', () => {
 
   it('投手カードにもスキルとして出る（何を持っているかが1か所で分かる）', () => {
     const lines = pitcherCardText(withGun()).split('\n');
-    expect(lines[lines.length - 1]).toBe('スキル ジュウ');
+    expect(lines[lines.length - 1]).toBe('スキル 銃');
   });
 
   /**
@@ -530,7 +538,7 @@ describe('状況パネルの銃の行（フェーズF-26-2）', () => {
       roster = grantSkill(roster, id, skillId).roster;
     }
     const lines = pitcherCardText(roster).split('\n');
-    expect(lines.filter((l) => l.includes('タフネス') || l.includes('ホーミングダン'))).toHaveLength(2);
+    expect(lines.filter((l) => l.includes('タフネス') || l.includes('ホーミング弾'))).toHaveLength(2);
     // カードの幅は**表示幅**で決まる（カタカナは半角の2倍で描かれる）ので、文字数ではなく
     // そちらで測る。スタミナゲージ＝D-18でカードの幅を決めている行を超えないこと。
     const displayWidth = (line: string) =>
@@ -557,8 +565,8 @@ describe('選手カードの消費型スキル（フェーズF-26-8）', () => {
    * 状態になっていた（実機で発見：Gで銃モードには入れるのにパネルは2行のまま）。
    */
   it('消費型の弾だけの投手でも銃の行が出る（撃てるのに残弾が見えない、を防ぐ）', () => {
-    expect(gunLine(withConsumable(), false)).toBe('\nジュウ ノコリ 1');
-    expect(gunLine(withConsumable(), true)).toBe('\n▶ジュウ モード (ノコリ 1)');
+    expect(gunLine(withConsumable(), false)).toBe('\n銃 残り1');
+    expect(gunLine(withConsumable(), true)).toBe('\n▶銃モード（残り1）');
   });
 
   it('撃ち切れば行ごと消える（消費型は弾切れの表示を残さない）', () => {
@@ -567,19 +575,19 @@ describe('選手カードの消費型スキル（フェーズF-26-8）', () => {
 
   it('消費型は残り回数まで出る', () => {
     const lines = pitcherCardText(withConsumable()).split('\n');
-    expect(lines[lines.length - 1]).toBe('スキル ヨビジュウ ノコリ1');
+    expect(lines[lines.length - 1]).toBe('スキル 予備銃 残り1');
   });
 
   it('常設のスキルには残り回数を出さない（従来の見た目のまま）', () => {
     const roster = createTeamRoster(HOME_TEAM);
     const lines = pitcherCardText(grantSkill(roster, roster.pitcher, 'ju').roster).split('\n');
-    expect(lines[lines.length - 1]).toBe('スキル ジュウ');
+    expect(lines[lines.length - 1]).toBe('スキル 銃');
   });
 
   it('使い切ると行ごと消える（もう使えないものはカードに残らない）', () => {
     const roster = recordGunShot(withConsumable());
     const lines = pitcherCardText(roster).split('\n');
-    expect(lines.some((l) => l.includes('ヨビジュウ'))).toBe(false);
+    expect(lines.some((l) => l.includes('予備銃'))).toBe(false);
   });
 
   it('残り回数が付いてもカードは横に伸びない（スタミナゲージを超えない）', () => {
@@ -588,7 +596,7 @@ describe('選手カードの消費型スキル（フェーズF-26-8）', () => {
     roster = grantSkill(roster, roster.pitcher, 'tafunesu').roster;
     roster = grantSkill(roster, roster.pitcher, 'haguruma').roster;
     const lines = pitcherCardText(roster).split('\n');
-    expect(lines.some((l) => l.includes('ヨビジュウ ノコリ3'))).toBe(true);
+    expect(lines.some((l) => l.includes('予備銃 残り3'))).toBe(true);
     const displayWidth = (line: string) =>
       [...line].reduce((w, ch) => w + (/[ -~]/.test(ch) ? 1 : 2), 0);
     const gauge = displayWidth(lines.find((l) => l.startsWith('スタミナ'))!);

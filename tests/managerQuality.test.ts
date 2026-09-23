@@ -106,7 +106,7 @@ describe('采配メニューの継投（describePitcherEntry）', () => {
     // 表なので改行しない（960x540で溢れないための形。実機の計測で決めた）
     expect(line).not.toContain('\n');
     expect(line).toContain(TEAM.pitchers[1][0]);
-    expect(line).toMatch(/センパツ|リリーフ/);
+    expect(line).toMatch(/先発|救援/);
     expect(line).toContain('100%');
     expect(filled(line)).toBeGreaterThan(0);
   });

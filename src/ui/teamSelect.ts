@@ -52,6 +52,7 @@ import {
   fatigueFromRemaining,
   formatEra,
   padName,
+  POSITION_SHORT,
   pitcherRole,
   pitcherStuff,
   positionOf,
@@ -62,9 +63,20 @@ import {
 } from '../core/roster';
 import { type CarriedState, nextGameRoster } from '../core/run';
 import { type PlayMode, type PlayerSlot, PLAYER_LABEL } from '../core/players';
+import { type PracticeMode, PRACTICE_MODES, practiceHumanSide } from '../debug/practice';
 import type { TeamSide } from '../core/rules';
 import { type TeamId, TEAMS, pitcherRowPitching, teamById } from '../core/teams';
 import type { VirtualPad } from '../input/keyboard';
+import { PIXEL_FONT_FAMILY } from './hud/pixelText';
+import { sfx } from '../audio/sfx';
+
+/** 押したときに音を鳴らしてから本来の処理をする（メニューの操作音） */
+function withSound(sound: () => void, fn: () => void): () => void {
+  return () => {
+    sound();
+    fn();
+  };
+}
 
 /**
  * チーム選択の結果。モードと、先攻・後攻の球団と、球場と、（1P PLAYなら）人間が操作する側と、
@@ -83,6 +95,12 @@ export interface MatchSelection {
    * `MATCH_SETUP` の `plans` にそのまま渡せる形にしてある。
    */
   plans: Partial<Record<TeamSide, RosterPlan>>;
+  /**
+   * デバッグモード（フェーズPP-64）。**通常のプレイでは常に undefined**で、
+   * そのとき main.ts はこの選択をこれまでとまったく同じに扱う（ランを作って試合を始める）。
+   * 入っているときだけ「確認したい局面を繰り返す」配線に入る。
+   */
+  practice?: PracticeMode;
 }
 
 /** 球団グリッドの列数（16球団を4×4で並べる） */
@@ -100,62 +118,97 @@ const OVERLAY_STYLE = `
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 32, 0.94);
+  background:
+    radial-gradient(ellipse at 50% 38%, rgba(40, 70, 150, 0.55), rgba(0, 0, 0, 0) 70%),
+    rgba(4, 8, 36, 0.96);
   color: #fff;
-  font-family: "MS Gothic", "ＭＳ ゴシック", monospace;
-  font-size: 20px;
-  letter-spacing: 2px;
+  font-family: ${PIXEL_FONT_FAMILY};
+  font-size: calc(16px * var(--ui-scale, 1));
+  line-height: 1.5;
+  -webkit-font-smoothing: none;
 `;
 
 const GRID_STYLE = `
   display: grid;
-  grid-template-columns: repeat(${COLUMNS}, 200px);
-  gap: 8px 12px;
-  margin: 20px 0;
+  grid-template-columns: repeat(${COLUMNS}, calc(176px * var(--ui-scale, 1)));
+  gap: calc(6px * var(--ui-scale, 1)) calc(10px * var(--ui-scale, 1));
+  margin: calc(16px * var(--ui-scale, 1)) 0;
 `;
 
 const PARK_GRID_STYLE = `
   display: grid;
-  grid-template-columns: repeat(${PARK_COLUMNS}, 240px);
-  gap: 10px 14px;
-  margin: 20px 0;
+  grid-template-columns: repeat(${PARK_COLUMNS}, calc(208px * var(--ui-scale, 1)));
+  gap: calc(8px * var(--ui-scale, 1)) calc(12px * var(--ui-scale, 1));
+  margin: calc(16px * var(--ui-scale, 1)) 0;
 `;
 
 const STAFF_GRID_STYLE = `
   display: grid;
-  grid-template-columns: repeat(${STAFF_COLUMNS}, 260px);
-  gap: 10px 14px;
-  margin: 16px 0;
+  grid-template-columns: repeat(${STAFF_COLUMNS}, calc(232px * var(--ui-scale, 1)));
+  gap: calc(8px * var(--ui-scale, 1)) calc(12px * var(--ui-scale, 1));
+  margin: calc(12px * var(--ui-scale, 1)) 0;
 `;
 
 const CELL_BASE_STYLE = `
-  padding: 6px 10px;
-  border: 3px solid transparent;
+  padding: calc(4px * var(--ui-scale, 1)) calc(8px * var(--ui-scale, 1));
+  border: calc(2px * var(--ui-scale, 1)) solid transparent;
   text-align: center;
-  font-size: 20px;
+  font-size: calc(16px * var(--ui-scale, 1));
+`;
+
+/** 段の見出し（格子の2倍＝32px。影を付けて浮かせる） */
+const TITLE_STYLE = `
+  font-size: calc(32px * var(--ui-scale, 1));
+  line-height: 1.25;
+  color: #ffe066;
+  text-shadow: calc(2px * var(--ui-scale, 1)) calc(2px * var(--ui-scale, 1)) 0 #10101c;
+`;
+
+/** 決まった内容の控え（先攻・後攻・球場…） */
+const CARD_STYLE = `
+  margin-top: calc(6px * var(--ui-scale, 1));
+  font-size: calc(16px * var(--ui-scale, 1));
+  line-height: 1.5;
+  text-align: center;
+  white-space: pre;
+`;
+
+/** 操作の案内 */
+const HINT_STYLE = `
+  margin-top: calc(16px * var(--ui-scale, 1));
+  font-size: calc(16px * var(--ui-scale, 1));
+  color: #b8c0d8;
 `;
 
 /** 打順の表（9行）。等幅で桁を揃えたいので中央寄せにはしない */
 const ORDER_LIST_STYLE = `
-  margin: 16px 0;
-  padding: 8px 14px;
-  border: 3px solid transparent;
-  font-size: 20px;
-  line-height: 1.55;
+  margin: calc(12px * var(--ui-scale, 1)) 0;
+  padding: calc(8px * var(--ui-scale, 1)) calc(12px * var(--ui-scale, 1));
+  border: calc(2px * var(--ui-scale, 1)) solid transparent;
+  font-size: calc(16px * var(--ui-scale, 1));
+  line-height: 1.5;
   white-space: pre;
 `;
 
-type Step = 'mode' | 'away' | 'home' | 'park' | 'side' | 'starter' | 'order';
+type Step = 'mode' | 'practice' | 'away' | 'home' | 'park' | 'side' | 'starter' | 'order';
 
-/** モード選択（フェーズD-20）の並び。説明書p4の順に 1P PLAY → 2P PLAY */
-const MODES: readonly { id: PlayMode; label: string; note: string }[] = [
-  { id: '1p', label: '1P PLAY', note: 'ヒトリ デ アソブ（アイテハ CPU）' },
-  { id: '2p', label: '2P PLAY', note: 'フタリ デ タイセン（センコウ=1P コウコウ=2P）' },
+/**
+ * モード選択（フェーズD-20）の並び。説明書p4の順に 1P PLAY → 2P PLAY で、
+ * **その後ろに DEBUG**（フェーズPP-64。原作には無い開発用の入口）。
+ *
+ * **原作の2つより後ろに置く**：説明書p4の並びは動かさず、足したものが最後に来るだけ
+ * ＝原作を触った人が見たときに並びが変わっていない（WATCHをスコープ外にしたときと同じ扱い）。
+ */
+const MODES: readonly { id: PlayMode | 'debug'; label: string; note: string }[] = [
+  { id: '1p', label: '1P PLAY', note: 'ひとりで遊ぶ（相手はCPU）' },
+  { id: '2p', label: '2P PLAY', note: 'ふたりで対戦（先攻＝1P　後攻＝2P）' },
+  { id: 'debug', label: 'DEBUG', note: '確認用（3カウントでアウトにならない）' },
 ];
 
 /** その段階でカーソルが動くグリッドの形（段階ごとに並ぶものが変わる） */
 function gridOf(step: Step, staffSize: number): { columns: number; count: number } {
   if (step === 'mode') return { columns: 1, count: MODES.length };
+  if (step === 'practice') return { columns: 1, count: PRACTICE_MODES.length };
   if (step === 'park') return { columns: PARK_COLUMNS, count: BALLPARKS.length };
   if (step === 'starter') return { columns: STAFF_COLUMNS, count: staffSize };
   // 打順は1列の縦並び（1行が長いので横に並べると読めない）
@@ -183,24 +236,24 @@ function gridOf(step: Step, staffSize: number): { columns: number; count: number
  *   減っているぶんは下の `ザンリョウ` が受け持つ（二重に減らすと読み方が壊れる）。
  */
 function describeStaffPitcher(name: string, stats: PitcherStats, remaining?: number): string {
-  const role = pitcherRole(stats.stamina) === 'starter' ? 'センパツ' : 'リリーフ';
+  const role = pitcherRole(stats.stamina) === 'starter' ? '先発' : '救援';
   // 変化量は左右の平均（カーブとシュートを別々に出すと1人が6行になる）＝采配メニューの
   // 継投（DD-51）とまったく同じ3つを、同じ目盛りで出す。
   const stuff = pitcherStuff(stats, fatigueFromRemaining(remaining ?? 1));
   return [
     `${name} ${role}`,
-    `ERA${formatEra(stats.era)}`,
-    `キュウソク ${ratingBar(stuff.speed)}`,
-    `ヘンカ　　 ${ratingBar(stuff.breaking)}`,
-    `セイキュウ ${ratingBar(stuff.control)}`,
-    `スタミナ　 ${ratingBar(stats.stamina)}`,
+    `防御率 ${formatEra(stats.era)}`,
+    `球速　　 ${ratingBar(stuff.speed)}`,
+    `変化　　 ${ratingBar(stuff.breaking)}`,
+    `制球　　 ${ratingBar(stuff.control)}`,
+    `スタミナ ${ratingBar(stats.stamina)}`,
     // 疲れの持ち越し（フェーズV-43）。**無傷なら行そのものを出さない**ので、試合前の
     // 選択画面（C-15。全員が無傷）ではこの行が出ない
     // （銃の残弾・持ち越したリード・ゼッコーチョーの行と同じ扱い）。
     // ここが見えていなければ「今日は誰に投げさせるか」を選びようがない
     // （既存の「意思決定材料は隠さない」方針）。
     ...(remaining !== undefined && remaining < 1
-      ? [`ザンリョウ ${ratingBar(remaining)}${remaining < STAMINA_FRESH_THRESHOLD ? ' ツカレ' : ''}`]
+      ? [`残量　　 ${ratingBar(remaining)}${remaining < STAMINA_FRESH_THRESHOLD ? ' 疲れ' : ''}`]
       : []),
   ].join('\n');
 }
@@ -230,18 +283,18 @@ export function describeLineupRow(roster: TeamRoster, slot: number): string {
   const cells = pitching
     ? [eraStatCell(pitching.era), ratingBar(batting.run)]
     : batterStatCells(batting);
-  return `${slot + 1}バン ${(position ?? '　').padEnd(2, ' ')} ${padName(player.name)} ${cells.join(' ')}`;
+  return `${slot + 1}番 ${position ? POSITION_SHORT[position] : '　'} ${padName(player.name)} ${cells.join(' ')}`;
 }
 
 /**
  * 打順の表の見出し（`describeLineupRow` の能力値の列に名前を付ける）。
- * 行と同じ幅の空欄（`1バン`＝全角2＋半角1／守備位置＝半角2／名前＝全角4）を置いてから
+ * 行と同じ幅の空欄（`1番`＝半角1＋全角1／守備位置＝全角1／名前＝全角4）を置いてから
  * 列名を出す＝見出しと値が縦に揃う（等幅フォント前提。`ORDER_LIST_STYLE`）。
  */
 function lineupHeaderRow(): string {
   const mark = '　 '; // カーソル欄（`▶ `／`◆ `／`　 `）ぶん
-  const slot = '　　 '; // 「1バン」ぶん（全角2＋半角1）
-  const position = '  '; // 守備位置ぶん（半角2）
+  const slot = ' 　'; // 「1番」ぶん（半角1＋全角1）
+  const position = '　'; // 守備位置ぶん（全角1）
   return `${mark}${slot} ${position} ${padName('')} ${BATTER_STAT_HEADERS.join(' ')}`;
 }
 
@@ -300,8 +353,9 @@ function createPlanEditor(opts: {
     const cell = document.createElement('div');
     cell.style.cssText = CELL_BASE_STYLE;
     cell.style.whiteSpace = 'pre';
-    cell.style.lineHeight = '1.45';
-    cell.style.fontSize = '17px';
+    cell.style.lineHeight = '1.4';
+    cell.style.fontSize = 'calc(16px * var(--ui-scale, 1))';
+    cell.style.textAlign = 'left';
     staffGrid.appendChild(cell);
     return cell;
   });
@@ -392,7 +446,7 @@ export function runTeamSelect(
   return new Promise((resolve) => {
     let step: Step = 'mode';
     let cursor = 0;
-    let mode: PlayMode = MODES[0].id;
+    let mode: PlayMode = '1p';
     let away: TeamId = TEAMS[0].id;
     let home: TeamId = TEAMS[1].id;
     let park: BallparkId = BALLPARKS[0].id;
@@ -430,13 +484,13 @@ export function runTeamSelect(
     overlay.style.cssText = OVERLAY_STYLE;
 
     const title = document.createElement('div');
-    title.style.fontSize = '24px';
+    title.style.cssText = TITLE_STYLE;
 
     // モード（フェーズD-20。説明書p4）。1列の縦並び＝原作のモード選択と同じ並び方で、
     // それぞれ何が起きるか（相手はCPUか人間か・どちらのパッドがどちらの側か）を添える。
     const modeGrid = document.createElement('div');
     modeGrid.style.cssText = PARK_GRID_STYLE;
-    modeGrid.style.gridTemplateColumns = '460px';
+    modeGrid.style.gridTemplateColumns = 'calc(448px * var(--ui-scale, 1))';
     const modeCells = MODES.map((m) => {
       const cell = document.createElement('div');
       cell.style.cssText = CELL_BASE_STYLE;
@@ -444,6 +498,22 @@ export function runTeamSelect(
       cell.style.lineHeight = '1.5';
       cell.textContent = `${m.label}\n${m.note}`;
       modeGrid.appendChild(cell);
+      return cell;
+    });
+
+    // デバッグモードの中身（フェーズPP-64）。モード選択と同じ1列の縦並び＝
+    // 押し方（W/S→K）が変わらないので、覚え直すものが無い。
+    const practiceGrid = document.createElement('div');
+    practiceGrid.style.cssText = PARK_GRID_STYLE;
+    practiceGrid.style.gridTemplateColumns = 'calc(480px * var(--ui-scale, 1))';
+    const practiceCells = PRACTICE_MODES.map((m) => {
+      const cell = document.createElement('div');
+      cell.style.cssText = CELL_BASE_STYLE;
+      cell.style.whiteSpace = 'pre';
+      cell.style.lineHeight = '1.5';
+      cell.textContent = `${m.label}
+${m.note}`;
+      practiceGrid.appendChild(cell);
       return cell;
     });
 
@@ -466,7 +536,7 @@ export function runTeamSelect(
       cell.style.cssText = CELL_BASE_STYLE;
       cell.style.whiteSpace = 'pre';
       cell.style.lineHeight = '1.5';
-      cell.textContent = `${p.name}\nセンター ${p.center}m\nリョウヨク ${p.wing}m`;
+      cell.textContent = `${p.name}\n中堅 ${p.center}m\n両翼 ${p.wing}m`;
       parkGrid.appendChild(cell);
       return cell;
     });
@@ -475,12 +545,12 @@ export function runTeamSelect(
 
     // 選んだカードは常時見えるようにしておく（後攻を選んでいる最中に先攻を忘れない）
     const card = document.createElement('div');
-    card.style.cssText = 'margin-top: 8px; font-size: 20px; line-height: 1.6; text-align: center;';
+    card.style.cssText = CARD_STYLE;
 
     const hint = document.createElement('div');
-    hint.style.cssText = 'margin-top: 20px; font-size: 15px; opacity: 0.8;';
+    hint.style.cssText = HINT_STYLE;
 
-    overlay.append(title, modeGrid, grid, parkGrid, staffGrid, orderList, card, hint);
+    overlay.append(title, modeGrid, practiceGrid, grid, parkGrid, staffGrid, orderList, card, hint);
     root.appendChild(overlay);
 
     function teamName(id: TeamId): string {
@@ -505,25 +575,33 @@ export function runTeamSelect(
     function render(): void {
       const onTeamGrid = step === 'away' || step === 'home';
       modeGrid.style.display = step === 'mode' ? 'grid' : 'none';
+      practiceGrid.style.display = step === 'practice' ? 'grid' : 'none';
       grid.style.display = onTeamGrid ? 'grid' : 'none';
       parkGrid.style.display = step === 'park' ? 'grid' : 'none';
       planEditor.render(step === 'starter' || step === 'order' ? step : null, cursor);
       title.textContent =
         step === 'mode'
-          ? 'モード ヲ エラベ'
-          : step === 'away'
-            ? 'センコウ ノ チーム ヲ エラベ'
+          ? 'モードを選択'
+          : step === 'practice'
+            ? 'DEBUG：確認するものを選択'
+            : step === 'away'
+            ? '先攻チームを選択'
             : step === 'home'
-              ? 'コウコウ ノ チーム ヲ エラベ'
+              ? '後攻チームを選択'
               : step === 'park'
-                ? 'キュウジョウ ヲ エラベ'
+                ? '球場を選択'
                 : step === 'side'
-                  ? 'ソウサ スル チーム ヲ エラベ'
+                  ? '操作するチームを選択'
                   : step === 'starter'
-                    ? `${planOwnerLabel()}センパツ ピッチャー ヲ エラベ`
-                    : `${planOwnerLabel()}ダジュン ヲ キメロ`;
+                    ? `${planOwnerLabel()}先発投手を選択`
+                    : `${planOwnerLabel()}打順を決定`;
       modeCells.forEach((cell, i) => {
         const active = step === 'mode' && i === cursor;
+        cell.style.borderColor = active ? '#ffe066' : 'transparent';
+        cell.style.color = active ? '#ffe066' : '#fff';
+      });
+      practiceCells.forEach((cell, i) => {
+        const active = step === 'practice' && i === cursor;
         cell.style.borderColor = active ? '#ffe066' : 'transparent';
         cell.style.color = active ? '#ffe066' : '#fff';
       });
@@ -540,24 +618,24 @@ export function runTeamSelect(
 
       // 決まった側だけを出す（先攻を選ぶ段階では、まだ何も決まっていない）
       const lines: string[] = [];
-      const decided = step !== 'mode';
-      if (decided && step !== 'away') lines.push(`センコウ: ${teamName(away)}`);
-      if (decided && step !== 'away' && step !== 'home') lines.push(`コウコウ: ${teamName(home)}`);
+      const decided = step !== 'mode' && step !== 'practice';
+      if (decided && step !== 'away') lines.push(`先攻: ${teamName(away)}`);
+      if (decided && step !== 'away' && step !== 'home') lines.push(`後攻: ${teamName(home)}`);
       // 球場の紹介文はカーソルが乗っている球場のもの＝決める前に特徴が読める
       if (step === 'park') lines.push(BALLPARKS[cursor].note);
       if (decided && step !== 'away' && step !== 'home' && step !== 'park') {
-        lines.push(`キュウジョウ: ${parkName(park)}`);
+        lines.push(`球場: ${parkName(park)}`);
       }
       if (step === 'side') {
         lines.push(
-          `${humanSide === 'away' ? '▶ ' : '　 '}センコウ　　${humanSide === 'home' ? '▶ ' : '　 '}コウコウ`,
+          `${humanSide === 'away' ? '▶ ' : '　 '}先攻　　${humanSide === 'home' ? '▶ ' : '　 '}後攻`,
         );
       }
       // 先発・打順を決めているのが誰のチームなのかを出す（対戦カードだけだと、
       // 自分がどちらを操作しているのかがこの段階で分からなくなる）。**2P PLAY では
       // どちらのパッドで押すのかまで出す**（画面は1つなので、番が見えないと押せない）。
       if (step === 'starter' || step === 'order') {
-        lines.push(`ソウサ: ${planOwnerLabel()}${teamName(planTeamId())}`);
+        lines.push(`操作: ${planOwnerLabel()}${teamName(planTeamId())}`);
       }
       card.textContent = lines.join('\n');
       card.style.whiteSpace = 'pre';
@@ -565,21 +643,23 @@ export function runTeamSelect(
       // 2P PLAY のときは、その段を動かすキーがどちらのパッドのものかを添える
       // （1P PLAY ではこれまでどおり何も付かない）。
       const owner = ownerOf(step);
-      const keys = owner === 'p2' ? 'ヤジルシ/テンキー' : owner === 'p1' ? '1P' : '';
+      const keys = owner === 'p2' ? '矢印/テンキー' : owner === 'p1' ? '1P' : '';
       const prefix = mode === '2p' && keys !== '' ? `[${keys}] ` : '';
       hint.textContent =
         prefix +
         (step === 'mode'
-          ? 'W/S デ センタク　　K デ ケッテイ'
-          : step === 'side'
-            ? '← → デ センタク　　K デ ケッテイ　　J デ モドル'
+          ? 'W/S：選択　K：決定　M：BGMオン/オフ'
+          : step === 'practice'
+            ? 'W/S：選択　K：開始　J：戻る'
+            : step === 'side'
+            ? '←→：選択　K：決定　J：戻る'
             : step === 'away'
-              ? 'WASD デ センタク　　K デ ケッテイ　　J デ モドル'
+              ? 'WASD：選択　K：決定　J：戻る'
               : step === 'order'
                 ? !planEditor.picking()
-                  ? 'W/S デ センタク　　K デ センシュ ヲ エラブ　　Shift デ ケッテイ　　J デ モドル'
-                  : 'W/S デ センタク　　K デ イレカエ　　J デ トリケシ'
-                : 'WASD デ センタク　　K デ ケッテイ　　J デ モドル');
+                  ? 'W/S：選択　K：選手を選ぶ　Shift：決定　J：戻る'
+                  : 'W/S：選択　K：入れ替え　J：取り消し'
+                : 'WASD：選択　K：決定　J：戻る');
     }
 
     /** グリッドの移動。端では止まる（一巡させると今どこにいるか見失いやすい） */
@@ -636,7 +716,10 @@ export function runTeamSelect(
 
     /** J＝1つ前の段階へ戻る（押し間違いを取り消せないと16球団から選ぶのが怖くなる） */
     function onB(): void {
-      if (step === 'away') {
+      if (step === 'practice') {
+        step = 'mode';
+        cursor = MODES.findIndex((m) => m.id === 'debug');
+      } else if (step === 'away') {
         step = 'mode';
         cursor = MODES.findIndex((m) => m.id === mode);
       } else if (step === 'home') {
@@ -662,10 +745,38 @@ export function runTeamSelect(
 
     function onA(): void {
       if (step === 'mode') {
-        mode = MODES[cursor].id;
+        const chosen = MODES[cursor].id;
+        // DEBUG（フェーズPP-64）は**もう1段だけ選んで即開始**する＝球団・球場・采配の段を
+        // 通らない（確認したい局面へ最短で入る、というこのモードの目的そのもの）。
+        // 投手・打者を替えたいときは**試合中の采配メニュー**（継投・代打）でできるので、
+        // 選択画面に段を足す必要が無い。
+        if (chosen === 'debug') {
+          step = 'practice';
+          cursor = 0;
+          render();
+          return;
+        }
+        mode = chosen;
         step = 'away';
         cursor = TEAMS.findIndex((t) => t.id === away);
         render();
+        return;
+      }
+      if (step === 'practice') {
+        const practice = PRACTICE_MODES[cursor].id;
+        offs.forEach((off) => off());
+        root.removeChild(overlay);
+        // 既定は「ところざわ・フレイムズ対サンダーズ・名鑑どおりの采配」＝
+        // `plans` を渡さなければ `normalizeRosterPlan` が既定に落とす（C-15の約束）。
+        resolve({
+          mode: '1p',
+          away,
+          home,
+          park,
+          humanSide: practiceHumanSide(practice),
+          plans: {},
+          practice,
+        });
         return;
       }
       if (step === 'away') {
@@ -722,12 +833,13 @@ export function runTeamSelect(
       const guard = (fn: () => void) => () => {
         if (canAct(player)) fn();
       };
-      offs.push(pad.onPress('left', guard(() => moveCursor(-1, 0))));
-      offs.push(pad.onPress('right', guard(() => moveCursor(1, 0))));
-      offs.push(pad.onPress('up', guard(() => moveCursor(0, -1))));
-      offs.push(pad.onPress('down', guard(() => moveCursor(0, 1))));
-      offs.push(pad.onPress('b', guard(onB)));
-      offs.push(pad.onPress('a', guard(onA)));
+      // 操作音（ブラッシュアップ：効果音）。カーソル移動・決定・戻るで音を分ける
+      offs.push(pad.onPress('left', guard(withSound(sfx.menuMove, () => moveCursor(-1, 0)))));
+      offs.push(pad.onPress('right', guard(withSound(sfx.menuMove, () => moveCursor(1, 0)))));
+      offs.push(pad.onPress('up', guard(withSound(sfx.menuMove, () => moveCursor(0, -1)))));
+      offs.push(pad.onPress('down', guard(withSound(sfx.menuMove, () => moveCursor(0, 1)))));
+      offs.push(pad.onPress('b', guard(withSound(sfx.menuCancel, onB))));
+      offs.push(pad.onPress('a', guard(withSound(sfx.menuConfirm, onA))));
       // Shift（Select）＝采配を決め終えて試合開始。Kは打順の入替に使っているので、
       // 「決定」は別のキーになる（CLAUDE.mdのキー表のSelect＝メニュー確定/選択）。
       offs.push(
@@ -735,6 +847,7 @@ export function runTeamSelect(
           'select',
           guard(() => {
             if (step !== 'order' || planEditor.picking()) return;
+            sfx.menuConfirm();
             if (!commitPlan()) return;
             offs.forEach((off) => off());
             root.removeChild(overlay);
@@ -780,7 +893,7 @@ export function runRosterPlanSelect(
     plan: RosterPlan;
     /** ランが持ち越しているスキル・使った回数・疲れ（`nextGameRoster` にそのまま渡す） */
     carried: CarriedState;
-    /** 「2シアイメ ノ センパツ」 */
+    /** 「2試合目の先発」 */
     headline: string;
   },
 ): Promise<RosterPlan> {
@@ -794,13 +907,13 @@ export function runRosterPlanSelect(
     overlay.style.cssText = OVERLAY_STYLE;
 
     const title = document.createElement('div');
-    title.style.fontSize = '24px';
+    title.style.cssText = TITLE_STYLE;
 
     const card = document.createElement('div');
-    card.style.cssText = 'margin-top: 8px; font-size: 20px; line-height: 1.6; text-align: center;';
+    card.style.cssText = CARD_STYLE;
 
     const hint = document.createElement('div');
-    hint.style.cssText = 'margin-top: 20px; font-size: 15px; opacity: 0.8;';
+    hint.style.cssText = HINT_STYLE;
 
     overlay.append(title, editor.staffGrid, editor.orderList, card, hint);
     root.appendChild(overlay);
@@ -808,14 +921,14 @@ export function runRosterPlanSelect(
     function render(): void {
       editor.render(step, cursor);
       title.textContent =
-        step === 'starter' ? `${opts.headline} センパツ ピッチャー ヲ エラベ` : 'ダジュン ヲ キメロ';
+        step === 'starter' ? `${opts.headline} 先発投手を選択` : '打順を決定';
       card.textContent = `${TEAMS.find((t) => t.id === opts.teamId)?.name ?? ''}`;
       hint.textContent =
         step === 'starter'
-          ? 'WASD デ センタク　　K デ ケッテイ'
+          ? 'WASD：選択　K：決定'
           : !editor.picking()
-            ? 'W/S デ センタク　　K デ センシュ ヲ エラブ　　Shift デ ケッテイ　　J デ モドル'
-            : 'W/S デ センタク　　K デ イレカエ　　J デ トリケシ';
+            ? 'W/S：選択　K：選手を選ぶ　Shift：決定　J：戻る'
+            : 'W/S：選択　K：入れ替え　J：取り消し';
     }
 
     function moveCursor(dx: number, dy: number): void {
@@ -831,12 +944,13 @@ export function runRosterPlanSelect(
     }
 
     const offs: (() => void)[] = [];
-    offs.push(pad.onPress('left', () => moveCursor(-1, 0)));
-    offs.push(pad.onPress('right', () => moveCursor(1, 0)));
-    offs.push(pad.onPress('up', () => moveCursor(0, -1)));
-    offs.push(pad.onPress('down', () => moveCursor(0, 1)));
+    offs.push(pad.onPress('left', withSound(sfx.menuMove, () => moveCursor(-1, 0))));
+    offs.push(pad.onPress('right', withSound(sfx.menuMove, () => moveCursor(1, 0))));
+    offs.push(pad.onPress('up', withSound(sfx.menuMove, () => moveCursor(0, -1))));
+    offs.push(pad.onPress('down', withSound(sfx.menuMove, () => moveCursor(0, 1))));
     offs.push(
       pad.onPress('b', () => {
+        if (step === 'order') sfx.menuCancel();
         // 先発の段のJは何もしない（戻り先が無い＝扉はもう選んでいる）
         if (step === 'order' && !editor.cancel('order')) {
           step = 'starter';
@@ -847,6 +961,7 @@ export function runRosterPlanSelect(
     );
     offs.push(
       pad.onPress('a', () => {
+        sfx.menuConfirm();
         if (step === 'starter') {
           editor.press('starter', cursor);
           step = 'order';
@@ -860,6 +975,7 @@ export function runRosterPlanSelect(
     offs.push(
       pad.onPress('select', () => {
         if (step !== 'order' || editor.picking()) return;
+        sfx.menuConfirm();
         offs.forEach((off) => off());
         root.removeChild(overlay);
         resolve(editor.plan);

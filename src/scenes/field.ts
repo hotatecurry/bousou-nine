@@ -15,7 +15,6 @@ import {
   DEFAULT_BALLPARK,
   FENCE_ANGLE_LIMIT_DEG,
   fenceAt,
-  deepestFence,
 } from '../core/ballpark';
 import {
   STAND_RISE,
@@ -35,6 +34,8 @@ import {
   skylinePlan,
 } from '../core/horizon';
 import { type StadiumPart, placeParts } from '../entities/stadium';
+import { createGround } from './fieldGround';
+import { createClouds } from './clouds';
 import { BASE_AXIS } from '../core/fielding';
 
 export const FIELD_POSITIONS = {
@@ -54,9 +55,6 @@ export const FIELD_POSITIONS = {
  * カメラが下がれるようになった**ぶん（フェーズC-14）、E-24の150mから広げてある。
  */
 export const GROUND_RADIUS = 175;
-
-/** 芝生をフェンスの外側へどれだけはみ出させるか（フェンスの足元が地面の縁に来ないように） */
-const GRASS_MARGIN = 10;
 
 /** フェンスを何度きざみで多角形近似するか（1°＝両翼線の間で90枚のパネル） */
 const FENCE_STEP_DEG = 1;
@@ -363,6 +361,8 @@ function createBackdrop(park: Ballpark): THREE.Group {
       transform(0, FAR_GROUND_Y, 0, 0, FAR_GROUND_RADIUS, 1, FAR_GROUND_RADIUS),
     ]),
   );
+  // 雲（ブラッシュアップ）。屋根付きのどうむは屋内なので出さない
+  if (!STAND_STYLE[park.id].roof) group.add(createClouds());
   return group;
 }
 
@@ -392,73 +392,22 @@ export function createField(park: Ballpark = DEFAULT_BALLPARK): THREE.Group {
   const group = new THREE.Group();
   const fenceDistance = (deg: number): number => fenceAt(park, deg).distance;
   const fenceHeight = (deg: number): number => fenceAt(park, deg).height;
-  const grassRadius = deepestFence(park) + GRASS_MARGIN;
 
-  // 球場の外まで敷く地面（芝生の下。フェアゾーンの芝生より暗い色で、ファウルゾーンと
-  // 場外を埋める）。芝生・土・ラインより下に置いてZファイティングを避ける。
+  // 球場の外まで敷く地面（スタンドの下・場外を埋める）。芝・土・ラインより下に置いて
+  // Zファイティングを避ける。
   const ground = new THREE.Mesh(
-    new THREE.CircleGeometry(GROUND_RADIUS, 48),
-    new THREE.MeshLambertMaterial({ color: 0x216b2c }),
+    new THREE.CircleGeometry(GROUND_RADIUS, 64),
+    new THREE.MeshLambertMaterial({ color: 0x4a8a3a }),
   );
   ground.rotation.x = -Math.PI / 2;
   ground.position.y = -0.02;
+  ground.receiveShadow = true;
   group.add(ground);
 
-  // 芝生（ファウルゾーン含む全面）。フェンスの外側まで少しはみ出させる
-  const grass = new THREE.Mesh(
-    new THREE.CircleGeometry(grassRadius, 32, Math.PI / 4, Math.PI / 2),
-    new THREE.MeshLambertMaterial({ color: 0x2e8b3d }),
-  );
-  grass.rotation.x = -Math.PI / 2;
-  grass.rotation.z = Math.PI / 2;
-  group.add(grass);
-
-  // 内野の土（ダイヤモンド）
-  const dirtShape = new THREE.Shape();
-  const d = BASE_AXIS + 4;
-  dirtShape.moveTo(0, 5);
-  dirtShape.lineTo(d, -BASE_AXIS + 1);
-  dirtShape.lineTo(0, -d * 2 + 6);
-  dirtShape.lineTo(-d, -BASE_AXIS + 1);
-  dirtShape.closePath();
-  const dirt = new THREE.Mesh(
-    new THREE.ShapeGeometry(dirtShape),
-    new THREE.MeshLambertMaterial({ color: 0xb8860b }),
-  );
-  dirt.rotation.x = -Math.PI / 2;
-  dirt.position.y = 0.01;
-  group.add(dirt);
-
-  // マウンド
-  const mound = new THREE.Mesh(
-    new THREE.CylinderGeometry(2.7, 3.2, 0.4, 16),
-    new THREE.MeshLambertMaterial({ color: 0xcd9b45 }),
-  );
-  mound.position.copy(FIELD_POSITIONS.mound);
-  mound.position.y = 0.2;
-  group.add(mound);
-
-  // 塁ベース＋本塁
-  const baseGeo = new THREE.BoxGeometry(1.2, 0.15, 1.2);
-  const baseMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
-  for (const key of ['first', 'second', 'third', 'home'] as const) {
-    const base = new THREE.Mesh(baseGeo, baseMat);
-    base.position.copy(FIELD_POSITIONS[key]);
-    base.position.y = 0.08;
-    base.rotation.y = Math.PI / 4;
-    group.add(base);
-  }
-
-  // ファウルライン（両翼線）。長さは両翼のフェンスまで＝球場ごとに変わる
-  const lineMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-  for (const sign of [1, -1]) {
-    const length = fenceDistance(sign * FENCE_ANGLE_LIMIT_DEG);
-    const line = new THREE.Mesh(new THREE.PlaneGeometry(0.3, length), lineMat);
-    line.rotation.x = -Math.PI / 2;
-    line.rotation.z = (sign * Math.PI) / 4;
-    line.position.set((sign * length) / (2 * Math.SQRT2), 0.02, -length / (2 * Math.SQRT2));
-    group.add(line);
-  }
+  // グラウンドの地面一式（ブラッシュアップ：芝の刈り目・内野の土と芝・マウンドの盛り上がり・
+  // 五角形の本塁・打席の白線・ウォーニングトラック・ポール・距離表示）。形はすべて判定と
+  // 同じ定数から起こすので、球場を替えれば一緒に変わる（`scenes/fieldGround.ts`）。
+  group.add(createGround(park));
 
   // ラッキーゾーン（たからづか）。低い柵の外にもう1枚の外壁があり、その間の床を
   // 塗り分ける。柵が低いこと自体は fenceAt の高さに入っていて打球判定に効く。

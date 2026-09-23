@@ -29,9 +29,15 @@
     "balance:relief": "vite-node tools/balance/relief.ts",
     "balance:arm": "vite-node tools/balance/arm.ts",
     "balance:pinchrun": "vite-node tools/balance/pinchrun.ts",
-    "balance:hr": "vite-node tools/balance/homerun.ts"
+    "balance:hr": "vite-node tools/balance/homerun.ts",
+    "balance:scale": "vite-node tools/balance/scale.ts",
+    "balance:release": "vite-node tools/balance/release.ts",
+    "balance:ball": "vite-node tools/balance/ball.ts",
+    "balance:flight": "vite-node tools/balance/flight.ts",
+    "balance:plate": "vite-node tools/balance/plate.ts"
   },
   "dependencies": {
+    "@fontsource/dotgothic16": "^5.3.0",
     "three": "^0.178.0",
     "xstate": "^5.19.0"
   },

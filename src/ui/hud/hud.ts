@@ -42,6 +42,7 @@ import {
   effectivePitching,
   fatigueOf,
   formatAverage,
+  positionLabel,
   formatEra,
   gunRemainingOf,
   hasSkill,
@@ -55,7 +56,7 @@ import { skillDef } from '../../core/skills';
 import type { RunProgress } from '../../core/run';
 import { CALL_BANNER_SEC, GUN_TELEGRAPH_SEC } from '../../core/tempo';
 import type { PlayPromptKind } from '../../scenes/chicchaiScene';
-import { type PixelLabel, createPixelLabel } from './pixelText';
+import { type PixelLabel, createPixelLabel, uiScale } from './pixelText';
 
 /**
  * ちっちゃいモードの操作ヒントの文言（走塁＝説明書p19の進塁B／帰塁A、
@@ -66,47 +67,47 @@ import { type PixelLabel, createPixelLabel } from './pixelText';
 const PLAY_PROMPT_TEXT: Record<PlayPromptKind, string> = {
   // タッチアップ（説明書p19）。**方向なしは全員**（フェーズL-32）は盗塁と同じ規則なので、
   // 同じ書き方で添える（同じキー・同じ入力が場面で違う意味になると案内が信用できなくなる）。
-  tagUp: 'タッチアップ!\nJ+ホウコウ デ シンルイ (ナシ=ゼンイン)',
-  recall: 'K+ホウコウ デ キルイ',
+  tagUp: 'タッチアップ！\nJ+方向で進塁（方向なし＝全員）',
+  recall: 'K+方向で帰塁',
   // 塁間で止まる（フェーズN-34）。**帰塁を消さずに並べる**のは、この2つが同じ場面の
   // 2つの逃げ道だから（行く／戻る／止まる のうち押せる2つが見えていないと選択にならない）。
   // 「1プレー1カイ」を書くのは、バイク・ドロップキックと同じ回数の枷があるため。
-  hold: 'J デ ソノバニ トマル (1プレー1カイ)\nK+ホウコウ デ キルイ',
+  hold: 'Jでその場に止まる（1プレー1回）\nK+方向で帰塁',
   // 止まっている間（同上）。塁を踏んでいない＝刺されうる局面なので、「イキスギ!」と
   // 同じ「危ないことを先に伝えてから抜け道を案内する」書式で出す。
-  holding: 'トマッテイル!\nJ デ ハシル / K+ホウコウ デ モドル',
+  holding: '止まっている！\nJで走る／K+方向で戻る',
   // バイク（フェーズF-26-3）で塁を行き過ぎた走者。踏んだ塁を離れているので刺されうる
   // ＝リード中と同じ「危ないことを先に伝えてから対処を案内する」書式で出す。
-  overrun: 'イキスギ!\nK+ホウコウ デ ルイヘ モドル',
+  overrun: '行き過ぎ！\nK+方向で塁へ戻る',
   // ドロップキック（フェーズF-26-4）。**当たるかどうかは書かない**：射程に野手がいるかを
   // 自分で測るのがこの操作の判断そのもので、「いま当たる」と出した瞬間に空振りの代償
   // （転倒）が消えて押し得になる。代わりに外したときに何が起きるかを添える。
-  dropkick: 'Gデ ドロップキック\nハズスト コロブ',
+  dropkick: 'Gでドロップキック\n外すと転ぶ',
   // ヒットエンドラン（フェーズH-28）。**この窓の間だけKは帰塁ではなくスイング**なので、
   // 出さないと「Kを押したら振ってしまった」になる（バイクの「イキスギ!」と同じ、
   // 危ない/短い局面を先に伝えてから操作を案内する書式）。他のヒントと同じ2行に収める。
-  hitAndRun: 'ヒットエンドラン!\nKデ スイング',
+  hitAndRun: 'ヒットエンドラン！\nKでスイング',
   // 守備側への警告（同上）。**射程の倍の距離で出る**ので、詰めるのをやめて塁へ投げる
   // 時間がまだある＝「見えているから避けられる」（意思決定材料は隠さない）。
-  kickDanger: 'ケラレル!\nK+ホウコウ デ ルイヘ ナゲロ',
+  kickDanger: '蹴られる！\nK+方向で塁へ投げろ',
   // 一時効果・守備側（フェーズM-33）。**回数券であることを書く**のが要点で、
   // 「押せる」だけでは温存の判断ができない（残り回数は選手カードにも出るが、
   // 守備側のカードは画面に出ないので、ここが唯一の手がかりになる）。
   // 何回残っているかまでは書かない＝文言を場面ごとに作り分けないための割り切りで、
   // 抽選画面と采配前に確かめられる（`ドロップキック` の「ハズスト コロブ」と同じ粒度）。
-  catchEffect: 'Gデ シュビハンイ カクダイ\nカイスウセイゲン アリ',
-  finePlay: 'K+ホウコウ デ ファインプレイ',
-  rundown: 'J+ホウコウ デ ランダン',
-  pickoff: 'K+ホウコウ デ ケンセイ',
+  catchEffect: 'Gで守備範囲を拡大\n回数制限あり',
+  finePlay: 'K+方向でファインプレー',
+  rundown: 'J+方向でランダンプレー',
+  pickoff: 'K+方向でけん制',
   // けん制されているが、走者はまだ塁についている（フェーズII-56）。**押している間だけ
   // リードが伸びる**ので、ここで案内しないとリードという操作が画面のどこにも現れない
   // （走者が勝手に動かない＝フィードバックも無い）。**押さなければ刺されない**ことまで
   // 書くのは、けん制されただけで慌てる必要が無いと分かって初めて「出るかどうか」の
   // 判断になるから（`ファウルハ サンシン!` と同じ「先に危なさの有無を伝える」書式）。
-  leadStart: 'ホウコウ オシッパナシ デ リード\nオサナケレバ ケンセイハ セーフ',
+  leadStart: '方向を押している間リード\n押さなければけん制はセーフ',
   // けん制モードで走者がリードしている間。刺されうる局面であることを先に伝えたうえで
   // 対処（帰塁）を案内する（「意思決定材料は隠さない」方針）。
-  lead: 'リード!\nK+ホウコウ デ キルイ',
+  lead: 'リード中！\nK+方向で帰塁',
   // 盗塁（説明書p13）。攻撃側にはでっかいモードで「いつ押すか」まで伝える：仕掛ける
   // タイミング（投球の残り時間）がそのまま成否を決める操作なので、キーだけ示しても
   // 判断材料にならない。守備側には塁へ投げる操作を案内する。
@@ -114,11 +115,20 @@ const PLAY_PROMPT_TEXT: Record<PlayPromptKind, string> = {
   // **方向を入れないと全員走る**（フェーズL-32のダブルスチール）ことも書く：ここを
   // 書かないと、1人だけ走らせるつもりのJで走者全員が飛び出す＝**見えている操作と効く
   // 操作が食い違う**（無指定の意味がL-32で変わった、いちばん事故になりやすい点）。
-  steal: 'J+ホウコウ デ トウルイ (ナシ=ゼンイン)\nモーションチュウニ スタート',
+  steal: 'J+方向で盗塁（方向なし＝全員）\nモーション中にスタート',
+  // リードを取りに行く（フェーズKK-58）。**まだ投げていない間だけ**出て、投球動作に
+  // 入った瞬間に `steal` へ入れ替わる＝**同じJが投球前と投球中で違う意味になる**ので、
+  // 並べて出すと「いまどちらが効くのか」が読めない（`bunt` / `buntTwoStrikes` と同じ
+  // 「1つの操作の2つの状態」の持ち方）。
+  //
+  // **1打席1回であることを書く**のは、この操作の判断が「いつ取りに行くか」そのものだから
+  // （`hold` が「1プレー1カイ」を書いているのと同じ理由）。2行目で盗塁の存在も残す＝
+  // 入れ替えでダブルスチールの案内が消えるが、そちらは投球中に必ず出る。
+  takeLead: 'Jでリードを取りに行く（1打席1回）\nモーション中のJ+方向＝盗塁',
   // 一時効果・打者側（フェーズM-33）。**「1打席だけ」を必ず書く**：切った直後の1打席で
   // 打ち取られれば効果は消える＝**いつ切るかが効果の大きさそのもの**なので、寿命を
   // 知らずに押させると判断そのものが成立しない（残り回数は打者カードに出ている）。
-  battingEffect: 'Gデ コノダセキ ダゲキ キョウカ\nツカウト 1カイ ヘル',
+  battingEffect: 'Gでこの打席の打撃を強化\n使うと回数が1減る',
   // 押しバント（説明書p17「バットをななめに出し、ファールラインぎりぎりに転がすのが
   // コツ」。フェーズY-46）。**バットを出している間だけ**出る＝押せる窓と案内が同じ
   // 状態（`isBunting`）から出るので食い違わない（H-28の `hitAndRun` と同じ扱い）。
@@ -126,13 +136,13 @@ const PLAY_PROMPT_TEXT: Record<PlayPromptKind, string> = {
   // **「ラインギワヘ」まで書く**のが要点：押しは方向を当てて初めて得で、正面へ押すと
   // 投手が空中で捕る小フライになる＝**キーだけ案内すると罠になる**（`ドロップキック` が
   // 「ハズスト コロブ」と代償を添えているのと同じ書式）。
-  bunt: 'バント\nWデ オス (ラインギワヘ ネラウ)',
+  bunt: 'バント\nWで押す（ライン際を狙う）',
   // 2ストライクのバント（フェーズAA-48）。**ファウルが三振になる**唯一の場面なので、
   // 「危ないことを先に伝えてから操作を案内する」既存の書式（`イキスギ!`・`リード!`・
   // `ケラレル!`・`トマッテイル!`）に合わせて1行目を警告に差し替える。**知らずに三振する
   // のを防ぐのが役目**で、押せる操作そのものは `bunt` と同じ（＝2行に収まる）。
-  buntTwoStrikes: 'ファウルハ サンシン!\nWデ オス (ラインギワヘ ネラウ)',
-  stealThrow: 'トウルイ!\nK+ホウコウ デ ソウキュウ',
+  buntTwoStrikes: 'ファウルなら三振！\nWで押す（ライン際を狙う）',
+  stealThrow: '盗塁！\nK+方向で送球',
 };
 
 /**
@@ -266,10 +276,20 @@ export interface Hud {
    * 空配列で全部消える。毎フレーム呼ばれる前提で、要素は使い回す。
    */
   showRunnerMarkers(markers: EdgeMarker[]): void;
+  /**
+   * デバッグモードの状態表示（フェーズPP-64。`src/debug/practice.ts`）。null で消える。
+   *
+   * **常に出す**：いま本番ではないこと（3カウントでアウトにならない等）と、押せる数字キーが
+   * 見えていないとデバッグモードそのものが使えない。**画面上端の中央**に置くのは、
+   * スコアボード（左上）・状況パネル（右上）・バナー（34%）・カード（下）のどれとも
+   * 帯が重ならない唯一の場所だから（D-18で決めた配置をそのまま守る）。
+   * 通常のプレイでは一度も呼ばれない＝**本番の画面は1ドットも変わらない**。
+   */
+  setDebugLine(text: string | null): void;
 }
 
 function halfLabel(half: 'top' | 'bottom'): string {
-  return half === 'top' ? 'オモテ' : 'ウラ';
+  return half === 'top' ? '表' : '裏';
 }
 
 function runnerDiamond(game: GameContext): string {
@@ -281,8 +301,11 @@ function runnerDiamond(game: GameContext): string {
 /** スタミナゲージの目盛り数。半分（5マス）が球威の落ち始める境目にちょうど当たる */
 const STAMINA_CELLS = 10;
 
-/** 打者カード／投手カードの拡大率（他のパネルと同じ。狭い窓ではここから整数倍で落とす） */
-const CARD_SCALE = 3;
+/**
+ * 打者カード／投手カードの拡大率（他のパネルと同じ＝原寸16px。ブラッシュアップで
+ * DotGothic16 にしてからは1が基準で、大きな画面では画面全体の倍率 `uiScale` が掛かる）
+ */
+const CARD_SCALE = 1;
 
 /**
  * 今マウンドにいる投手のスタミナ表示（フェーズB-11）。
@@ -305,7 +328,7 @@ function staminaLines(roster: TeamRoster): string[] {
   const filled = Math.round(remainingStaminaOf(roster, id) * STAMINA_CELLS);
   const gauge = '■'.repeat(filled) + '□'.repeat(STAMINA_CELLS - filled);
   const lines = [`スタミナ ${gauge}`];
-  if (fatigueOf(roster, id) > 0) lines.push('キュウイダウン');
+  if (fatigueOf(roster, id) > 0) lines.push('球威ダウン');
   return lines;
 }
 
@@ -328,7 +351,7 @@ export function gunLine(roster: TeamRoster, gunMode: boolean): string {
     return '';
   }
   const remaining = gunRemainingOf(roster, roster.pitcher);
-  return gunMode ? `\n▶ジュウ モード (ノコリ ${remaining})` : `\nジュウ ノコリ ${remaining}`;
+  return gunMode ? `\n▶銃モード（残り${remaining}）` : `\n銃 残り${remaining}`;
 }
 
 /**
@@ -381,7 +404,7 @@ export function leadLine(
  * 打者カードのスキルの行（F-26-7）がすでに使っているものと同じ。
  */
 const RUNNERS_PER_SPEED_LINE = 2;
-/** 続きの行の字下げ（見出し `ソウ ` とちょうど同じ表示幅＝塁の番号が縦に揃う） */
+/** 続きの行の字下げ（見出し `走力 ` とちょうど同じ表示幅＝塁の番号が縦に揃う） */
 const SPEED_LINE_INDENT = '　　 ';
 
 export function runnerSpeedLine(game: GameContext): string {
@@ -402,7 +425,7 @@ export function runnerSpeedLine(game: GameContext): string {
   const lines: string[] = [];
   for (let i = 0; i < cells.length; i += RUNNERS_PER_SPEED_LINE) {
     const row = cells.slice(i, i + RUNNERS_PER_SPEED_LINE).join(' ');
-    lines.push(`${i === 0 ? 'ソウ ' : SPEED_LINE_INDENT}${row}`);
+    lines.push(`${i === 0 ? '走力 ' : SPEED_LINE_INDENT}${row}`);
   }
   return `\n${lines.join('\n')}`;
 }
@@ -435,7 +458,7 @@ export function batterCardText(roster: TeamRoster, inning?: number): string {
   const batter = currentBatter(roster);
   const position = currentBatterPosition(roster);
   // 代打が入ったばかりの打順（投手の打席への代打）は守備位置を持たない＝打順だけ出す
-  const slot = `${roster.lineupIndex + 1}バン${position === null ? '' : ` ${position}`}`;
+  const slot = `${roster.lineupIndex + 1}番${position === null ? '' : ` ${positionLabel(position)}`}`;
   // **スキルの補正込みで表示する**（フェーズF-26-1）。AV/HR は能力値レーティングからの
   // 導出なので、`キンニク` を付ければカードの本塁打数もその場で増える＝「表示された数字が
   // 判断材料として使える」（⑥）がスキルを入れた後も保たれる。
@@ -443,7 +466,7 @@ export function batterCardText(roster: TeamRoster, inning?: number): string {
   // 上がった状態で出る（数字が「今日この打者は来ている」を語る）。
   const stats = effectiveBatting(roster, currentBatterId(roster), inning);
   return [
-    `ダシャ ${slot}`,
+    `打者 ${slot}`,
     // **走力は AV/HR と同じ行に併記する**（フェーズFF-53。ユーザー判断）＝行を増やさない
     // ので、**D-18で詰めた「平常時のカードの高さ」の前提を1ミリも動かさない**
     // （ゼッコーチョー・一時効果・スキルの行が「持たない打者には出さない」ことで守って
@@ -455,8 +478,8 @@ export function batterCardText(roster: TeamRoster, inning?: number): string {
     // （DD-51・EE-52 が投手側・代打側で揃えたのと逆をやることになる）。見出しは
     // 表の `ソウリョク` の頭2文字で、**カードは1行を短く保つ**という D-18 の制約に従う
     // （長い見出しを足すとカードが画面中央＝投手と球の通り道へ張り出す）。
-    `${batter.name} AV${formatAverage(stats.average)} HR${displayHomeRuns(stats.power)} ソウ${ratingBar(stats.run)}`,
-    `ダイダ ノコリ${roster.bench.length}`,
+    `${batter.name} 打率${formatAverage(stats.average)} 本塁打${displayHomeRuns(stats.power)} 走力${ratingBar(stats.run)}`,
+    `代打 残り${roster.bench.length}`,
     ...hotLines(roster, currentBatterId(roster), inning),
     ...effectLines(roster, currentBatterId(roster)),
     ...skillLines(roster, currentBatterId(roster)),
@@ -472,7 +495,7 @@ export function batterCardText(roster: TeamRoster, inning?: number): string {
  * 果たしているのと同じ役目）。相手にも見えるのは意図どおり＝切ったことは隠さない。
  */
 function effectLines(roster: TeamRoster, playerId: string): string[] {
-  return activeEffectsOf(roster, playerId).map((id) => `${skillDef(id).name}!`);
+  return activeEffectsOf(roster, playerId).map((id) => `${skillDef(id).name}！`);
 }
 
 /**
@@ -485,7 +508,7 @@ function effectLines(roster: TeamRoster, playerId: string): string[] {
  * 同じことを言っているが、**ちっちゃいモードや代打の直後でも読める**のが表示の役割。
  */
 function hotLines(roster: TeamRoster, playerId: string, inning?: number): string[] {
-  return isHot(roster, playerId, inning) ? ['ゼッコーチョー!'] : [];
+  return isHot(roster, playerId, inning) ? ['絶好調！'] : [];
 }
 
 /**
@@ -511,7 +534,7 @@ function skillLines(roster: TeamRoster, playerId: string): string[] {
     // 温存して強化を狙うか」という判断そのものの材料なので、隠すと判断が成立しない
     // （既存の「意思決定材料は隠さない」方針＝スタミナゲージを両側に見せているのと同じ）。
     const left = chargesLeftOf(roster, playerId, id);
-    const charges = left > 0 ? ` ノコリ${left}` : '';
+    const charges = left > 0 ? ` 残り${left}` : '';
     return `${i === 0 ? 'スキル' : '　　　'} ${skillDef(id).name}${charges}`;
   });
 }
@@ -533,10 +556,10 @@ function skillLines(roster: TeamRoster, playerId: string): string[] {
 export function pitcherCardText(roster: TeamRoster): string {
   const pitcher = roster.players[roster.pitcher];
   const stats = effectivePitching(roster, roster.pitcher);
-  const era = stats ? `ERA${formatEra(stats.era)} ` : '';
+  const era = stats ? `防御率${formatEra(stats.era)} ` : '';
   return [
-    `トウシュ ${pitcher.name}`,
-    `${era}キュウエン ノコリ${roster.bullpen.length}`,
+    `投手 ${pitcher.name}`,
+    `${era}救援 残り${roster.bullpen.length}`,
     ...staminaLines(roster),
     ...skillLines(roster, roster.pitcher),
   ].join('\n');
@@ -571,7 +594,7 @@ export function scoreboardText(game: GameContext, run?: RunProgress): string {
     // 「試合の記録」を出す場所だから＝ランは試合の記録の外枠にあたる。1行増えるだけなので
     // D-18で詰めた「決着バナーはパネルの下端より下（max(34%,180px)）」の前提は動かない
     // （このパネルは4行でも約110px）。ランを通していない呼び出し（テスト）では行ごと出ない。
-    ...(run ? [`ラン ${run.game}/${run.total} ${run.wins}カツ`] : []),
+    ...(run ? [`ラン ${run.game}/${run.total} ${run.wins}勝`] : []),
     `     ${header}  R`,
     `${game.rosters.away.team.short} ${lineScoreRow(game.lineScore.away, totalInnings)}  ${game.score.away}`,
     `${game.rosters.home.team.short} ${lineScoreRow(game.lineScore.home, totalInnings)}  ${game.score.home}`,
@@ -581,7 +604,7 @@ export function scoreboardText(game: GameContext, run?: RunProgress): string {
 /** 試合終了の勝者表示。球団名で出す（フェーズB-12/C-13。従来は「ビジター/ホーム」固定） */
 export function winnerText(game: GameContext): string {
   if (game.winner === null) return '';
-  return `${game.rosters[game.winner].team.name} ノ カチ!`;
+  return `${game.rosters[game.winner].team.name}の勝ち！`;
 }
 
 /**
@@ -593,29 +616,29 @@ const BANNER_STYLE: Record<
   BannerKind,
   { color: string; scale: number; durationMs: number; flashColor?: string }
 > = {
-  homerun: { color: '#ffe066', scale: 6, durationMs: 1400, flashColor: '#e0a83c' },
-  triple: { color: '#66e0ff', scale: 4, durationMs: 900 },
-  double: { color: '#66e0ff', scale: 4, durationMs: 800 },
-  single: { color: '#f8f8f8', scale: 3, durationMs: 650 },
-  strikeout: { color: '#ff6666', scale: 4, durationMs: 800 },
-  walk: { color: '#f8f8f8', scale: 3, durationMs: 650 },
+  homerun: { color: '#ffe066', scale: 4, durationMs: 1400, flashColor: '#e0a83c' },
+  triple: { color: '#66e0ff', scale: 3, durationMs: 900 },
+  double: { color: '#66e0ff', scale: 3, durationMs: 800 },
+  single: { color: '#f8f8f8', scale: 2, durationMs: 650 },
+  strikeout: { color: '#ff6666', scale: 3, durationMs: 800 },
+  walk: { color: '#f8f8f8', scale: 2, durationMs: 650 },
   // 守備プレーの帰結（送球・捕球）を文字でも明示する。アウトは赤系、セーフは緑系。
-  out: { color: '#ff6666', scale: 5, durationMs: 900 },
-  safe: { color: '#66ff88', scale: 5, durationMs: 900 },
+  out: { color: '#ff6666', scale: 3, durationMs: 900 },
+  safe: { color: '#66ff88', scale: 3, durationMs: 900 },
   // 1球ごとの判定コール。捕球後の「間」（PITCH_SETTLE_SEC）の中で読み切れる長さにする。
-  strike: { color: '#ffb066', scale: 3, durationMs: CALL_BANNER_SEC * 1000 },
-  ball: { color: '#99ccff', scale: 3, durationMs: CALL_BANNER_SEC * 1000 },
-  foul: { color: '#f8f8f8', scale: 3, durationMs: CALL_BANNER_SEC * 1000 },
+  strike: { color: '#ffb066', scale: 2, durationMs: CALL_BANNER_SEC * 1000 },
+  ball: { color: '#99ccff', scale: 2, durationMs: CALL_BANNER_SEC * 1000 },
+  foul: { color: '#f8f8f8', scale: 2, durationMs: CALL_BANNER_SEC * 1000 },
   // 球威ダウンの告知。1試合に投手1人1回きりなので判定コールより長く見せるが、
   // 打席の決着（三振・本塁打）より小さくする（起きたのは「兆候」であって決着ではない）。
-  stamina: { color: '#ffaa33', scale: 3, durationMs: 1400 },
+  stamina: { color: '#ffaa33', scale: 2, durationMs: 1400 },
   // 銃の予兆（フェーズF-26-2）。**予兆の間ずっと出ている**必要があるので、表示時間は
   // 静止時間（GUN_TELEGRAPH_SEC）と同じにする（短いと「構えた」の告知だけ消えて、
   // 何を待たされているのか分からない静止時間が残る）。色はシリアス演出のトーンに
   // 合わせた赤系で、命中時の暗転フラッシュ（gunHitFlash）と対になる。
   gunAim: {
     color: '#ff4444',
-    scale: 5,
+    scale: 3,
     durationMs: GUN_TELEGRAPH_SEC * 1000,
     flashColor: '#7a0000',
   },
@@ -651,12 +674,12 @@ export function createHud(root: HTMLElement): Hud {
   // 画面の上から4割ほどを占め、**中央上に出る決着バナーの帯が必ずどちらかに重なる**
   // （PROGRESS.mdのB-11の検証で記録した既存の不具合）。左右に分ければどちらも3行に収まり、
   // バナーはその下の空いた帯に置ける。
-  const scoreboard = createPixelLabel('', { fontSize: 8, scale: 3, color: '#f8f8f8' });
+  const scoreboard = createPixelLabel('', { scale: 1, color: '#f8f8f8' });
   applyPanelChrome(scoreboard.el);
   Object.assign(scoreboard.el.style, { position: 'absolute', top: '0', left: '0' });
   root.appendChild(scoreboard.el);
 
-  const situation = createPixelLabel('', { fontSize: 8, scale: 3, color: '#f8f8f8' });
+  const situation = createPixelLabel('', { scale: 1, color: '#f8f8f8' });
   applyPanelChrome(situation.el);
   Object.assign(situation.el.style, { position: 'absolute', top: '0', right: '0' });
   root.appendChild(situation.el);
@@ -665,7 +688,7 @@ export function createHud(root: HTMLElement): Hud {
   // 46%→54%（フェーズD-18）：決着バナーを下げたぶん、こちらも下げて帯を分ける。
   // 同時に出うるのは「サヨナラ本塁打→試合終了」の組み合わせだけだが、そこがいちばん
   // 大きいバナー（scale 6）なので、重ならない間隔はここで確保しておく必要がある。
-  const message = createPixelLabel('', { fontSize: 10, scale: 3, color: '#f8f8f8', align: 'center' });
+  const message = createPixelLabel('', { scale: 2, color: '#f8f8f8', align: 'center' });
   applyPanelChrome(message.el);
   Object.assign(message.el.style, {
     position: 'fixed',
@@ -681,7 +704,7 @@ export function createHud(root: HTMLElement): Hud {
   // **画面の下端に、小さく出す**：技表は最大5行になるので、中央のメッセージ枠に出すと
   // 殴り合っている2人をまるごと覆ってしまう（実機で確認）。乱闘は画面下部に何も置かない
   // （打者・投手カードはでっかいモード専用）ので、ここが空いている。
-  const brawlHintPanel = createPixelLabel('', { fontSize: 8, scale: 2, color: '#ffe066', align: 'center' });
+  const brawlHintPanel = createPixelLabel('', { scale: 1, color: '#ffe066', align: 'center' });
   applyPanelChrome(brawlHintPanel.el);
   Object.assign(brawlHintPanel.el.style, {
     position: 'fixed',
@@ -692,6 +715,18 @@ export function createHud(root: HTMLElement): Hud {
   });
   root.appendChild(brawlHintPanel.el);
 
+  // ---- デバッグモードの状態表示（フェーズPP-64。update() の管理外の独立チャンネル） ----
+  const debugPanel = createPixelLabel('', { scale: 1, color: '#7ee081', align: 'center' });
+  applyPanelChrome(debugPanel.el);
+  Object.assign(debugPanel.el.style, {
+    position: 'fixed',
+    top: '8px',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    display: 'none',
+  });
+  root.appendChild(debugPanel.el);
+
   // ---- 決着演出バナー（ホームラン等。update()の管理外の独立チャンネルで
   //      一定時間後に自動的に消える。messageと混線しないよう別要素にした） ----
   //
@@ -699,7 +734,13 @@ export function createHud(root: HTMLElement): Hud {
   // **画面の大きさによらず固定のピクセル高さ**（ドット絵を整数倍で拡大しているため）なので、
   // 位置を%だけで決めると画面が縦に小さいときだけ重なる。ピクセルの下限を併記して、
   // どちらの画面でもパネルの下端より下に出るようにする。
-  const banner = createPixelLabel('', { fontSize: 10, scale: 4, color: '#f8f8f8', align: 'center' });
+  const banner = createPixelLabel('', {
+    scale: 3,
+    color: '#f8f8f8',
+    align: 'center',
+    // 背景の無い大きな字は3Dの画面に直接乗るので、1ドットの縁で画面から切り離す
+    outline: '#10101c',
+  });
   Object.assign(banner.el.style, {
     position: 'fixed',
     top: 'max(34%, 180px)',
@@ -753,7 +794,7 @@ export function createHud(root: HTMLElement): Hud {
   Object.assign(promptRow.style, { display: 'flex', justifyContent: 'center' });
   bottomLayer.appendChild(promptRow);
 
-  const playPrompt = createPixelLabel('', { fontSize: 8, scale: 3, color: '#ffe066', align: 'center' });
+  const playPrompt = createPixelLabel('', { scale: 1, color: '#ffe066', align: 'center' });
   applyPanelChrome(playPrompt.el);
   playPrompt.el.style.display = 'none';
   promptRow.appendChild(playPrompt.el);
@@ -773,11 +814,11 @@ export function createHud(root: HTMLElement): Hud {
   // ＝いちばん長い行がそのカードの幅を決める：**打者カードは能力値の行**
   // （名前＋AV＋HR＋走力のバー。フェーズFF-53で走力を併記したぶん、スキルの行を追い越して
   // ここが最長になった）、**投手カードはスタミナゲージ**（`スタミナ` ＋10目盛り）。
-  const batterCard = createPixelLabel('', { fontSize: 8, scale: CARD_SCALE, color: '#f8f8f8' });
+  const batterCard = createPixelLabel('', { scale: CARD_SCALE, color: '#f8f8f8' });
   applyPanelChrome(batterCard.el);
   cardRow.appendChild(batterCard.el);
 
-  const pitcherCard = createPixelLabel('', { fontSize: 8, scale: CARD_SCALE, color: '#f8f8f8' });
+  const pitcherCard = createPixelLabel('', { scale: CARD_SCALE, color: '#f8f8f8' });
   applyPanelChrome(pitcherCard.el);
   cardRow.appendChild(pitcherCard.el);
 
@@ -799,7 +840,9 @@ export function createHud(root: HTMLElement): Hud {
     // **縁と余白（拡大率に依らない）を先に差し引く**（`PANEL_CHROME_WIDTH`）。
     const total = batterCard.el.width + pitcherCard.el.width;
     const room = root.clientWidth - PANEL_CHROME_WIDTH * 2;
-    const fit = Math.max(1, Math.floor(room / total));
+    // 画面全体の倍率（`uiScale`）が掛かったうえで収まるか。収まらなければ全体の倍率を
+    // 打ち消すところまで落とす（原寸の16pxより小さくはしない＝字が潰れる）
+    const fit = Math.max(1, Math.floor(room / (total * uiScale())));
     if (fit < CARD_SCALE) {
       batterCard.setText(batterText, { scale: fit });
       pitcherCard.setText(pitcherText, { scale: fit });
@@ -820,7 +863,7 @@ export function createHud(root: HTMLElement): Hud {
   // 位置は**画面中央のやや下**。上寄りに置くと左上のスコアボード／状況パネルに重なって
   // カウントや控え人数を隠してしまい（実機のスクリーンショットで確認）、下寄りすぎると
   // 操作ヒント（playPrompt）とぶつかる。打者が打席に入ってくる様子のすぐ上に出る。
-  const interlude = createPixelLabel('', { fontSize: 10, scale: 3, color: '#ffe066', align: 'center' });
+  const interlude = createPixelLabel('', { scale: 2, color: '#ffe066', align: 'center' });
   applyPanelChrome(interlude.el);
   Object.assign(interlude.el.style, {
     position: 'fixed',
@@ -940,7 +983,7 @@ export function createHud(root: HTMLElement): Hud {
     wrap.appendChild(fill);
     // コンボ数（乱闘v2＝フェーズG-27）。**繋がっている間だけ出す**＝繋げられたことが
     // その場で分かり、途切れた瞬間に消える（`BrawlState` のコンボ数からの導出そのもの）。
-    const combo = createPixelLabel('', { color: '#ffdd55', scale: 3, fontSize: 8 });
+    const combo = createPixelLabel('', { color: '#ffdd55', scale: 2, outline: '#10101c' });
     combo.el.style.display = 'none';
     column.appendChild(wrap);
     column.appendChild(combo.el);
@@ -972,7 +1015,7 @@ export function createHud(root: HTMLElement): Hud {
   ): string {
     const fielding = fieldingTeam(half);
     if (!isTwoPlayer(controllers)) {
-      return `◆ソウサ:${controllers[fielding] !== 'cpu' ? labels.fielding : labels.batting}`;
+      return `◆操作:${controllers[fielding] !== 'cpu' ? labels.fielding : labels.batting}`;
     }
     const first = controllers[fielding] === 'p1' ? labels.fielding : labels.batting;
     const second = first === labels.fielding ? labels.batting : labels.fielding;
@@ -1032,8 +1075,8 @@ export function createHud(root: HTMLElement): Hud {
         // Startキーで開ける采配メニュー（代打/継投）の存在も常時ヒント表示する
         // （意思決定材料は隠さない、という既存方針をメニューの発見しやすさにも適用）。
         const control = controlLine(controllers, game.half, {
-          fielding: 'トウキュウ',
-          batting: 'ダゲキ',
+          fielding: '投球',
+          batting: '打撃',
         });
         // イニングとカウントは1行にまとめている（フェーズB-11でスタミナの行が増えたぶん、
         // パネルの高さを元に戻すため）。打順・控えの残り人数・スタミナは
@@ -1047,7 +1090,7 @@ export function createHud(root: HTMLElement): Hud {
         // けん制のプレーの後にしか無く、走力は走者がいれば必ずあるので、順序を
         // 逆にすると「あったり無かったりする行」が下に来て並びが安定しない。
         situation.setText(
-          `${halfLabel(game.half)} ${game.inning}カイ  B${game.count.balls} S${game.count.strikes} O${game.outs}${leadLine(leads)}${runnerSpeedLine(game)}${gun}\n${control}  Start:サクセン`,
+          `${game.inning}回${halfLabel(game.half)}  B${game.count.balls} S${game.count.strikes} O${game.outs}${leadLine(leads)}${runnerSpeedLine(game)}${gun}\n${control}  Start:作戦`,
         );
         // 打者は攻撃側／投手は守備側のロスターから引く（＝カードは常に「今の対戦」を出す。
         // 人間がどちらを操作しているかによらず同じものを見せる既存方針どおり）。
@@ -1059,20 +1102,20 @@ export function createHud(root: HTMLElement): Hud {
         message.el.style.display = 'none';
         // 2P/CPU操作分離：今このプレーで人間が何を操作しているか（守備/走塁）を明示する
         const control = controlLine(controllers, game.half, {
-          fielding: 'シュビ',
-          batting: 'ソウルイ',
+          fielding: '守備',
+          batting: '走塁',
         });
         situation.setText(`O ${game.outs}\n${runnerDiamond(game)}\n${control}`);
       } else if (modeState === 'deadBall') {
-        situation.setText('デッドボール!');
+        situation.setText('デッドボール！');
         // **乱闘に持ち込むかを決めるのは殴られた打者側**（CLAUDE.md ③）。2P PLAY では
         // それがどちらのプレイヤーかと、その人が押すキーまで出す（フェーズD-20。
         // ヒントに1Pのキー名を固定で書くと、2Pには押せないキーを案内することになる）。
         const batterPlayer = playerOfSide(controllers, battingTeam(game.half));
         const twoPlayer = isTwoPlayer(controllers);
-        const who = twoPlayer && batterPlayer ? `${PLAYER_LABEL[batterPlayer]} ガ キメル\n` : '';
-        const keys = twoPlayer && batterPlayer === 'p2' ? '([1]=ハイ / [2]=イイエ)' : '(J=ハイ / K=イイエ)';
-        message.setText(`${who}ラントウ スル?\n${keys}`);
+        const who = twoPlayer && batterPlayer ? `${PLAYER_LABEL[batterPlayer]}が決める\n` : '';
+        const keys = twoPlayer && batterPlayer === 'p2' ? '（[1]=はい / [2]=いいえ）' : '（J=はい / K=いいえ）';
+        message.setText(`${who}乱闘する？\n${keys}`);
         message.el.style.display = 'block';
       } else if (modeState === 'brawl') {
         // 乱闘v2（フェーズG-27）：**操作と技表は main.ts が組んで渡す**（`setBrawlHint`）。
@@ -1094,11 +1137,20 @@ export function createHud(root: HTMLElement): Hud {
         gauge.fill.style.backgroundColor = gaugeColor(ratio);
         // 1発は「コンボ」ではないので2ヒット目から出す（毎回出ると意味が薄れる）
         const show = view.combo >= 2;
-        if (show) gauge.combo.setText(`${view.combo} ヒット!`);
+        if (show) gauge.combo.setText(`${view.combo}ヒット！`);
         gauge.combo.el.style.display = show ? 'block' : 'none';
       };
       apply(batterGauge, batter);
       apply(pitcherGauge, pitcher);
+    },
+
+    setDebugLine(text) {
+      if (text === null) {
+        debugPanel.el.style.display = 'none';
+        return;
+      }
+      debugPanel.setText(text);
+      debugPanel.el.style.display = 'block';
     },
 
     setBrawlHint(text) {

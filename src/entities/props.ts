@@ -22,6 +22,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import propsModelUrl from '../assets/props.glb?url';
+import { addOutline, castShadows, toonify } from '../render/toon';
 
 /**
  * 部品の名前（`assets-src/props.blend` のオブジェクト名と一致させる）。
@@ -34,6 +35,13 @@ export const PROP_PARTS = [
   'Bike',
   /** 拳銃（★3 メカ `ジュウ` ／消費型 `ヨビジュウ`）。原点＝握る手・+Z が銃口の向き */
   'Gun',
+  // ---- ブラッシュアップで追加（`assets-src/scripts/build_props.py`） ----
+  /** 木のバット。原点＝握り・先端が -Y で**握りから先端まで 1.1m**（判定の到達範囲の約束） */
+  'Bat',
+  /** 野手のグラブ（投げない側の手に付く。原点＝手のひら） */
+  'Glove',
+  /** 捕手のミット（同上） */
+  'Mitt',
 ] as const;
 export type PropPart = (typeof PROP_PARTS)[number];
 
@@ -57,6 +65,11 @@ export async function preloadProps(): Promise<void> {
   for (const part of PROP_PARTS) {
     const node = gltf.scene.getObjectByName(part);
     if (!node) throw new Error(`preloadProps: モデルに ${part} が無い（props.glb を確認）`);
+    // トゥーン調（選手モデルと同じ塗り方・同じ縁）。原型に一度だけ掛けるので、
+    // 複製した持ち物も同じ見た目になる。
+    toonify(node);
+    addOutline(node);
+    castShadows(node);
     found.set(part, node);
   }
   prototypes = found;

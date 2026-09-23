@@ -208,7 +208,7 @@ export const BALLPARKS: readonly Ballpark[] = [
     name: 'ところざわ',
     center: 120,
     wing: 95,
-    note: 'ヒロカラズ セマカラズ モットモ ヘイキンテキ',
+    note: '広からず狭からず 最も平均的',
     sectors: [],
     luckyZone: null,
     runningHomerDistance: null,
@@ -219,7 +219,7 @@ export const BALLPARKS: readonly Ballpark[] = [
     name: 'ふえいふえい',
     center: 120,
     wing: 96,
-    note: 'イビツナ カタチ ト タカイ レフトフェンス',
+    note: 'いびつな形と高いレフトフェンス',
     // いびつな形＝レフトからレフト中間だけが基準の円弧より6m張り出し、その区間に
     // 10mの壁が立つ（説明書「レフト方向のホームランは至難のワザ!?」）。両翼線
     // （-45°〜-40°）は区間の外に置いてあるので、説明書の両翼96mはそのまま残る＝
@@ -234,7 +234,7 @@ export const BALLPARKS: readonly Ballpark[] = [
     name: 'かせんじき',
     center: 110,
     wing: 85,
-    note: 'トニカク セマイ ホームランノ カイカンニ ヨウナラ ココ',
+    note: 'とにかく狭い ホームランの快感に酔うならここ',
     sectors: [],
     luckyZone: null,
     runningHomerDistance: null,
@@ -245,7 +245,7 @@ export const BALLPARKS: readonly Ballpark[] = [
     name: 'たからづか',
     center: 119,
     wing: 91,
-    note: 'ラッキーゾーンアリ チョウダリョクノ チームニ ユウリ',
+    note: 'ラッキーゾーンあり 長打力のチームに有利',
     // ラッキーゾーンの柵は外壁より低い＝ライナー性の打球でも越える（説明書
     // 「長打力のあるチームに有利か?」）。距離のほうはすでに119m/91mに
     // 織り込まれている（ところざわより両翼で4m近い＝「少し狭い感じ」）。
@@ -262,7 +262,7 @@ export const BALLPARKS: readonly Ballpark[] = [
     name: 'どうむ',
     center: 122,
     wing: 100,
-    note: 'ヤネツキ トップクラスノ ヒロサ シュンソクノ チームニ チャンス',
+    note: '屋根付き トップクラスの広さ 俊足のチームにチャンス',
     sectors: [],
     luckyZone: null,
     runningHomerDistance: null,
@@ -278,7 +278,7 @@ export const BALLPARKS: readonly Ballpark[] = [
     // 説明書は「センター推定130m／両翼不明」。両翼はこちらで決めた数値
     // （どうむの100mが「トップクラスの広さ」と紹介されている以上、それを上回る必要がある）
     wingIsOurs: true,
-    note: 'トテツモナク ヒロイ ソラスト ランニングホームラン',
+    note: 'とてつもなく広い そらすとランニングホームラン',
     // 低い板塀（説明書の写真）。距離が桁違いなので高さは効かない
     sectors: [{ fromDeg: -45, toDeg: 45, offset: 0, height: 3 }],
     luckyZone: null,

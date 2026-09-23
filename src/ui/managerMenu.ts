@@ -37,6 +37,7 @@ import {
   isHot,
   isPitcherAtBat,
   padName,
+  positionLabel,
   pitcherRole,
   pitcherStuffOf,
   ratingBar,
@@ -47,7 +48,8 @@ import { skillDef } from '../core/skills';
 import { type Bases, forceAdvance } from '../core/rules';
 import type { VirtualPad } from '../input/keyboard';
 import { applyPanelChrome } from './hud/hud';
-import { createPixelLabel } from './hud/pixelText';
+import { createPixelLabel, uiScale } from './hud/pixelText';
+import { sfx } from '../audio/sfx';
 
 export type ManagerMenuRole = 'batting' | 'pitching';
 
@@ -106,23 +108,23 @@ const OVERLAY_STYLE = `
  * DD-51 では継投だけがこの形で、代打は1行が文章だったので従来のマーク（`▶ `）のままだった。
  * **EE-52で代打も表になった**ので、役割で分ける理由がなくなり1つに畳んだ。
  */
-const MARKS = { on: '▶　', off: '　　', current: 'イマ' } as const;
+const MARKS = { on: '▶　', off: '　　', current: '現在' } as const;
 
-/** 候補一覧のドット絵の拡大率（画面に収まらなければ `render` が整数倍のまま落とす） */
-const MENU_SCALE = 3;
+/** 候補一覧のドット絵の拡大率（原寸16px。画面全体の倍率 `uiScale` が上に掛かる） */
+const MENU_SCALE = 1;
 
 /** 「(Nバン SS)」＝今の打席が打順の何番で、その選手がどこを守っているか */
 function describeBattingSlot(roster: TeamRoster): string {
   const position = currentBatterPosition(roster);
   // 代打が入ったばかりの打順（投手の打席への代打）は守備位置を持たないので打順だけ出す
   return position === null
-    ? `(${roster.lineupIndex + 1}バン)`
-    : `(${roster.lineupIndex + 1}バン ${position})`;
+    ? `（${roster.lineupIndex + 1}番）`
+    : `（${roster.lineupIndex + 1}番 ${positionLabel(position)}）`;
 }
 
 /** 「(9バン P)」＝継投すると打線のどのスロットが入れ替わるか（原作にDH制は無い） */
 function describePitcherSlot(roster: TeamRoster): string {
-  return `(${roster.pitcherSlot + 1}バン P)`;
+  return `（${roster.pitcherSlot + 1}番 投手）`;
 }
 
 /**
@@ -153,7 +155,7 @@ function describePitcherSlot(roster: TeamRoster): string {
  * 960x540 で**メニューが画面から溢れた**（14行＝タイトルとヒントが切れる／1行939px）。
  * 列に畳めば9行・約820pxに収まり、**縦に並んだ同じ列を目で比べられる**というおまけも付く。
  */
-const STUFF_HEADERS = ['キュウソク', 'ヘンカ　　', 'セイキュウ'] as const;
+const STUFF_HEADERS = ['球速　　　', '変化　　　', '制球　　　'] as const;
 
 /**
  * 表の1行。**見出しも「イマ」も候補もこの関数を通す**ので、列が縦にずれることが起きない。
@@ -166,7 +168,7 @@ function pitcherRow(name: string, role: string, stamina: string, cells: readonly
 
 /** 列の見出し（名前・型・残量の欄は空けて、バーの列にだけ名前を付ける） */
 function pitcherHeaderRow(): string {
-  return pitcherRow('', '　　　　', '', STUFF_HEADERS);
+  return pitcherRow('', '　　', '', STUFF_HEADERS);
 }
 
 /**
@@ -177,7 +179,7 @@ export function describePitcherEntry(roster: TeamRoster, id: PlayerId): string {
   // スキルの補正込みで読む（フェーズF-26-1）。`タフネス` はSTMへの補正なので、
   // **型（先発/リリーフ）の導出まで一緒に動く**＝表示と実際の持ち球数が食い違わない。
   const stats = effectivePitching(roster, id);
-  const role = stats && pitcherRole(stats.stamina) === 'starter' ? 'センパツ' : 'リリーフ';
+  const role = stats && pitcherRole(stats.stamina) === 'starter' ? '先発' : '救援';
   const { speed, breaking, control } = pitcherStuffOf(roster, id);
   return pitcherRow(
     roster.players[id].name,
@@ -228,7 +230,7 @@ export function describeBatterEntry(roster: TeamRoster, id: PlayerId, inning?: n
   const stats = effectiveBatting(roster, id, inning);
   const owned = skillsOf(roster, id);
   const skills = owned.length === 0 ? '' : ` ${owned.map((s) => skillDef(s).name).join(' ')}`;
-  const hot = isHot(roster, id, inning) ? ' ゼッコーチョー' : '';
+  const hot = isHot(roster, id, inning) ? ' 絶好調' : '';
   return batterRow(roster.players[id].name, stats.bats, batterStatCells(stats), `${hot}${skills}`);
 }
 
@@ -244,16 +246,16 @@ export function describeBatterEntry(roster: TeamRoster, id: PlayerId, inning?: n
 export function describePinchRunTarget(roster: TeamRoster, target: PinchRunTarget): string {
   const base = { first: 1, second: 2, third: 3 }[target.base];
   const stats = effectiveBatting(roster, target.runnerId);
-  return `ダイソウ ${base}ルイ ${roster.players[target.runnerId].name} ソウ${ratingBar(stats.run)}`;
+  return `代走 ${base}塁 ${roster.players[target.runnerId].name} 走力${ratingBar(stats.run)}`;
 }
 
 /** 塁状況の短い表記（敬遠の結果を1行で見せるため） */
 function describeBases(bases: Bases): string {
-  const names = [bases.first ? 'イチ' : '', bases.second ? 'ニ' : '', bases.third ? 'サン' : '']
+  const names = [bases.first ? '一' : '', bases.second ? '二' : '', bases.third ? '三' : '']
     .filter(Boolean);
-  if (names.length === 0) return 'ランナーナシ';
-  if (names.length === 3) return 'マンルイ';
-  return `${names.join('・')}ルイ`;
+  if (names.length === 0) return '走者なし';
+  if (names.length === 3) return '満塁';
+  return `${names.join('・')}塁`;
 }
 
 /**
@@ -265,8 +267,8 @@ function describeBases(bases: Bases): string {
  */
 function describeIntentionalWalk(target: IntentionalWalkTarget): string {
   const { bases, runs } = forceAdvance(target.bases);
-  const after = runs > 0 ? `オシダシ ${runs}テン` : describeBases(bases);
-  return `ケイエン ${target.batterName}→${after} ツギ:${target.nextBatterName}`;
+  const after = runs > 0 ? `押し出し${runs}点` : describeBases(bases);
+  return `敬遠 ${target.batterName}→${after} 次:${target.nextBatterName}`;
 }
 
 /**
@@ -326,7 +328,7 @@ export function runManagerMenu(
         // 「打つ力で選ぶか、足で選ぶか」を同じ物差しで比べられる（EE-52の走力の列）。
         const target = stage.target;
         candidates = canPinchRun(roster, target.runnerId) ? roster.bench : [];
-        title.setText(`サクセン: ${describePinchRunTarget(roster, target)}`);
+        title.setText(`作戦: ${describePinchRunTarget(roster, target)}`);
         notes = [
           `${MARKS.off}${batterHeaderRow()}`,
           `${MARKS.current}${describeBatterEntry(roster, target.runnerId, inning)}`,
@@ -334,13 +336,13 @@ export function runManagerMenu(
         // 投手に代走を出すと自動継投になる（＝先発が降りる）。代打とまったく同じ代償なので、
         // 代打と同じ書式で押す前に見せる。
         if (candidates.length > 0 && target.runnerId === roster.pitcher) {
-          notes.push(`ジドウ コウタイトウシュ: ${roster.players[roster.bullpen[0]].name}`);
+          notes.push(`自動で投手交代: ${roster.players[roster.bullpen[0]].name}`);
         }
         items = candidates.map((id, index) => ({
           label: describeBatterEntry(roster, id, inning),
           choice: { kind: 'pinchRun', base: target.base, index },
         }));
-        items.push({ label: 'ヤメル', choice: null });
+        items.push({ label: 'やめる', choice: null });
         cursor = 0;
         return;
       }
@@ -351,8 +353,8 @@ export function runManagerMenu(
       candidates = role === 'batting' ? (canPinchHit(roster) ? roster.bench : []) : roster.bullpen;
       title.setText(
         role === 'batting'
-          ? `サクセン: ダイダ ${describeBattingSlot(roster)}`
-          : `サクセン: コウタイトウシュ ${describePitcherSlot(roster)}`,
+          ? `作戦: 代打 ${describeBattingSlot(roster)}`
+          : `作戦: 投手交代 ${describePitcherSlot(roster)}`,
       );
       // 候補には判断に効く能力値を併記する：継投なら型・残量・球の中身（B-11／DD-51）、
       // 代打なら打席の左右・打率・本塁打数・走力（D-18／EE-52）。投手にスタミナ、打者に打撃と
@@ -396,7 +398,7 @@ export function runManagerMenu(
         notes.push(
           `${MARKS.off}${pitcherHeaderRow()}`,
           `${MARKS.current}${describePitcherEntry(roster, id)}${
-            fatigueOf(roster, id) > 0 ? ' キュウイダウン' : ''
+            fatigueOf(roster, id) > 0 ? ' 球威ダウン' : ''
           }`,
         );
       } else {
@@ -407,7 +409,7 @@ export function runManagerMenu(
         );
         // 投手の打席への代打は自動継投を伴う（＝ブルペンを1人使う）ので、それも押す前に見せる。
         if (candidates.length > 0 && isPitcherAtBat(roster)) {
-          notes.push(`ジドウ コウタイトウシュ: ${roster.players[roster.bullpen[0]].name}`);
+          notes.push(`自動で投手交代: ${roster.players[roster.bullpen[0]].name}`);
         }
       }
       cursor = 0;
@@ -416,16 +418,15 @@ export function runManagerMenu(
     const overlay = document.createElement('div');
     overlay.style.cssText = OVERLAY_STYLE;
 
-    const title = createPixelLabel('', { fontSize: 10, scale: 3, color: '#ffe066' });
+    const title = createPixelLabel('', { scale: 2, color: '#ffe066' });
     applyPanelChrome(title.el);
     title.el.style.marginBottom = '10px';
 
-    const list = createPixelLabel('', { fontSize: 9, scale: MENU_SCALE, color: '#f8f8f8' });
+    const list = createPixelLabel('', { scale: MENU_SCALE, color: '#f8f8f8' });
     applyPanelChrome(list.el);
 
-    const hint = createPixelLabel('W/S:イドウ Select:ケッテイ Start:モドル', {
-      fontSize: 7,
-      scale: 2,
+    const hint = createPixelLabel('W/S:移動 Select:決定 Start:戻る', {
+      scale: 1,
       color: '#cccccc',
     });
     Object.assign(hint.el.style, {
@@ -444,7 +445,7 @@ export function runManagerMenu(
         .join('\n');
       // 候補が無いときも「イマ」の行は出す（今の状態が分かったうえで代われないことが
       // 分かる＝「意思決定材料は隠さない」方針）。
-      const head = [...notes, ...(candidates.length === 0 ? ['(コウホ ナシ)'] : [])]
+      const head = [...notes, ...(candidates.length === 0 ? ['（候補なし）'] : [])]
         .map((line) => `${line}\n`)
         .join('');
       const text = `${head}${body}`;
@@ -454,14 +455,14 @@ export function runManagerMenu(
       // 左の `▶` と右の セイキュウ の列が消えた＝どれを選んでいるのか分からなくなる）。
       // 縮めるのは整数倍のまま（ドット絵の拡大はいつも整数倍＝②の約束）。
       // **代打側にも同じ保険が効く**：スキルを4つ持つ控えの行はもともと画面より長い。
-      const fit = Math.max(1, Math.floor(root.clientWidth / list.el.width));
+      const fit = Math.max(1, Math.floor(root.clientWidth / (list.el.width * uiScale())));
       if (fit < MENU_SCALE) list.setText(text, { scale: fit });
       // 2段目だけ「J＝1つ前へ戻る」を案内する（1段目の J は戻り先が無いので何も起きない
       // ＝押せない操作を案内しない。抽選画面の段階①・V-43の先発の段と同じ扱い）。
       hint.setText(
         stage.kind === 'main'
-          ? 'W/S:イドウ Select:ケッテイ Start:モドル'
-          : 'W/S:イドウ Select:ケッテイ J:モドル',
+          ? 'W/S:移動 Select:決定 Start:戻る'
+          : 'W/S:移動 Select:決定 J:戻る',
       );
     }
     buildStage();
@@ -478,15 +479,19 @@ export function runManagerMenu(
     }
 
     const offUp = pad.onPress('up', () => {
+      sfx.menuMove();
       cursor = (cursor - 1 + items.length) % items.length;
       render();
     });
     const offDown = pad.onPress('down', () => {
+      sfx.menuMove();
       cursor = (cursor + 1) % items.length;
       render();
     });
     const offSelect = pad.onPress('select', () => {
       const choice = items[cursor].choice;
+      if (choice === null) sfx.menuCancel();
+      else sfx.menuConfirm();
       // 1段目の代走の行（`index: -1`）だけは「決定」ではなく**2段目へ進む**
       // （C-15の打順入替が「選手を選んでK→打順を選んでK」の2段階なのと同じ）。
       if (choice !== null && choice.kind === 'pinchRun' && choice.index < 0) {
@@ -501,11 +506,13 @@ export function runManagerMenu(
       close(choice);
     });
     const offStart = pad.onPress('start', () => {
+      sfx.menuCancel();
       close(null);
     });
     // J は2段目でだけ意味を持つ（1つ前へ戻る）。1段目では戻り先が無いので何もしない。
     const offBack = pad.onPress('b', () => {
       if (stage.kind === 'main') return;
+      sfx.menuCancel();
       stage = { kind: 'main' };
       buildStage();
       render();

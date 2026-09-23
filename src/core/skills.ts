@@ -69,11 +69,11 @@ import { type RngState, createRngState, nextIndex, nextWeightedIndex, sampleWith
 export type SkillLineage = 'violence' | 'mecha' | 'psychic' | 'animal' | 'guts';
 
 export const LINEAGE_NAME: Record<SkillLineage, string> = {
-  violence: 'ボウリョク',
+  violence: '暴力',
   mecha: 'メカ',
-  psychic: 'チョウノウリョク',
-  animal: 'ドウブツ',
-  guts: 'コンジョウ',
+  psychic: '超能力',
+  animal: '動物',
+  guts: '根性',
 };
 
 /**
@@ -102,11 +102,11 @@ export const ALL_LINEAGES: readonly SkillLineage[] = [
  * - `guts` コンジョウ＝**能力値の底上げ**（長打力・打率・スタミナと、その代償）
  */
 export const LINEAGE_DOMAIN: Record<SkillLineage, string> = {
-  violence: 'ラントウト ボウガイ',
-  mecha: 'ソウルイト ヒドウグ',
-  psychic: 'トウキュウト ヨミ',
-  animal: 'シュビト ソウルイノ カン',
-  guts: 'ノウリョクチノ ソコアゲ',
+  violence: '乱闘と妨害',
+  mecha: '走塁と飛び道具',
+  psychic: '投球と読み',
+  animal: '守備と走塁の勘',
+  guts: '能力値の底上げ',
 };
 
 /** ★1（地味に効く）〜★4（デュオ専用）。数値が大きいほどレアで強い */
@@ -494,68 +494,68 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   // ---- ボウリョク：乱闘と妨害 ----
   kenkappayai: {
     id: 'kenkappayai',
-    name: 'ケンカッパヤイ',
+    name: '喧嘩っ早い',
     lineage: 'violence',
     rarity: 1,
     target: 'any',
-    text: 'ラントウノ タイリョク+30',
+    text: '乱闘の体力+30',
     brawl: { hp: 30 },
   },
   tekko: {
     id: 'tekko',
-    name: 'テッコウ',
+    name: '鉄甲',
     lineage: 'violence',
     rarity: 1,
     target: 'any',
-    text: 'ラントウノ イリョク1.2バイ',
+    text: '乱闘の威力1.2倍',
     brawl: { powerScale: 1.2 },
   },
   zutsuki: {
     id: 'zutsuki',
-    name: 'ズツキ',
+    name: '頭突き',
     lineage: 'violence',
     rarity: 1,
     target: 'any',
     // 体力と威力を少しずつ。★1の中で「どちらにも効くが尖っていない」枠で、
     // ケンカッパヤイ（体力だけ）・テッコウ（威力だけ）との選び分けになる。
-    text: 'ラントウノ タイリョクト イリョク',
+    text: '乱闘の体力と威力',
     brawl: { hp: 20, powerScale: 1.1 },
   },
   karate: {
     id: 'karate',
-    name: 'カラテ',
+    name: '空手',
     lineage: 'violence',
     rarity: 1,
     target: 'any',
     // ★1の「威力寄りだが体力も少し」。テッコウ（威力だけ1.2）との選び分けになる幅で、
     // 同じ軸の札を複数置くときは**必ずどちらかが上位互換にならない配分**にする
     // （でないと片方が死に札になる）。
-    text: 'ラントウガ スコシ ツヨイ',
+    text: '乱闘が少し強い',
     brawl: { hp: 10, powerScale: 1.15 },
   },
   dosukoi: {
     id: 'dosukoi',
-    name: 'ドスコイ',
+    name: 'どすこい',
     lineage: 'violence',
     rarity: 1,
     target: 'any',
     // ボウリョク系統で唯一、**打席にも効く**★1（体当たりの力がそのまま打球に乗る）。
     // 乱闘は死球が起きた試合にしか出番が無いので、系統を引き当てた試合が
     // 「何も起きなければ全部空振り」にならないための逃げ道でもある。
-    text: 'オシガ ツヨク チカラモ ツク',
+    text: '押しが強く力もつく',
     modifier: { power: 0.1 },
     brawl: { hp: 20 },
   },
   shoryuken: {
     id: 'shoryuken',
-    name: 'ショウリュウケン',
+    name: '昇龍拳',
     lineage: 'violence',
     rarity: 2,
     target: 'any',
     // 乱闘v2（G-27）：**必殺技はスキルが配る**（2026-07-31 ユーザー判断）。コマンドは
     // `core/brawl.ts` の `MOVES` が持つので、ここに書くのは「どの技が解禁されるか」だけ
     // （表示の技表もコマンド判定も同じ1か所から起きる）。
-    text: 'ヒッサツワザ ショウリュウケン',
+    text: '必殺技・昇龍拳',
     brawl: { unlockMove: 'shoryu' },
   },
   doroppukikku: {
@@ -568,40 +568,40 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // **動詞系**（新しい操作の解禁）。`ショウリュウケン` が乱闘という別の画面の中で効くのに対し、
     // こちらは**試合そのものの中で殴る**ので、実体は `core/fielding.ts` のドロップキック定数と
     // `scenes/chicchaiScene.ts` の走塁にある（バイクと同じ置き方）。
-    text: 'Gデ ヤシュヲ ケリタオス',
+    text: 'Gで野手を蹴り倒す',
   },
   abareguse: {
     id: 'abareguse',
-    name: 'アバレグセ',
+    name: '暴れ癖',
     lineage: 'violence',
     rarity: 2,
     target: 'any',
-    text: 'ラントウガ ゼンメンテキニ ツヨイ',
+    text: '乱闘が全面的に強い',
     brawl: { hp: 40, powerScale: 1.2 },
   },
   haganenokarada: {
     id: 'haganenokarada',
-    name: 'ハガネノカラダ',
+    name: '鋼の体',
     lineage: 'violence',
     rarity: 2,
     target: 'any',
     // 体力に全振りした★2。**負けない**ほうへ寄せた札で、威力寄りの `イカク` と対になる
     // （乱闘は体力と威力の2軸しか無いので、★2はその両端を1枚ずつ持たせる）。
-    text: 'ラントウノ タイリョク+60',
+    text: '乱闘の体力+60',
     brawl: { hp: 60 },
   },
   ikaku: {
     id: 'ikaku',
-    name: 'イカク',
+    name: '威嚇',
     lineage: 'violence',
     rarity: 2,
     target: 'any',
-    text: 'ニラミデ ラントウガ ユウリ',
+    text: 'にらみで乱闘が有利',
     brawl: { powerScale: 1.3 },
   },
   tetsugeta: {
     id: 'tetsugeta',
-    name: 'テツゲタ',
+    name: '鉄下駄',
     lineage: 'violence',
     rarity: 2,
     target: 'any',
@@ -610,31 +610,31 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 2回だけだが射程6m（F-26-7の「同じ軸に複数置くときはどちらかが上位互換にならない
     // 配分にする」）。射程の補正をデュオ以外に置いている唯一の札で、
     // **自分でその動詞を解禁するので死に札にならない**（デュオ限定の理由が当たらない）。
-    text: '2カイダケ シャテイ6mノ ケリ',
+    text: '2回だけ射程6mの蹴り',
     play: { dropkickRange: 2 },
     charges: 2,
   },
   bukimochikomi: {
     id: 'bukimochikomi',
-    name: 'ブキモチコミ',
+    name: '武器持ち込み',
     lineage: 'violence',
     rarity: 3,
     target: 'any',
     // 乱闘v2（G-27）：威力に加えて**溜めコマンドの大技**を配る★3。ショウリュウケン（★2）が
     // 「速くて出しやすい必殺技」なのに対し、こちらは**1秒ためて待つ**ことが代償の一撃
     // ＝同じ「必殺技を配る札」でもどちらかが上位互換にならない（F-26-7の配分方針）。
-    text: 'イリョク1.5バイ ＋ タメワザ',
+    text: '威力1.5倍＋溜め技',
     brawl: { powerScale: 1.5, unlockMove: 'buki' },
   },
   oyabun: {
     id: 'oyabun',
-    name: 'オヤブン',
+    name: '親分',
     lineage: 'violence',
     rarity: 3,
     target: 'any',
     // ★3は「試合の形が変わるもの」。乱闘に持ち込めば**ほぼ負けない**体力と威力で、
     // 死球を受けた（撃たれた）ときに乱闘を選ぶかどうかの判断そのものを反転させる。
-    text: 'ラントウガ メチャクチャ ツヨイ',
+    text: '乱闘がめちゃくちゃ強い',
     brawl: { hp: 50, powerScale: 1.3 },
   },
 
@@ -649,17 +649,17 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 「野手の足 8.5m/s より遅い」という挟殺成立の前提（⑥）は保たれる。
     // 上限そのものを踏み越えるのは `バイク`（F-26-3）のほうで、そちらは
     // 「曲がれない＝塁を行き過ぎる」を代償に付けてある。
-    text: 'ソウリョクガ アガル',
+    text: '走力が上がる',
     modifier: { run: 0.15 },
   },
   haguruma: {
     id: 'haguruma',
-    name: 'ハグルマ',
+    name: '歯車',
     lineage: 'mecha',
     rarity: 1,
     target: 'pitcher',
     // SPD +0.15＝緩急3段階すべての基準速が上がる（`speedForPitchSelection`）。
-    text: 'キュウソクガ アガル',
+    text: '球速が上がる',
     modifier: { speed: 0.15 },
   },
   kyatapira: {
@@ -671,19 +671,19 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // **★1で唯一のトレードオフ**。走力は スケボー より大きく伸びるが打率が落ちる＝
     // 「代走向きの札」になる。負の補正は `combinedModifier` の足し算と `rated` の
     // クランプにそのまま乗るので、専用の仕組みは要らない。
-    text: 'アシハ ハヤイガ ダゲキガ オチル',
+    text: '足は速いが打撃が落ちる',
     modifier: { run: 0.25, average: -0.1 },
   },
   yobitanku: {
     id: 'yobitanku',
-    name: 'ヨビタンク',
+    name: '予備タンク',
     lineage: 'mecha',
     rarity: 1,
     target: 'pitcher',
     // 限界球数 +20球。コンジョウの `タフネス`（+25球）と近いが、**系統が違う**ので
     // 同じ試合に両方が出るのは3系統のうち2つを引いたときだけ＝どちらか片方しか
     // 出ない試合のほうが多い（絞り込みがあるぶん、系統をまたいだ重複は許容できる）。
-    text: 'スタミナ+20キュウ',
+    text: 'スタミナ+20球',
     modifier: { stamina: 0.2 },
   },
   bane: {
@@ -694,16 +694,16 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     target: 'any',
     // 長打力と走力を少しずつ＝**メカ系統で唯一、打撃にも効く★1**。走塁一辺倒の系統に
     // 打者としての使い道を1枚だけ混ぜてある（`ドスコイ` と同じ理由）。
-    text: 'ハンパツデ チカラト アシ',
+    text: '反発で力と足',
     modifier: { power: 0.1, run: 0.1 },
   },
   jettogutsu: {
     id: 'jettogutsu',
-    name: 'ジェットグツ',
+    name: 'ジェット靴',
     lineage: 'mecha',
     rarity: 2,
     target: 'any',
-    text: 'ソウリョクガ オオハバニ アガル',
+    text: '走力が大幅に上がる',
     modifier: { run: 0.3 },
   },
   tabo: {
@@ -714,7 +714,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     target: 'pitcher',
     // 球速を大きく上げる代わりにスタミナが減る＝**短いイニングを飛ばす投手**になる。
     // STM は限界球数そのもの（B-11）なので、-0.15 は限界 -15球として素直に効く。
-    text: 'キュウソク++ スタミナ-',
+    text: '球速++ スタミナ-',
     modifier: { speed: 0.3, stamina: -0.15 },
   },
   hoba: {
@@ -725,18 +725,18 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     target: 'any',
     // 走力の★2を2枚（`ジェットグツ` は走力一本、こちらは打撃も少し）。走者速度の上限
     // （8.2m/s）は動かないので、`バイク` だけが上限を踏み越えるという⑥の整理は保たれる。
-    text: 'ウキアガッテ ハシル ダゲキモ+',
+    text: '浮き上がって走る 打撃も+',
     modifier: { run: 0.25, average: 0.05 },
   },
   douryokuro: {
     id: 'douryokuro',
-    name: 'ドウリョクロ',
+    name: '動力炉',
     lineage: 'mecha',
     rarity: 2,
     target: 'pitcher',
     // `ターボ`（球速を大きく上げてスタミナを削る）と正反対の投手札＝**長く投げる**ほう。
     // 同じ系統に「飛ばす」と「持たせる」を並べておくと、投手をどう作るかの選択になる。
-    text: 'キュウソクト スタミナガ アガル',
+    text: '球速とスタミナが上がる',
     modifier: { speed: 0.15, stamina: 0.2 },
   },
   jairo: {
@@ -747,12 +747,12 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     target: 'any',
     // AV は「芯を外したときの打球の弱まりにくさ」（⑥）＝機械の安定装置で軸がぶれない、
     // という説明がそのまま効果になる。
-    text: 'ブレナイ ツマッテモ マエヘ',
+    text: 'ぶれない 詰まっても前へ',
     modifier: { average: 0.2, run: 0.1 },
   },
   yobiju: {
     id: 'yobiju',
-    name: 'ヨビジュウ',
+    name: '予備銃',
     lineage: 'mecha',
     rarity: 2,
     // 撃つのは投手だけ（`ジュウ` と同じ理由。CLAUDE.md ③）。
@@ -760,7 +760,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // **消費型**（F-26-8）。★3の `ジュウ`（毎試合3発）に対してラン全体で1発だけ＝
     // レアリティの差がそのまま回数の差になっている。**1発しか無いからこそ
     // 「どの打者に使うか」が判断になる**（銃は実質敬遠なので、狙いどころが読める）。
-    text: '1カイダケ ジュウガ ウテル',
+    text: '1回だけ銃が撃てる',
     charges: 1,
   },
   nitoro: {
@@ -772,12 +772,12 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // **消費型**（F-26-8）。★3の `バイク`（何度でも乗れる）に対してラン全体で2回だけ。
     // 代償（オーバーラン6m）はそのままなので、⑥の設計不変条件（走力の上限＜野手の足＝
     // 挟殺が成立する）は消費型でも同じ形で保たれる＝**バイク専用の分岐は増えない**。
-    text: '2カイダケ バイクニ ノレル',
+    text: '2回だけバイクに乗れる',
     charges: 2,
   },
   ju: {
     id: 'ju',
-    name: 'ジュウ',
+    name: '銃',
     lineage: 'mecha',
     rarity: 3,
     // 投手だけが撃てる（CLAUDE.md ③「ピッチャーはオプションで銃を持つことができる」）。
@@ -787,7 +787,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     //
     // フェーズF-26-2でオリジナル要素の銃をここへ吸収した。以後**銃は常設ではなく
     // ランごとの当たり**になる＝引けなかった試合に銃は存在しない（CLAUDE.md ⑧）。
-    text: 'Gデ ダシャヲ ウテル 3ハツ',
+    text: 'Gで打者を撃てる（3発）',
   },
   baiku: {
     id: 'baiku',
@@ -801,59 +801,59 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // レーティングでは表せない。代償（曲がれない＝塁を行き過ぎる）とセットでしか
     // 成立しないスキルなので、実体は `core/fielding.ts` のバイク定数と
     // `scenes/chicchaiScene.ts` の走塁にある。
-    text: 'Jナガオシデ 2バイソク イキスギル',
+    text: 'J長押しで2倍速 行き過ぎる',
   },
 
   // ---- チョウノウリョク：投球と読み ----
   yochi: {
     id: 'yochi',
-    name: 'ヨチ',
+    name: '予知',
     lineage: 'psychic',
     rarity: 1,
     target: 'any',
     // AV は「芯を外したときの打球の弱まりにくさ」（⑥）＝**当たりやすさには効かない**ので、
     // 読めても操作の手応えは変わらない（打者が代わるたびにスイングの感触が変わらない、
     // というB-8のユーザー判断はスキルでも崩さない）。
-    text: 'タマガ ヨメル シンヲ クワナイ',
+    text: '球が読める 詰まりにくい',
     modifier: { average: 0.15 },
   },
   nenriki: {
     id: 'nenriki',
-    name: 'ネンリキ',
+    name: '念力',
     lineage: 'psychic',
     rarity: 1,
     target: 'pitcher',
-    text: 'カーブガ オオキク マガル',
+    text: 'カーブが大きく曲がる',
     modifier: { breakLeft: 0.2 },
   },
   shinenha: {
     id: 'shinenha',
-    name: 'シネンハ',
+    name: '思念波',
     lineage: 'psychic',
     rarity: 1,
     target: 'pitcher',
-    text: 'シュートガ オオキク マガル',
+    text: 'シュートが大きく曲がる',
     modifier: { breakRight: 0.2 },
   },
   reikan: {
     id: 'reikan',
-    name: 'レイカン',
+    name: '霊感',
     lineage: 'psychic',
     rarity: 1,
     target: 'any',
-    text: 'タマスジガ スコシ ヨメル',
+    text: '球筋が少し読める',
     modifier: { average: 0.1, power: 0.05 },
   },
   nendouriki: {
     id: 'nendouriki',
-    name: 'ネンドウリキ',
+    name: '念動力',
     lineage: 'psychic',
     rarity: 1,
     target: 'pitcher',
     // ネンリキ（カーブ）／シネンハ（シュート）が片側ずつなのに対し、こちらは両方を少し。
     // **★1のうちに「どちらも曲がる」形を用意しておく**と、★2の `サイコパワー` は
     // その上位ではなく「大きく曲げる」選択として残る。
-    text: 'リョウホウ スコシ マガル',
+    text: '両方少し曲がる',
     modifier: { breakLeft: 0.1, breakRight: 0.1 },
   },
   terepashi: {
@@ -862,7 +862,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
-    text: 'ハイキュウガ スケテ ミエル',
+    text: '配球が透けて見える',
     modifier: { average: 0.25 },
   },
   saikopawa: {
@@ -872,43 +872,43 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     rarity: 2,
     target: 'pitcher',
     // 左右どちらの変化量も上げる＝ネンリキ／シネンハを1枚で兼ねる上位札。
-    text: 'ヘンカキュウガ ヨク マガル',
+    text: '変化球がよく曲がる',
     modifier: { breakLeft: 0.25, breakRight: 0.25 },
   },
   jikanteishi: {
     id: 'jikanteishi',
-    name: 'ジカンテイシ',
+    name: '時間停止',
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
-    text: 'タマガ トマッテ ミエル',
+    text: '球が止まって見える',
     modifier: { average: 0.15, power: 0.15 },
   },
   miraishi: {
     id: 'miraishi',
-    name: 'ミライシ',
+    name: '未来視',
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
     // チョウノウリョクで唯一の**長打力に全振り**した札。「読み」の系統に力の軸を1本入れて
     // おかないと、この系統を引いた試合は打球が飛ばない試合になってしまう。
-    text: 'ヨンダ タマヲ シトメル',
+    text: '読んだ球を仕留める',
     modifier: { power: 0.25 },
   },
   sainendou: {
     id: 'sainendou',
-    name: 'サイネンドウ',
+    name: 'サイ念動',
     lineage: 'psychic',
     rarity: 2,
     target: 'pitcher',
     // 球速と変化量を同時に。**変化量は飛行時間に効く**（球が遅いほど横に大きく動く）ので、
     // 球速を上げるとこの2つは打ち消し合う＝1枚では極端にならない配分にしてある。
-    text: 'タマガ ハヤク マガル',
+    text: '球が速く よく曲がる',
     modifier: { speed: 0.2, breakLeft: 0.1, breakRight: 0.1 },
   },
   shinenseigyo: {
     id: 'shinenseigyo',
-    name: 'シネンセイギョ',
+    name: '思念制御',
     lineage: 'psychic',
     rarity: 2,
     target: 'pitcher',
@@ -919,12 +919,12 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // +0.20 は `pitch.ts` の `COURSE_VX_PER_CONTROL` の基準そのもの＝**人間が投げると、
     // ど真ん中のプレート位置からCPUの決め球と同じ隅（0.50）へ届く**ようになる。
     // CPUが投げる側に回れば狙いがゾーンの縁の内側へ入る（＝見逃せば三振）。
-    text: 'ネラッタ コースヘ スイコマレル',
+    text: '狙ったコースへ吸い込まれる',
     modifier: { control: 0.2 },
   },
   zazen: {
     id: 'zazen',
-    name: 'ザゼン',
+    name: '座禅',
     lineage: 'psychic',
     rarity: 2,
     target: 'pitcher',
@@ -933,12 +933,12 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 打球初速（`0.5 × 球速`）・飛行時間（打者に与える時間が延びる）・そして
     // **S-40の持ち味**（`cpuPitcherStyle` は SPD と F の差で決まるので、速球派が
     // バランス型や技巧派に変わりうる＝CPUが投げる側に回ると決め球そのものが変わる）。
-    text: 'スミヘ トドクガ タマガ オソイ',
+    text: '隅へ届くが球が遅い',
     modifier: { control: 0.3, speed: -0.2 },
   },
   zettaiyochi: {
     id: 'zettaiyochi',
-    name: 'ゼッタイヨチ',
+    name: '絶対予知',
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
@@ -947,144 +947,144 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 「ここぞの1打席を確実にする」ほうへ振ってある（F-26-7の配分方針）。
     // 効果の形は従来どおりのパラメータ系なので、**HUDの打者カードの AV も一緒に動く**
     // ＝切ったことが数字で見える（CLAUDE.md ⑥「表示はレーティングからの導出」）。
-    text: '1ダセキ スベテ ミエル',
+    text: '1打席すべて見える',
     modifier: { average: 0.5 },
     charges: 2,
     duration: 'atBat',
   },
   shingan: {
     id: 'shingan',
-    name: 'シンガン',
+    name: '心眼',
     lineage: 'psychic',
     rarity: 3,
     target: 'any',
     // AV +0.35＝HUDの表示打率も一緒に +.053 動く（`displayAverage`）。
     // 表示がレーティングからの導出だから起きることで、⑥の整理がそのまま効いている。
-    text: 'スベテノ タマガ ミエル',
+    text: 'すべての球が見える',
     modifier: { average: 0.35 },
   },
   yomikiru: {
     id: 'yomikiru',
-    name: 'ヨミキル',
+    name: '読み切る',
     lineage: 'psychic',
     rarity: 3,
     target: 'any',
     // `シンガン`（打率に全振り）と対になる★3＝**読んで仕留める**ほう。デュオの
     // `ゼンチゼンノウ`（AV+0.3/HR+0.1）より力側へ寄せてあるので、デュオの上位互換にならない。
-    text: 'スベテ ヨンデ シトメル',
+    text: 'すべて読んで仕留める',
     modifier: { average: 0.25, power: 0.2 },
   },
 
   // ---- ドウブツ：守備と走塁の勘 ----
   inu: {
     id: 'inu',
-    name: 'イヌ',
+    name: '犬',
     lineage: 'animal',
     rarity: 1,
     target: 'any',
     // **原作（説明書p26-29）に守備の能力項目は無い**（⑥）ので、守備に個人差が付くのは
     // ローグライトのここが初めて。素の選手は全員 `CATCH_RADIUS`=2.6 のまま。
-    text: 'タマニ トドク ハンイガ ヒロガル',
+    text: '球に届く範囲が広がる',
     play: { catchRadius: 0.6 },
   },
   usagi: {
     id: 'usagi',
-    name: 'ウサギ',
+    name: '兎',
     lineage: 'animal',
     rarity: 1,
     target: 'any',
     // 盗塁のスタート位置（`STEAL_LEAD`=3.5m）が深くなる＝走る距離が縮む。
     // 判定（`stealSafeJumpSec`）は元から lead を引数に取るので、専用の分岐は要らない。
-    text: 'トウルイノ スタートガ フカイ',
+    text: '盗塁のスタートが深い',
     play: { stealLead: 1.2 },
   },
   saru: {
     id: 'saru',
-    name: 'サル',
+    name: '猿',
     lineage: 'animal',
     rarity: 1,
     target: 'any',
-    text: 'スバシッコク ケンカニ ツヨイ',
+    text: 'すばしっこく喧嘩に強い',
     modifier: { run: 0.1 },
     brawl: { hp: 15 },
   },
   neko: {
     id: 'neko',
-    name: 'ネコ',
+    name: '猫',
     lineage: 'animal',
     rarity: 1,
     target: 'any',
     // 捕球半径 +0.4m（`イヌ` の +0.6 より控えめ）に足の速さが少し付く。守備範囲の札を
     // ★1に2枚置くのは、**デュオ `ヤセイノカン` の前提（イヌ＋タカ）を掘り当てる邪魔をしない**
     // 程度に、守備型のビルドを始めやすくするため。
-    text: 'ミノコナシガ カルイ',
+    text: '身のこなしが軽い',
     play: { catchRadius: 0.4 },
     modifier: { run: 0.05 },
   },
   kame: {
     id: 'kame',
-    name: 'カメ',
+    name: '亀',
     lineage: 'animal',
     rarity: 1,
     target: 'any',
     // ★1のトレードオフ札で、`キャタピラ`（足＋／打撃−）のちょうど逆。足を捨てて
     // 詰まっても前へ飛ばす＝**代打で出す価値はあるが走らせたくない**打者になる。
-    text: 'オソイガ シブトイ',
+    text: '遅いがしぶとい',
     modifier: { average: 0.15, run: -0.05 },
   },
   taka: {
     id: 'taka',
-    name: 'タカ',
+    name: '鷹',
     lineage: 'animal',
     rarity: 2,
     target: 'any',
-    text: 'タマニ トドク ハンイガ オオキイ',
+    text: '球に届く範囲が大きい',
     play: { catchRadius: 1.2 },
   },
   uma: {
     id: 'uma',
-    name: 'ウマ',
+    name: '馬',
     lineage: 'animal',
     rarity: 2,
     target: 'any',
-    text: 'アシガ ハヤク スタートモ フカイ',
+    text: '足が速くスタートも深い',
     modifier: { run: 0.2 },
     play: { stealLead: 1 },
   },
   kuma: {
     id: 'kuma',
-    name: 'クマ',
+    name: '熊',
     lineage: 'animal',
     rarity: 2,
     target: 'any',
-    text: 'チカラガ ツヨク ケンカニ ツヨイ',
+    text: '力が強く喧嘩に強い',
     modifier: { power: 0.25 },
     brawl: { hp: 20 },
   },
   washi: {
     id: 'washi',
-    name: 'ワシ',
+    name: '鷲',
     lineage: 'animal',
     rarity: 2,
     target: 'any',
     // `タカ`（+1.2）より狭いが足が付く★2。守備範囲は**ファインプレイの伸びたリーチにも
     // そのまま乗る**ので、跳ぶ判断の届く距離まで一緒に広がる。
-    text: 'トビツイテ トル アシモ+',
+    text: '飛びついて捕る 足も+',
     play: { catchRadius: 0.9 },
     modifier: { run: 0.1 },
   },
   inoshishi: {
     id: 'inoshishi',
-    name: 'イノシシ',
+    name: '猪',
     lineage: 'animal',
     rarity: 2,
     target: 'any',
-    text: 'マッスグ トツゲキスル',
+    text: 'まっすぐ突撃する',
     modifier: { run: 0.25, average: -0.05 },
   },
   kemonogaeri: {
     id: 'kemonogaeri',
-    name: 'ケモノガエリ',
+    name: '獣返り',
     lineage: 'animal',
     rarity: 2,
     target: 'any',
@@ -1095,7 +1095,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 打者側の2枚（打席の頭で切る）と判断の質そのものが違う＝同じ「一時効果」でも
     // 場面が重ならない。届くかどうかを見てから払う点で、ファインプレイ（跳んで外せば
     // 起き上がるまで動けない）と同じ「見てから賭ける」操作の系列に乗る。
-    text: '1ダセキ シュビハンイ ゲキゾウ',
+    text: '1打席 守備範囲激増',
     play: { catchRadius: 3 },
     charges: 2,
     duration: 'atBat',
@@ -1108,19 +1108,19 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     target: 'any',
     // RUN +0.4 でも走者速度の上限は 8.2m/s のまま＝野手（8.5m/s）に追いつかれうる
     // という挟殺成立の前提（⑥）は崩れない。踏み越えるのは `バイク` だけ。
-    text: 'アシガ トテツモナク ハヤイ',
+    text: '足がとてつもなく速い',
     modifier: { run: 0.4 },
   },
   hayabusa: {
     id: 'hayabusa',
-    name: 'ハヤブサ',
+    name: '隼',
     lineage: 'animal',
     rarity: 3,
     target: 'any',
     // `チーター`（走力に全振り）と対になる★3＝**守備範囲に全振り**。素の 2.6m が 3.6m まで
     // 広がるので、内野の間を抜ける打球が目に見えて減る＝どこを守らせるかが采配になる
     // （B-10の守備位置の割当が打球処理に効く数少ない経路）。
-    text: 'ハヤク トビ ヒロク トル',
+    text: '速く跳び広く捕る',
     play: { catchRadius: 1 },
     modifier: { run: 0.2 },
   },
@@ -1128,13 +1128,13 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   // ---- コンジョウ：能力値の底上げ ----
   kinniku: {
     id: 'kinniku',
-    name: 'キンニク',
+    name: '筋肉',
     lineage: 'guts',
     rarity: 1,
     target: 'any',
     // HR レーティング +0.15＝打球初速 +0.9m/s、HUDの表示本塁打数 +7本。**表示も一緒に動く**
     // のは、表示が同じレーティングからの導出だから（⑥）＝カードの数字が嘘にならない。
-    text: 'ホンルイダ+7ホン ブンノ チカラ',
+    text: '本塁打+7本分の力',
     modifier: { power: 0.15 },
   },
   tafunesu: {
@@ -1146,127 +1146,127 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // STM は「球威を保てる球数」そのもの（⑥）なので、+0.25 は限界球数 +25球にあたる。
     // リリーフ型（0.3）がこれを得ると 0.55 で先発型の一歩手前まで来る＝`pitcherRole` の
     // 導出まで動くので、「継投で出したリリーフが長い回を投げられるようになる」が起きる。
-    text: 'スタミナ+25キュウ',
+    text: 'スタミナ+25球',
     modifier: { stamina: 0.25 },
   },
   shuchu: {
     id: 'shuchu',
-    name: 'シュウチュウ',
+    name: '集中',
     lineage: 'guts',
     rarity: 1,
     target: 'any',
-    text: 'ダゲキガ ゼンタイテキニ アガル',
+    text: '打撃が全体的に上がる',
     modifier: { average: 0.1, power: 0.1 },
   },
   hashirikomi: {
     id: 'hashirikomi',
-    name: 'ハシリコミ',
+    name: '走り込み',
     lineage: 'guts',
     rarity: 1,
     target: 'any',
     // コンジョウ系統に**走力の底上げ**を1枚。メカ・ドウブツを引かなかった試合でも
     // 足を伸ばす手が残る（系統を3つに絞る以上、どの系統にも一通りの軸を置いておく）。
-    text: 'ハシリコンデ アシガ ツク',
+    text: '走り込んで足がつく',
     modifier: { run: 0.15 },
   },
   suburi: {
     id: 'suburi',
-    name: 'スブリ',
+    name: '素振り',
     lineage: 'guts',
     rarity: 1,
     target: 'any',
     // `シュウチュウ`（AV/HRを均等に）と配分違いの★1＝力寄り。均等・力寄り・
     // 力に全振り（`キンニク`）の3枚で、★1の中に薄いグラデーションを作っている。
-    text: 'フリコンデ チカラガ ツク',
+    text: '振り込んで力がつく',
     modifier: { power: 0.1, average: 0.05 },
   },
   nebari: {
     id: 'nebari',
-    name: 'ネバリ',
+    name: '粘り',
     lineage: 'guts',
     rarity: 2,
     target: 'any',
-    text: 'ツマッテモ マエヘ トブ アシモ+',
+    text: '詰まっても前へ飛ぶ 足も+',
     modifier: { average: 0.2, run: 0.1 },
   },
   kajibanochikara: {
     id: 'kajibanochikara',
-    name: 'カジバノチカラ',
+    name: '火事場の力',
     lineage: 'guts',
     rarity: 2,
     target: 'any',
     // ★2のトレードオフ札。長打力は名鑑の4番級まで跳ね上がるが、芯を外したときに
     // 打球が死ぬ＝**当たれば大きいが当たらない打者**になる。表示（打率・本塁打数）も
     // 同じレーティングからの導出なので、カードの数字がそのまま性格を語る。
-    text: 'チカラ オオハバ+ ダリツ-',
+    text: '力 大幅+ 打率-',
     modifier: { power: 0.35, average: -0.15 },
   },
   tetsuwan: {
     id: 'tetsuwan',
-    name: 'テッワン',
+    name: '鉄腕',
     lineage: 'guts',
     rarity: 2,
     target: 'pitcher',
-    text: 'キュウソクト スタミナガ アガル',
+    text: '球速とスタミナが上がる',
     modifier: { speed: 0.2, stamina: 0.15 },
   },
   dokonjou: {
     id: 'dokonjou',
-    name: 'ドコンジョウ',
+    name: 'ど根性',
     lineage: 'guts',
     rarity: 2,
     target: 'any',
     // 打撃3項目を少しずつ＝**系統の名前どおりの「底上げ」の見本**。尖らないぶん
     // 誰に付けても腐らないので、枠が余っているときの受け皿になる。
-    text: 'スベテ スコシズツ アガル',
+    text: 'すべて少しずつ上がる',
     modifier: { average: 0.15, power: 0.15, run: 0.05 },
   },
   kiai: {
     id: 'kiai',
-    name: 'キアイ',
+    name: '気合',
     lineage: 'guts',
     rarity: 2,
     target: 'any',
     // `カジバノチカラ`（力を大きく上げて打率を下げる）から代償を抜いて幅を縮めた札。
     // **代償のある強い札と、代償の無い程よい札**を同じレアリティに並べておくと、
     // トレードオフを取るかどうかがその場の判断になる。
-    text: 'キアイデ トバス',
+    text: '気合で飛ばす',
     modifier: { power: 0.25, average: 0.05 },
   },
   shinimonogurui: {
     id: 'shinimonogurui',
-    name: 'シニモノグルイ',
+    name: '死に物狂い',
     lineage: 'guts',
     rarity: 2,
     target: 'any',
     // **一時効果**（M-33）。同じ★2の `カジバノチカラ`（力+0.35／打率-0.15 が常時）と
     // **同じ「一発狙い」の軸だが代償の形が違う**：あちらは打率を差し出し、こちらは回数を
     // 差し出す（打率は下がらない）。どちらかが上位互換にならない配分（F-26-7）。
-    text: '1ダセキ チカラガ バクハツ',
+    text: '1打席 力が爆発',
     modifier: { power: 0.5 },
     charges: 2,
     duration: 'atBat',
   },
   fushicho: {
     id: 'fushicho',
-    name: 'フシチョウ',
+    name: '不死鳥',
     lineage: 'guts',
     rarity: 3,
     target: 'pitcher',
     // 限界球数 +50球。先発型（0.85＝110球）に乗せると完投どころか延長まで持つ。
-    text: 'スタミナ+50キュウ',
+    text: 'スタミナ+50球',
     modifier: { stamina: 0.5 },
   },
   daiesu: {
     id: 'daiesu',
-    name: 'ダイエース',
+    name: '大エース',
     lineage: 'guts',
     rarity: 3,
     target: 'pitcher',
     // 投手の4項目をまとめて底上げする★3。`フシチョウ`（スタミナに全振り＝長く投げる）に
     // 対して、こちらは**1試合を支配する**ほう。系統の担当領域（能力値の底上げ）を
     // 投手側でも成立させる1枚。
-    text: 'エースノ カンロク',
+    text: 'エースの貫禄',
     modifier: { speed: 0.25, breakLeft: 0.2, breakRight: 0.2, stamina: 0.15 },
   },
 
@@ -1274,7 +1274,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   battoshoryuken: {
     id: 'battoshoryuken',
     // 「バットショウリュウケン」を8文字に収めた表記（`SKILL_NAME_MAX_LENGTH`）。
-    name: 'バットリュウケン',
+    name: 'バット龍拳',
     lineage: 'violence',
     rarity: DUO_RARITY,
     target: 'any',
@@ -1282,7 +1282,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 揃えた選手への報酬として、**一回転コマンドの最大威力技**を配る。前提の2技も持って
     // いるので、格の上がる順（ジャブ→パンチ→昇龍→タメ→バット）にコンボが繋がる
     // ＝「誰に集めるか」がそのまま乱闘の強さになる（CLAUDE.md ⑧のデュオの狙い）。
-    text: 'イッカイテンノ サイダイヒッサツ',
+    text: '一回転の最大必殺',
     brawl: { hp: 20, powerScale: 1.5, unlockMove: 'batto' },
     requires: ['shoryuken', 'bukimochikomi'],
   },
@@ -1293,11 +1293,11 @@ export const SKILLS: Record<SkillId, SkillDef> = {
    */
   rokettogeta: {
     id: 'rokettogeta',
-    name: 'ロケットゲタ',
+    name: 'ロケット下駄',
     lineage: 'violence',
     rarity: DUO_RARITY,
     target: 'any',
-    text: 'テツゲタガ 4カイ シャテイ8m',
+    text: '鉄下駄が4回 射程8m',
     play: { dropkickRange: 2 },
     chargeBonus: 2,
     requires: ['tetsugeta'],
@@ -1311,31 +1311,31 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // **射程が伸びると警告距離（`ケラレル!`）も一緒に伸びる**：警告は射程からの導出
     // （`dropkickWarnRange`）なので、「回避手段が間に合う」という F-26-4 の不変条件が
     // デュオを取っても保たれる（桜井ノウハウ「人に反応できない動作は理不尽」）。
-    text: 'ドロップキックノ シャテイガ ノビル',
+    text: 'ドロップキックの射程が伸びる',
     play: { dropkickRange: 2.5 },
     requires: ['doroppukikku', 'tekko'],
   },
   homingudan: {
     id: 'homingudan',
-    name: 'ホーミングダン',
+    name: 'ホーミング弾',
     lineage: 'mecha',
     rarity: DUO_RARITY,
     // 前提の2つがどちらも投手専用なので、デュオ自身も投手専用でなければ整合しない
     // （`tests/skills.test.ts` が「前提に投手専用があればデュオも投手専用」を固定する）。
     target: 'pitcher',
-    text: 'ジュウノ タマガ 2ハツ フエル',
+    text: '銃の弾が2発増える',
     play: { gunShots: 2 },
     requires: ['ju', 'haguruma'],
   },
   /** 強化デュオ（F-26-8）。`ヨビジュウ` を温存している投手にだけ出る＝弾が3発になる */
   renshaju: {
     id: 'renshaju',
-    name: 'レンシャジュウ',
+    name: '連射銃',
     lineage: 'mecha',
     // 前提（`ヨビジュウ`）が投手専用なので、デュオ自身も投手専用でなければ整合しない。
     target: 'pitcher',
     rarity: DUO_RARITY,
-    text: 'ヨビジュウガ 3ハツニ フエル',
+    text: '予備銃が3発に増える',
     chargeBonus: 2,
     requires: ['yobiju'],
   },
@@ -1346,7 +1346,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'mecha',
     target: 'any',
     rarity: DUO_RARITY,
-    text: 'ニトロガ 4カイニ フエル',
+    text: 'ニトロが4回に増える',
     chargeBonus: 2,
     requires: ['nitoro'],
   },
@@ -1358,31 +1358,31 @@ export const SKILLS: Record<SkillId, SkillDef> = {
    */
   kaminoyochi: {
     id: 'kaminoyochi',
-    name: 'カミノヨチ',
+    name: '神の予知',
     lineage: 'psychic',
     rarity: DUO_RARITY,
     target: 'any',
-    text: 'ゼッタイヨチガ 4カイニ フエル',
+    text: '絶対予知が4回に増える',
     chargeBonus: 2,
     requires: ['zettaiyochi'],
   },
   kemononoou: {
     id: 'kemononoou',
-    name: 'ケモノノオウ',
+    name: '獣の王',
     lineage: 'animal',
     rarity: DUO_RARITY,
     target: 'any',
-    text: 'ケモノガエリガ 4カイニ フエル',
+    text: '獣返りが4回に増える',
     chargeBonus: 2,
     requires: ['kemonogaeri'],
   },
   fushinochikara: {
     id: 'fushinochikara',
-    name: 'フシノチカラ',
+    name: '不死の力',
     lineage: 'guts',
     rarity: DUO_RARITY,
     target: 'any',
-    text: 'シニモノグルイガ 4カイニ',
+    text: '死に物狂いが4回に',
     chargeBonus: 2,
     requires: ['shinimonogurui'],
   },
@@ -1395,36 +1395,36 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 走力の札2枚（`スケボー`＋`ジェットグツ`）を揃えた選手への報酬。走者速度の上限
     // （8.2m/s）自体は動かないので、これを積んでも「野手の足より遅い」という⑥の
     // 設計不変条件は保たれる（踏み越えるのは `バイク` だけ）。
-    text: 'ソウリョクガ キョクゲンマデ',
+    text: '走力が極限まで',
     modifier: { run: 0.4 },
     requires: ['sukebo', 'jettogutsu'],
   },
   zenchizenno: {
     id: 'zenchizenno',
-    name: 'ゼンチゼンノウ',
+    name: '全知全能',
     lineage: 'psychic',
     rarity: DUO_RARITY,
     target: 'any',
-    text: 'ヨミガ カンゼンニ ナル',
+    text: '読みが完全になる',
     modifier: { average: 0.3, power: 0.1 },
     requires: ['yochi', 'terepashi'],
   },
   mugenhenka: {
     id: 'mugenhenka',
-    name: 'ムゲンヘンカ',
+    name: '無限変化',
     lineage: 'psychic',
     rarity: DUO_RARITY,
     // 前提2つ（`ネンリキ`＋`シネンハ`）がどちらも投手専用なので、デュオ自身も投手専用。
     target: 'pitcher',
     // チョウノウリョクのもう1つのデュオは**投手側**（`ゼンチゼンノウ` は打者側）。
     // 系統に2つ置くときは、**同じ側で2つ作らない**＝どちらの役割で引いても目標がある。
-    text: 'ドチラモ キョクゲンマデ マガル',
+    text: 'どちらも極限まで曲がる',
     modifier: { breakLeft: 0.3, breakRight: 0.3 },
     requires: ['nenriki', 'shinenha'],
   },
   mushin: {
     id: 'mushin',
-    name: 'ムシン',
+    name: '無心',
     lineage: 'psychic',
     // 前提2つ（`シネンセイギョ`＋`ザゼン`）がどちらも投手専用なので、デュオ自身も投手専用。
     target: 'pitcher',
@@ -1434,57 +1434,57 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // （F-26-7の「同じ側で2つ作らない」は役割＝打者側/投手側の話で、W-44は投手側の
     // 別の軸を1本足した形）。**`ザゼン` の球速の代償はそのまま残る**ので、
     // 3枚積んだ投手は「どこへでも投げ切れるが遅い」という極端な形になる。
-    text: 'ネラワズトモ スミヘ トドク',
+    text: '狙わずとも隅へ届く',
     modifier: { control: 0.25 },
     requires: ['shinenseigyo', 'zazen'],
   },
   yaseinokan: {
     id: 'yaseinokan',
-    name: 'ヤセイノカン',
+    name: '野生の勘',
     lineage: 'animal',
     rarity: DUO_RARITY,
     target: 'any',
     // イヌ(+0.6)＋タカ(+1.2)＋これ(+1.5)＝捕球半径 2.6→5.9m。**守備範囲だけが
     // 極端に広い選手**が1人できる＝どこを守らせるかが采配になる（B-10の守備位置の割当が
     // 初めて打球処理に効く場面）。
-    text: 'シュビノ ハンイガ サラニ ヒロガル',
+    text: '守備の範囲がさらに広がる',
     play: { catchRadius: 1.5 },
     requires: ['inu', 'taka'],
   },
   kemonomichi: {
     id: 'kemonomichi',
-    name: 'ケモノミチ',
+    name: '獣道',
     lineage: 'animal',
     rarity: DUO_RARITY,
     target: 'any',
     // ドウブツのもう1つのデュオは**走塁側**（`ヤセイノカン` は守備側）。盗塁のスタートは
     // けん制で許される深さ（`MAX_LEAD`）で頭打ちになるので、**深くしすぎても
     // 「けん制で刺される」側へは踏み込まない**（読み出し側でクランプしてある）。
-    text: 'トウルイノ スタートガ フカイ',
+    text: '盗塁のスタートが深い',
     play: { stealLead: 1.5 },
     modifier: { run: 0.15 },
     requires: ['usagi', 'uma'],
   },
   yakyubaka: {
     id: 'yakyubaka',
-    name: 'ヤキュウバカ',
+    name: '野球バカ',
     lineage: 'guts',
     rarity: DUO_RARITY,
     target: 'any',
-    text: 'ダゲキノウリョクガ スベテ アガル',
+    text: '打撃能力がすべて上がる',
     modifier: { average: 0.2, power: 0.2, run: 0.1 },
     requires: ['kinniku', 'nebari'],
   },
   tetsujin: {
     id: 'tetsujin',
-    name: 'テツジン',
+    name: '鉄人',
     lineage: 'guts',
     rarity: DUO_RARITY,
     // 前提2つ（`タフネス`＋`フシチョウ`）がどちらも投手専用なので、デュオも投手専用。
     target: 'pitcher',
     // コンジョウのもう1つのデュオは**投手側**（`ヤキュウバカ` は打者側）。スタミナは
     // 限界球数そのもの（B-11）なので、揃えた投手は**延長まで球威が落ちない**。
-    text: 'ナゲツヅケテモ オトロエナイ',
+    text: '投げ続けても衰えない',
     modifier: { stamina: 0.3, speed: 0.15 },
     requires: ['tafunesu', 'fushicho'],
   },

@@ -34,12 +34,14 @@ import {
   type TeamRoster,
   chargesLeftOf,
   liveSkillsOf,
+  positionLabel,
   positionOf,
   skillHoldersOf,
 } from '../core/roster';
 import type { VirtualPad } from '../input/keyboard';
 import { applyPanelChrome } from './hud/hud';
 import { createPixelLabel } from './hud/pixelText';
+import { sfx } from '../audio/sfx';
 
 export interface SkillDraftChoice {
   skillId: SkillId;
@@ -71,13 +73,13 @@ const OVERLAY_STYLE = `
   background: rgba(0, 0, 32, 0.93);
 `;
 
-/** 「4バン 1B ヤマダ」＝どの打順・守備位置の誰か（采配メニューの見出しと同じ粒度） */
+/** 「4番 一塁 山田」＝どの打順・守備位置の誰か（采配メニューの見出しと同じ粒度） */
 function describePlayer(roster: TeamRoster, id: PlayerId): string {
   const name = roster.players[id].name;
   const position = positionOf(roster, id);
   const order = roster.lineup.indexOf(id);
-  const slot = order >= 0 ? `${order + 1}バン` : 'ヒカエ';
-  return `${slot}${position ? ` ${position}` : ''} ${name}`;
+  const slot = order >= 0 ? `${order + 1}番` : '控え';
+  return `${slot}${position ? ` ${positionLabel(position)}` : ''} ${name}`;
 }
 
 /**
@@ -99,7 +101,7 @@ function describeSkills(roster: TeamRoster, id: PlayerId): string {
   return `(${owned.length}/${MAX_SKILLS_PER_PLAYER})${names ? ` ${names}` : ''}`;
 }
 
-/** 「★★☆☆ ボウリョク ショウリュウケン」＝レアリティ・系統・名前 */
+/** 「★★☆☆ 暴力 昇龍拳」＝レアリティ・系統・名前 */
 function describeSkill(skillId: SkillId): string {
   const def = skillDef(skillId);
   return `${rarityStars(def.rarity)} ${LINEAGE_NAME[def.lineage]} ${def.name}`;
@@ -157,14 +159,14 @@ export function runSkillDraft(
     const overlay = document.createElement('div');
     overlay.style.cssText = OVERLAY_STYLE;
 
-    const title = createPixelLabel('', { fontSize: 10, scale: 3, color: '#ffe066' });
+    const title = createPixelLabel('', { scale: 2, color: '#ffe066' });
     applyPanelChrome(title.el);
     title.el.style.marginBottom = '10px';
 
-    const list = createPixelLabel('', { fontSize: 9, scale: 3, color: '#f8f8f8' });
+    const list = createPixelLabel('', { scale: 1, color: '#f8f8f8' });
     applyPanelChrome(list.el);
 
-    const hint = createPixelLabel('', { fontSize: 7, scale: 2, color: '#cccccc' });
+    const hint = createPixelLabel('', { scale: 1, color: '#cccccc' });
     Object.assign(hint.el.style, {
       marginTop: '10px',
       background: 'transparent',
@@ -177,12 +179,12 @@ export function runSkillDraft(
 
     function render(): void {
       if (stage === 'skill') {
-        // 「コンカイ: メカ ドウブツ コンジョウ」＝この試合に出る系統（F-26-5）。
+        // 「今回: メカ 動物 根性」＝この試合に出る系統（F-26-5）。
         // 系統名は `ALL_LINEAGES` の順に揃えて渡ってくるので、抽選のたびに並びが変わらない。
         const active = lineages?.length
-          ? `\nコンカイ: ${lineages.map((l) => LINEAGE_NAME[l]).join(' ')}`
+          ? `\n今回: ${lineages.map((l) => LINEAGE_NAME[l]).join(' ')}`
           : '';
-        title.setText(`スキル ハッケン: ${teamName}${active}`);
+        title.setText(`スキル発見: ${teamName}${active}`);
         const body = draft.options
           .map((id, i) => {
             const cursor = i === skillCursor ? '▶ ' : '　 ';
@@ -197,14 +199,14 @@ export function runSkillDraft(
         // D-19の `ゼッコーチョー!` の行・L-32のリードの行と同じ扱い）。
         hint.setText(
           rerollsLeft > 0
-            ? `W/S:センタク K:ケッテイ　J:ヒキナオス(ノコリ${rerollsLeft})`
-            : 'W/S:センタク K:ケッテイ',
+            ? `W/S:選択 K:決定　J:引き直す（残り${rerollsLeft}）`
+            : 'W/S:選択 K:決定',
         );
         return;
       }
 
       const def = skillDef(chosenSkill);
-      title.setText(`ダレニ ツケル?: ${def.name}`);
+      title.setText(`誰に付ける？: ${def.name}`);
       // カーソルが必ず窓の中に入るように、先頭位置をカーソルから決める（候補が
       // VISIBLE_CANDIDATES 以下なら常に0＝従来どおり全部出る）
       const start = Math.max(
@@ -219,10 +221,10 @@ export function runSkillDraft(
             `${start + i === playerCursor ? '▶ ' : '　 '}${describePlayer(roster, id)} ${describeSkills(roster, id)}`,
         );
       // 窓の外にまだ候補があることを示す（無いと「これで全員」と読めてしまう）
-      if (start > 0) rows.unshift(`　 ▲ ホカ${start}ニン`);
-      if (end < candidates.length) rows.push(`　 ▼ ホカ${candidates.length - end}ニン`);
+      if (start > 0) rows.unshift(`　 ▲ ほか${start}人`);
+      if (end < candidates.length) rows.push(`　 ▼ ほか${candidates.length - end}人`);
       list.setText(`${def.text}\n\n${rows.join('\n')}`);
-      hint.setText('W/S:センタク K:ケッテイ J:モドル');
+      hint.setText('W/S:選択 K:決定 J:戻る');
     }
 
     function enterPlayerStage(): void {
@@ -254,9 +256,16 @@ export function runSkillDraft(
       render();
     }
 
-    const offUp = pad.onPress('up', () => move(-1));
-    const offDown = pad.onPress('down', () => move(1));
+    const offUp = pad.onPress('up', () => {
+      sfx.menuMove();
+      move(-1);
+    });
+    const offDown = pad.onPress('down', () => {
+      sfx.menuMove();
+      move(1);
+    });
     const offA = pad.onPress('a', () => {
+      sfx.menuConfirm();
       if (stage === 'skill') {
         enterPlayerStage();
         return;
@@ -271,6 +280,7 @@ export function runSkillDraft(
         const rolled = opts.reroll?.();
         // 引き直せなかった（回数券が尽きた等）ら何も起きない＝回数券は減らない
         if (!rolled) return;
+        sfx.skillActivate();
         draft = rolled.draft;
         rerollsLeft = rolled.left;
         // カーソルは先頭へ戻す（並びが総取り替えになるので、前の位置には意味が無い）
@@ -278,6 +288,7 @@ export function runSkillDraft(
         render();
         return;
       }
+      sfx.menuCancel();
       stage = 'skill';
       render();
     });

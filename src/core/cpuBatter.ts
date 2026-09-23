@@ -10,48 +10,157 @@
  *   コースを線形外挿して着弾点を予測するので、投手側がその後もカーブを続けている場合は
  *   予測が外れて差し込まれる／泳ぐことがある（＝曲げ球がCPU打者も欺けるという、
  *   人間の打者と同じ駆け引きが自然に成立する。意図した挙動）。
- * - 判断内容：バットが届く範囲外なら見送り。2ストライク以降は際どい球にも手を出して
- *   粘る（ファウルで凌ぐ＝三振回避を優先）。それ以外は「甘い球」（ストライクゾーンに
- *   わずかな余裕を持たせた範囲）だけを振る選球眼を持たせる。
+ * - 判断内容：バットが届く範囲外なら見送り。**「甘い球」だけを振る**（ストライクゾーンの
+ *   隅の1つ内側）。**2ストライク以降は隅の1つ外まで広げて粘る**（ファウルで凌ぐ＝
+ *   三振回避を優先）が、そこから更に外れた球は見送る。
  * - エッジ検出（crossesSwingDecisionPoint）は、既存の contactPlaneCrossing 等と同じ
  *   「前後2フレームの状態から境界越えを検出する」作法に揃えた。
+ *
+ * ## フェーズSS-67：打席の駆け引きを成立させた
+ *
+ * QQ-65 が計測で見つけた構造（`ORIGINAL_PARITY.md`）＝**CPU打者は三振も四球もしない**
+ * （1打席1.51球で必ず打球になる／見送りは0.00球）と、**フォークが人間の投手の支配戦略**
+ * （ど真ん中のフォークが88.2%アウト）を、**新しい定数を1つも増やさずに**埋めた：
+ *
+ * 1. **罰を緩急の両側へ**（`cpuSwingLead`）＝遅い球には泳ぐ。速球・基準速は完全に不変。
+ * 2. **追い込まれたら窓の縁まで泳ぐ**（同上の `twoStrikes`）＝決め球に空振りが生まれる。
+ * 3. **振る幅を実際に「甘い球」へ**（`SELECTIVE_HALF_WIDTH` / `TWO_STRIKE_HALF_WIDTH`）
+ *    ＝見送りと四球が生まれ、T-41の制球（どれだけ外れるか）に初めて帰結が付く。
+ *
+ * 実測（`npm run balance:plate`）：三振 0%→**6.3%** / 四球 0%→**6.3%** /
+ * 1打席 1.51→**2.20球** / 死球 0% / **40球で終わらない打席 5件→0件**。
+ * **判定（`judgeSwing`）には1行も触っていない**ので `npm run balance` は完全に不変で、
+ * 人間の打者の手応え（到達範囲・有効窓）も1mmも動いていない。
  */
-import { CONTACT_PLANE_Z, SWING_IDEAL_SEC, batReachFor } from './batting';
+import { CONTACT_PLANE_Z, SWING_ACTIVE_SEC, SWING_IDEAL_SEC, batReachFor } from './batting';
 import type { BatterSide, PitchFlight } from './pitch';
 import {
   RIGHT_BATTER_SIDE,
-  SPEED_FAST,
+  SPEED_FAST_DELTA,
   SPEED_NEUTRAL,
+  SPEED_SLOW_DELTA,
   STRIKE_ZONE_HALF_WIDTH,
   batterFrameX,
   clampStance,
 } from './pitch';
+import { CORNER_MARGIN as CPU_CORNER_MARGIN } from './cpuPitcher';
 import type { Bases, Count } from './rules';
 
 /**
- * 速球に対してCPUがどれだけ早振り（＝タイミングを外して引っ掛け気味）になるか。
- * 実機テストプレイで「守備のときCPUが速球を100%ホームランにする」ことが判明した対策。
- * 旧実装はCPUが球速によらず常にジャストミート（timing=0）で捉えたため、初速が最大に
- * なる速球が確実にフェンスを越えていた。現実同様「速い球ほどタイミングが取りづらい」
- * よう、基準速→速球にかけてスイング判断のリード（＝押すタイミング）を早める。
+ * 基準速から離れた球に対してCPUがどれだけ早振り（＝タイミングを外して引っ掛け気味）に
+ * なるか。実機テストプレイで「守備のときCPUが速球を100%ホームランにする」ことが判明した
+ * 対策として入った値。旧実装はCPUが球速によらず常にジャストミート（timing=0）で捉えたため、
+ * 初速が最大になる速球が確実にフェンスを越えていた。現実同様「基準からずれた球ほど
+ * タイミングが取りづらい」よう、スイング判断のリード（＝押すタイミング）を早める。
  * スイングが早まるとジャストミートより terminal 側で捉える＝引っ張り・詰まりで初速が
  * 落ち、痛烈な当たりでも深いフライ／ゴロ止まりになりHRが激減する（ミートは残るので
- * CPUの攻撃自体は成立し続ける）。0.045秒でスイング経過が理想＋約0.045秒＝有効窓
- * （0.14秒）の中に収まるため空振りにはならず、確実に「弱い当たり」になる。
+ * CPUの攻撃自体は成立し続ける）。スイング経過が理想＋この罰＝有効窓（`SWING_ACTIVE_SEC`）の
+ * 中に収まるため、単独では空振りにならず「弱い当たり」になる。
+ *
+ * **フェーズSS-67で名前を `FAST` から外した**（値は 0.045 のまま＝**新しい定数はゼロ**）：
+ * `cpuSwingLead` が緩急の**両側**を見るようになったので、速球専用の値ではなくなった。
+ *
+ * ## フェーズTT-68：値を有効窓からの導出にした（0.045 → `SWING_ACTIVE_SEC / 3` ＝0.0467）
+ *
+ * SS-67 が残した宿題（**三振・四球が実際の野球の帯に届いていない**）を埋める2つのてこの
+ * うちの打者側。**新しい定数は増えず、むしろマジックナンバーが1つ消えた**＝
+ * 2ストライクの罰（`SWING_ACTIVE_SEC / 2`＝窓の縁まで泳ぐ）と**同じ刻みの梯子**になる：
+ *
+ * | 場面 | 罰 | 意味 |
+ * |---|---|---|
+ * | 通常 | `SWING_ACTIVE_SEC / 3` | 窓の1/3ぶん早振り＝弱い当たり（空振りにはならない） |
+ * | 2ストライク | `SWING_ACTIVE_SEC / 2` | 窓の縁まで泳ぐ＝決め球に空振りが生まれる（SS-67） |
+ *
+ * **SS-67 が「一律に上げる案」を否定したときの計測は、`foulsInAtBat`（ファウルで隅を
+ * 散らす規則）を入れる前のものだった**（＝1打席17球・ファウルの無限打席25%）。
+ * `npm run balance:plate` の13段目で測り直すと、**無限ファウルは起きない**（最長6球）。
+ *
+ * 値は同13段目が決めた（CLAUDE.md「バランス調整の方針」）＝**帯は 0.0455〜0.0472 で、
+ * `SWING_ACTIVE_SEC / 3`（0.0467）はそのほぼ中央**。上限の外（0.0475以上）では
+ * **CPU打線の本塁打が 0.00本/試合になる**（弱い当たりしか出なくなる）。
+ * さらに上（0.050）では**人間がど真ん中へ投げたフォークが100%ファウル**になり、
+ * SS-67 が消したばかりの「人間の投手側の支配戦略」が別の形で戻る＝**採用値では
+ * 3段目（人間の3択）は SS-67 と完全に同じ**（フォーク 32.6%アウト/67.4%安打）。
  */
-const CPU_FAST_TIMING_PENALTY_SEC = 0.045;
+export const CPU_TIMING_PENALTY_SEC = SWING_ACTIVE_SEC / 3;
 
-/** 球速に応じたスイング判断リード（速球ほど早振りになりタイミングを外す） */
-export function cpuSwingLead(pitchSpeed: number): number {
-  const fastness = Math.min(
-    1,
-    Math.max(0, (pitchSpeed - SPEED_NEUTRAL) / (SPEED_FAST - SPEED_NEUTRAL)),
-  );
-  return SWING_IDEAL_SEC + CPU_FAST_TIMING_PENALTY_SEC * fastness;
+/**
+ * 球速に応じたスイング判断リード（**基準速から離れた球ほど早振りになりタイミングを外す**）。
+ *
+ * ## フェーズSS-67：罰を緩急の両側へ広げた
+ *
+ * それまで罰は**速球側にしか無かった**（`fastness`）ので、**緩い球はCPU打者に必ず芯で
+ * 捉えられていた**（実測：フォークの |timing| は平均 0.117・芯率 87.5%）。打球初速に
+ * `0.5 × 球速` が入るぶん当たっても弱いのでほとんどアウトになり、結果として
+ * **フォークを投げ続けるのが人間の投手の支配戦略**になっていた（`npm run balance:plate`
+ * の3段目で「ど真ん中のフォーク＝88.2%アウト」。QQ-65 が
+ * `ORIGINAL_PARITY.md` に「別セッションの規模」として書き残した穴）。
+ *
+ * 実際の野球で緩急が効くのは**両側**（速い球には差し込まれ、遅い球には泳ぐ）なので、
+ * `fastness` を「基準速からの隔たり」（`offness`）に一般化した。**新しい定数は1つも
+ * 増えていない**（W-44 が `FATIGUE_CONTROL_LOSS` を `FATIGUE_SPEED_DROP` に、
+ * CC-50 が腕のずれを O-36 の可動幅に揃えたのと同じ「既にある値に揃える」やり方）。
+ *
+ * **基準線は動かない**（B-8以来の約束）：
+ * - **基準速（`SPEED_NEUTRAL`）は offness 0＝ジャストミートのまま**
+ * - **速球（`SPEED_FAST`）は offness 1＝従来とまったく同じ 0.045**
+ * ＝I-29・JJ-57・QQ-65・RR-66 が測った打たれ方の骨格（速球のHR・ファウルの帯）は
+ * 1mmも動かない（`tests/balance.test.ts` の速球HRの回帰帯がそのまま通る）。
+ * 動くのは**基準速より遅い球だけ**。
+ *
+ * 幅は上下で違う（`SPEED_FAST_DELTA`=6 / `SPEED_SLOW_DELTA`=14）ので、
+ * **どちらの端でも「緩急を目いっぱい使った球」がちょうど罰の最大**になる
+ * （＝緩急の幅そのものが投手によらず一定という `speedForPitchSelection` の約束と揃う）。
+ */
+export function cpuSwingLead(
+  pitchSpeed: number,
+  twoStrikes = false,
+  normalPenalty: number = CPU_TIMING_PENALTY_SEC,
+): number {
+  const offness =
+    pitchSpeed >= SPEED_NEUTRAL
+      ? (pitchSpeed - SPEED_NEUTRAL) / SPEED_FAST_DELTA
+      : (SPEED_NEUTRAL - pitchSpeed) / SPEED_SLOW_DELTA;
+  const penalty = twoStrikes ? SWING_ACTIVE_SEC / 2 : normalPenalty;
+  return SWING_IDEAL_SEC + penalty * Math.min(1, Math.max(0, offness));
 }
 
-/** 際どい球にも手を出す「甘い球」判定の許容幅（ストライクゾーンよりわずかに広い） */
-const SELECTIVE_HALF_WIDTH = STRIKE_ZONE_HALF_WIDTH + 0.15;
+/**
+ * 手を出す幅（＝これより外は見送る）＝**「甘い球」の定義そのもの**。
+ * **ストライクゾーンの隅の1つ内側**（`ゾーン半幅 - 投手が狙う隅の余裕`）。
+ *
+ * **フェーズSS-67で 0.15 → `-CPU_CORNER_MARGIN`**（0.60 → **0.40**）。
+ * このファイルの冒頭コメントは元から「**『甘い球』だけを振る選球眼**」と書いていたが、
+ * **実際の 0.60 は名鑑96人が投げる球をすべて含んでいた**（実測：通常の球は最大 0.382、
+ * 決め球でも最大 0.634）＝**CPU打者は1球も見送らず**（実測 見送り 0.00球/打席）、
+ * **四球も見逃し三振も構造的に起こりえなかった**。
+ *
+ * **新しい数値は持ち込まず、`CPU_CORNER_MARGIN`（＝CPU投手が狙う隅の余裕）1刻みで
+ * 表した**（W-44 が `COURSE_VX_PER_CONTROL` を「既にある隅に合わせる」で決めたのと
+ * 同じやり方）。意味はひと言で言える＝**「投手が狙う隅より内側だけを振る」**。
+ *
+ * 値は `npm run balance:plate` が決めた（CLAUDE.md「バランス調整の方針」）：
+ * ここを 0.40 にすると **三振6.3% / 四球6.3% / 死球0%** と3つが同時に成立する。
+ * 1つ広い 0.45（ゾーンいっぱい）では**三振が0%に戻り**、1つ狭い 0.3375 では
+ * **死球が2.8%に増える**（見送りが増えて内角の荒れ球が本塁まで届くため）。
+ */
+export const SELECTIVE_HALF_WIDTH = STRIKE_ZONE_HALF_WIDTH - CPU_CORNER_MARGIN;
+
+/**
+ * 2ストライク以降に手を出す幅（＝**追い込まれたら隅まで手を出す**）。
+ * **ストライクゾーンの隅の1つ外側**＝`SELECTIVE_HALF_WIDTH` とゾーンを挟んで対称。
+ *
+ * それまでは `count.strikes >= 2` なら **バットが届く球すべてに手を出す**（＝幅は無限大）
+ * だった。「ファウルで凌ぐ＝三振回避を優先」という意図は正しいが、**CPU投手の決め球は
+ * 81.3%がボール**（実測）なので、**どんなに外れた球でも必ず追いかける**＝
+ * **四球も見逃し三振も構造的に起こりえなかった**（T-41が作った「制球の値打ち＝
+ * 見逃し三振」も、CPU打者に対しては一度も成立していなかった）。
+ *
+ * フェーズSS-67では**「粘る」という意図はそのまま**に、**広がる幅を有限にした**：
+ * 追い込まれたら隅まで手を出すが、そこから更に外れた球は見送る。
+ * **刻みは `CPU_CORNER_MARGIN` 1つぶん**なので、ここでも新しい数値は持ち込んでいない。
+ */
+export const TWO_STRIKE_HALF_WIDTH = STRIKE_ZONE_HALF_WIDTH + CPU_CORNER_MARGIN;
 
 /** 打撃面（CONTACT_PLANE_Z）通過までの残り時間。既に通過済み/球速0以下なら Infinity */
 export function timeToContactPlane(flight: PitchFlight): number {
@@ -69,9 +178,17 @@ export function predictCrossX(flight: PitchFlight): number {
  * このステップでスイング判断フレーム（残り時間がしきい値を下回った最初の瞬間）を
  * 通過したか。prev/next は onFlightStep で渡される前後1ステップ分の飛行状態。
  * しきい値は球速に応じて変わる（速球ほど早振りになる。cpuSwingLead 参照）。
+ *
+ * `normalPenalty` は**計測が定数を書き換えずに罰を振るための引数**（`swingWidths` と
+ * 同じ作法。フェーズTT-68）。渡さなければ採用値＝ゲーム本体はこの経路しか通らない。
  */
-export function crossesSwingDecisionPoint(prev: PitchFlight, next: PitchFlight): boolean {
-  const lead = cpuSwingLead(prev.vz);
+export function crossesSwingDecisionPoint(
+  prev: PitchFlight,
+  next: PitchFlight,
+  count: Count = { balls: 0, strikes: 0 },
+  normalPenalty: number = CPU_TIMING_PENALTY_SEC,
+): boolean {
+  const lead = cpuSwingLead(prev.vz, count.strikes >= 2, normalPenalty);
   return timeToContactPlane(prev) > lead && timeToContactPlane(next) <= lead;
 }
 
@@ -88,19 +205,26 @@ export function crossesSwingDecisionPoint(prev: PitchFlight, next: PitchFlight):
  * （`judgeSwing` と同じ `batReachFor` から取るので、「振ると判断したのに届かない」
  * ／「届くのに見送る」がずれない）。選球眼は本塁基準のままで動かさない＝
  * **立ち位置は選球を変える手ではなく、打ちに行くコースを選ぶ手**。
+ *
+ * widths は**計測が定数を書き換えずに幅を振るための引数**（`cpuControlSpray(control, curve)`
+ * と同じ作法）。渡さなければ採用値＝ゲーム本体はこの経路しか通らない。
  */
 export function shouldCpuSwing(
   flight: PitchFlight,
   count: Count,
   side: BatterSide = RIGHT_BATTER_SIDE,
   stance = 0,
+  widths: { normal?: number; twoStrike?: number } = {},
 ): boolean {
   const predictedX = predictCrossX(flight);
   const localX = batterFrameX(predictedX, side);
   const reach = batReachFor(stance);
   if (localX < reach.outside || localX > reach.inside) return false;
-  if (count.strikes >= 2) return true;
-  return Math.abs(predictedX) <= SELECTIVE_HALF_WIDTH;
+  const width =
+    count.strikes >= 2
+      ? widths.twoStrike ?? TWO_STRIKE_HALF_WIDTH
+      : widths.normal ?? SELECTIVE_HALF_WIDTH;
+  return Math.abs(predictedX) <= width;
 }
 
 // ---- 打席内の立ち位置（フェーズO-36。説明書p14） ----
@@ -252,28 +376,18 @@ export function chooseCpuPinchHitter(opts: {
 // したがって規則は**買うもの（足）と売るもの（打力）の両方**を見る。
 
 /**
- * CPUが代走を出すときに**差し出してよい打力**（AV＋HRの合計の差）。
+ * 代走で**差し出してよい打力の上限**（AV＋HR の合計の差）。
  *
- * `npm run balance:pinchrun` の12段目が決めた＝**どのイニングで出しても100%損しない
- * 唯一の候補**（0.20 まで緩めると「残り9イニング＝1回に出す」場合の96.6%までしか
- * 保てない＝1回に出すと損をする組が出る）。**おかげでイニングの条件が要らない**
- * ＝X-45が代打で「イニングのしきい値は置かない」と決めたのと同じ形に収まった
- * （そこも計測が決めている）。
+ * 代走は「走力を買って打力を売る」手なので、**差し出しすぎると残りの試合でその打順が
+ * 損をする**（代走で入った選手はその打順を引き継いで以後ずっと打つ）。値は
+ * `npm run balance:pinchrun` が「**どのイニングで出しても損しない**」で決めた。
  *
- * 16球団すべてで2〜5組成立するので**規則は死んでいない**（`CPU_PINCH_HIT_GAP` を
- * 「11球団で成立する」ことで決めたのと同じ見方）。
- *
- * **符号が代打と逆**なのが要点：代打は「控えがこれだけ強ければ出す」、代走は
- * 「控えがこれ以上弱くなければ出す」。
- *
- * **フェーズJJ-57で測り直した**（空気抵抗が入って長打が減り、**盗塁1つの値打ちが
- * +0.112点 → +0.069点**に下がった）：0.10 の保証は「**残り3イニングなら100%**／
- * 残り9イニングでは98.0%」に弱まった（12段目）。**値は据え置いた**＝100%を取り戻すには
- * 0（＝打力を1ミリも落とさない）しかなく、そこまで絞ると成立する組が 51→35 に減り、
- * 「しきい値＝差し出してよい上限」という規則の形そのものが表せなくなる。
- * **終盤に出すぶんには従来どおり損しない**ので、代走が実際に効く場面の保証は保たれている。
+ * **フェーズRR-66で 0.10→0.03**：打撃モデルを作り直した（抗力＋初速の基準＋長打力の幅）
+ * ぶん**長打が減り、盗塁1つの利得が 0.112点→0.019点まで下がった**＝差し出せる打力も
+ * そのぶん小さくなった。**規則の形は動いていない**（名鑑16球団すべてに「出す値打ちの
+ * ある組み合わせ」が残っていることはテストが固定している）。
  */
-export const CPU_PINCH_RUN_BAT_LOSS = 0.1;
+export const CPU_PINCH_RUN_BAT_LOSS = 0.03;
 
 /** 代走の候補（控え1人ぶん）。`index` は `roster.bench` の添字をそのまま渡す */
 export interface CpuPinchRunCandidate {

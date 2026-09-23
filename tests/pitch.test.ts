@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   type PitchFlight,
+  ARM_RELEASE_LEAN_RAD,
   ARM_RELEASE_REACH,
   ARM_SLOT_RAD,
   BATTER_STANCE_RANGE,
@@ -15,6 +16,7 @@ import {
   RIGHT_ARM_SIDE,
   RIGHT_BATTER_SIDE,
   NEUTRAL_RATING,
+  RELEASE_HEIGHT,
   RELEASE_Z,
   RUBBER_HALF_RANGE,
   SPD_SPAN,
@@ -23,6 +25,8 @@ import {
   SPEED_NEUTRAL,
   SPEED_SLOW,
   STRIKE_ZONE_HALF_WIDTH,
+  armReleaseHandOffsetX,
+  armReleaseHeight,
   armReleaseOffsetX,
   clampReleaseX,
   clampRubberX,
@@ -241,8 +245,11 @@ describe('投球の統合挙動（リリース→プレート通過）', () => {
 
   it('操作次第で打者に当てられる（死球ゾーンに到達できる）', () => {
     // 曲げ続けると打者の背後に抜けるので、途中で戻すスキル操作を模す。
-    // 既定の右打者は三塁側（-X）に立つので、曲げるのも -X 側（BB-49）
-    const { crossX } = flyToPlate(createPitchFlight(-0.4), (t) => (t < 0.2 ? -1 : 0));
+    // 既定の右打者は三塁側（-X）に立つので、曲げるのも -X 側（BB-49）。
+    // **フェーズRR-66で 0.2→0.12秒**：バットが届く範囲に合わせて打者が本塁へ寄った
+    // （死球ゾーンが 0.9〜1.7 → 0.65〜1.45 へ動いた）ので、0.2秒も曲げると
+    // **打者の背後へ抜ける**（-1.54）。
+    const { crossX } = flyToPlate(createPitchFlight(-0.4), (t) => (t < 0.12 ? -1 : 0));
     expect(judgePitch(crossX)).toBe('hitByPitch');
   });
 
@@ -470,5 +477,92 @@ describe('投球腕（ARM。フェーズCC-50。説明書p26-29）', () => {
     const right = armReleaseOffsetX({ side: RIGHT_ARM_SIDE, ...over });
     expect(Math.sign(right)).toBe(Math.sign(batterStandX(RIGHT_BATTER_SIDE)));
     expect(Math.sign(right)).not.toBe(Math.sign(batterStandX(LEFT_BATTER_SIDE)));
+  });
+});
+
+/**
+ * リリースの高さ（フェーズMM-60）。CC-50 がスコープ外として残した1つで、
+ * **高低はゾーン判定に含めない**（説明書p19準拠）＝ここは全部「見た目だけ」の値。
+ * 帯は `npm run balance:release` が測ったもの（CLAUDE.md「バランス調整の方針」）。
+ */
+describe('リリースの高さ（フェーズMM-60。投げ方で低くなる）', () => {
+  const SLOTS = ['over', 'under', 'side'] as const;
+  const heightOf = (slot: (typeof SLOTS)[number], side = RIGHT_ARM_SIDE) =>
+    armReleaseHeight({ side, slot });
+
+  /**
+   * 基準線を動かさない（B-8の「基準値0.5＝従来の定数」、S-40の「基準速はちょうど従来の78m」、
+   * CC-50の「渡さない呼び出しは従来と同じ」と同じ整理）。名鑑96人のうち85人が上手なので、
+   * **大多数の投手の見え方はMM-60の前と1ドットも変わらない**。
+   */
+  it('上手は従来の 1.5m ちょうど（渡さない呼び出しも同じ）', () => {
+    expect(heightOf('over')).toBe(RELEASE_HEIGHT);
+    expect(heightOf('over', LEFT_ARM_SIDE)).toBe(RELEASE_HEIGHT);
+    expect(armReleaseHeight()).toBe(RELEASE_HEIGHT);
+    expect(ARM_RELEASE_LEAN_RAD.over).toBe(0);
+  });
+
+  it('上手 ＞ 横手 ＞ 下手 の順に低い（実際の野球の見え方）', () => {
+    expect(heightOf('over')).toBeGreaterThan(heightOf('side'));
+    expect(heightOf('side')).toBeGreaterThan(heightOf('under'));
+  });
+
+  /**
+   * (a) 帯の下側。**隣り合う投げ方どうしが画面で見分けられる**こと＝でっかいモードの
+   * いちばん低い解像度（540p）で 5px 以上（`balance:release` の4段目）。
+   * ここを割ると「3つ目の投げ方が無いのと同じ」になる。
+   */
+  it('隣り合う投げ方は 0.20m 以上離れる（画面で見分けが付く）', () => {
+    expect(heightOf('over') - heightOf('side')).toBeGreaterThanOrEqual(0.2);
+    expect(heightOf('side') - heightOf('under')).toBeGreaterThanOrEqual(0.2);
+  });
+
+  /**
+   * (b) 帯の上側その1。手が腰（リリースの瞬間 0.87m）より下がると、脚の外側を通るはずの
+   * 腕が体の中へ入る（剛体パーツなのでめり込みがそのまま見える）。
+   */
+  it('どの投げ方でも手は腰より上（腕が軸足を突き抜けない）', () => {
+    for (const slot of SLOTS) expect(heightOf(slot)).toBeGreaterThan(0.87);
+  });
+
+  /**
+   * (b) 帯の上側その2。**捕手のミット（1.0m）より高い位置から出る**＝球は必ず沈む。
+   * 割ると下手投げだけ球が上っていき、放り上げに見える（`balance:release` の6段目）。
+   */
+  it('どの投げ方でもミット（1.0m）より高い位置から出る（球は上らない）', () => {
+    for (const slot of SLOTS) expect(heightOf(slot)).toBeGreaterThan(1.0);
+  });
+
+  it('左右は完全な鏡像（高さは腕の側によらない）', () => {
+    for (const slot of SLOTS) {
+      expect(heightOf(slot, RIGHT_ARM_SIDE)).toBeCloseTo(heightOf(slot, LEFT_ARM_SIDE), 10);
+    }
+  });
+
+  /**
+   * **見た目の手の位置は実寸、判定に持ち込むずれは縮めたもの**（CC-50）。高さの落差は
+   * 「体の中心から手までの横の距離」に比例するので、縮める前の実寸を使う必要がある。
+   */
+  it('見た目の手の横位置は判定用のずれより外（実寸 vs 縮めたもの）', () => {
+    for (const slot of SLOTS) {
+      const hand = Math.abs(armReleaseHandOffsetX({ side: RIGHT_ARM_SIDE, slot }));
+      const judged = Math.abs(armReleaseOffsetX({ side: RIGHT_ARM_SIDE, slot }));
+      expect(hand).toBeGreaterThan(judged);
+      expect(Math.sign(armReleaseHandOffsetX({ side: RIGHT_ARM_SIDE, slot }))).toBe(
+        Math.sign(armReleaseOffsetX({ side: RIGHT_ARM_SIDE, slot })),
+      );
+    }
+  });
+
+  /**
+   * **判定は1つも動かない**（この投球は高低をゾーン判定に含めない＝`PitchFlight` は
+   * x と z しか持たない）。CC-50 の横のずれに触れていないことをここで固定する。
+   */
+  it('リリースの横のずれ（CC-50）は高さを入れても変わらない', () => {
+    expect(armReleaseOffsetX({ side: RIGHT_ARM_SIDE, slot: 'side' })).toBeCloseTo(
+      RIGHT_ARM_SIDE * ARM_RELEASE_REACH * Math.sin(ARM_SLOT_RAD.side),
+      10,
+    );
+    expect(createPitchFlight(0.3, 40)).not.toHaveProperty('y');
   });
 });

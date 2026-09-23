@@ -269,8 +269,16 @@ describe('CPUの代走（GG-54。chooseCpuPinchRunner）', () => {
   });
 
   it('しきい値ちょうどまでは許す（境界は「差し出してよい上限」）', () => {
+    // **ぴったりの差は浮動小数の丸めで揺れる**（0.5 − 0.03 の引き算は 0.03 より
+    // わずかに大きい差を作る）ので、しきい値の**すぐ内側**で見る。守りたいのは
+    // 「上限まで差し出してよい」という向きで、最後の1e-9をどちらに倒すかではない。
     const bench: CpuPinchRunCandidate[] = [
-      { index: 0, average: 0.5 - CPU_PINCH_RUN_BAT_LOSS, power: 0.5, stealSlack: FAST },
+      {
+        index: 0,
+        average: 0.5 - CPU_PINCH_RUN_BAT_LOSS + 1e-9,
+        power: 0.5,
+        stealSlack: FAST,
+      },
     ];
     expect(
       chooseCpuPinchRunner({ runner: SLOW_RUNNER, bench, stealSlackLimit: LIMIT }),
@@ -308,7 +316,7 @@ describe('代走：采配メニューの1枚目の行（describePinchRunTarget�
   it('塁の番号・走者の名前・走力のバーが出る（押す前に代える値打ちが読める）', () => {
     const runnerId = roster.lineup[0];
     const line = describePinchRunTarget(roster, { base: 'first', runnerId });
-    expect(line).toContain('ダイソウ 1ルイ');
+    expect(line).toContain('代走 1塁');
     expect(line).toContain(roster.players[runnerId].name);
     expect(line).toContain(ratingBar(TEAM.lineup[0][5]));
   });
@@ -317,7 +325,7 @@ describe('代走：采配メニューの1枚目の行（describePinchRunTarget�
     const bases = ['first', 'second', 'third'] as const;
     for (const [i, base] of bases.entries()) {
       const line = describePinchRunTarget(roster, { base, runnerId: roster.lineup[i] });
-      expect(line).toContain(`ダイソウ ${i + 1}ルイ`);
+      expect(line).toContain(`代走 ${i + 1}塁`);
     }
   });
 });

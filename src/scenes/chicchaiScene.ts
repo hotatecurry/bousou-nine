@@ -145,8 +145,11 @@ import {
   occupancy,
 } from '../core/rules';
 import {
+  BALL_RADIUS as BALL_REAL_RADIUS,
+  CHICCHAI_BALL_SCALE,
   CHICCHAI_DEFAULT_FOCUS,
   CHICCHAI_FOV_DEG,
+  CHICCHAI_PLAYER_SCALE,
   CHICCHAI_TILT_DEG,
   CHICCHAI_VIEW_HALF_WIDTH,
   cameraDistance,
@@ -160,11 +163,13 @@ import { PLAY_RESULT_PAUSE_SEC } from '../core/tempo';
 import { type PitchArm, NEUTRAL_PITCH_ARM } from '../core/pitch';
 import {
   attachBike,
+  attachGlove,
   createPlayer,
   movePlayerTo,
   setPlayerColor,
   setPlayerFacing,
   setPlayerPose,
+  setPlayerScale,
 } from '../entities/player';
 import { createProp } from '../entities/props';
 import type { VirtualPad } from '../input/keyboard';
@@ -227,8 +232,23 @@ export function createChicchaiCamera(aspect: number): ChicchaiCameraRig {
 
 // ---- 野手・走者のメッシュ ----
 
+/**
+ * 野手の色。**全員がこの1色**（フェーズUU-69）。
+ *
+ * セッション4（2026-07-20）には**「責任野手」を黄色で塗る目印**（`CONTROLLED_COLOR`）が
+ * あり、根拠は「**鳥瞰は9人が同時に映るので操作対象を見失いやすい**」だった。
+ * だが守備の操作は説明書p20準拠の**一斉移動**（十字キーで全員が同じ方向へ動く）なので、
+ * **「操作対象」という単独の野手はそもそも存在しない**＝前提のほうが成り立っていなかった。
+ *
+ * 運んでいた情報も**すべてボール側が既に運んでいる**：飛行中は**ボールの影**が地面の位置を
+ * 出し続け、確保後は**ボールが持ち主の上にある**（送球はその持ち主から出る）。
+ * テストプレイの指摘「**ボールを取ったら黄色くなるのが謎**」はそのとおりで、
+ * **塗るほど「ユニフォームの色が試合中に変わる」というノイズにしかならない**。
+ *
+ * 追う役そのものは今も導出している（`nearestFielder`）が、**使うのは X-45 のCPUの判断だけ**
+ * ＝見た目には出さない。戻すとしても「**確保した後は塗らない**」が最低条件になる。
+ */
 const FIELDER_COLOR = 0x336699;
-const CONTROLLED_COLOR = 0xffee33;
 const RUNNER_COLOR = 0xcc3333;
 /**
  * バイクに乗っている走者の色（フェーズF-26-3）。**誰が乗っているかは守備側にも見えないと
@@ -250,10 +270,31 @@ export interface FielderEntity {
   group: THREE.Group;
 }
 
+/**
+ * ちっちゃいモードの選手を1体作る（フェーズLL-59）。**このモードの選手はここだけで作る**
+ * ので、実寸より大きく描く倍率の掛け忘れが起きない（野手9人と走者4人の2か所に同じ
+ * 1行を書くと、片方だけ実寸のまま残りうる）。倍率は見た目だけで判定には効かない。
+ */
+function createChicchaiPlayer(color: number): THREE.Group {
+  const group = createPlayer(color);
+  setPlayerScale(group, CHICCHAI_PLAYER_SCALE);
+  return group;
+}
+
+/**
+ * 野手ごとのグラブ（ブラッシュアップ：グラフィック）。**野手Groupから引ける形で持つ**
+ * （bikeOf と同じ）＝投げる腕が変わったとき（継投でマウンドの投手が左右入れ替わる）に
+ * 持ち替える先をここから引く。捕手だけはミット。
+ */
+const gloveOf = new WeakMap<THREE.Group, THREE.Object3D>();
+
 /** 9守備位置のプレースホルダーを生成する（常時シーンに配置。表示/非表示の出し分けはしない）。 */
 export function createFielders(): FielderEntity[] {
   return (Object.keys(FIELDER_HOME_POSITIONS) as FielderId[]).map((id) => {
-    const group = createPlayer(FIELDER_COLOR);
+    const group = createChicchaiPlayer(FIELDER_COLOR);
+    const glove = createProp(id === 'C' ? 'Mitt' : 'Glove');
+    attachGlove(group, glove, NEUTRAL_PITCH_ARM.side);
+    gloveOf.set(group, glove);
     const pos = FIELDER_HOME_POSITIONS[id];
     // 定位置への配置は瞬間移動（走ってきたわけではない）
     movePlayerTo(group, pos.x, 0, pos.z, { snap: true });
@@ -278,7 +319,7 @@ const bikeOf = new WeakMap<THREE.Group, THREE.Object3D>();
 
 export function createRunners(): RunnerPool {
   const make = () => {
-    const g = createPlayer(RUNNER_COLOR);
+    const g = createChicchaiPlayer(RUNNER_COLOR);
     // 車体は走者1人につき1台、最初から持たせて**表示だけ出し入れする**
     // （野手・走者のメッシュ自体と同じ扱い＝プレー中に作らない）
     const bike = createProp('Bike');
@@ -353,14 +394,23 @@ export type FieldPlayOutcome =
 
 const MAX_DT = 0.1;
 /**
- * 鳥瞰カメラからでも見えるようにボールを拡大表示する。
- * フェーズE-24でカメラが約3.2倍寄ったので、従来の2.5倍（直径2m）では画面上で
- * 大きすぎて打球が野手を隠してしまう。寄ったぶんだけ倍率を下げる。
+ * 鳥瞰カメラからでも見えるようにボールを拡大表示する（**倍率の定義は
+ * `core/camera.ts`**＝選手の縮尺 `CHICCHAI_PLAYER_SCALE` の隣。フェーズNN-61で
+ * ジオメトリが実寸になったので、ここは「実寸の何倍で描くか」を受け取るだけになった）。
+ *
+ * **見かけは NN-61 の前と変わらない**：従来は半径0.4mのジオメトリ × 1.5倍＝描いた
+ * 半径0.6m で、実寸の16.4倍がちょうど同じ大きさになる（差 0.2mm＝0.0px）。
  */
-const BALL_SCALE = 1.5;
+const BALL_SCALE = CHICCHAI_BALL_SCALE;
 /** 保険：万一静止しない場合の強制打ち切り秒数 */
 const MAX_PLAY_SEC = 15;
-const BALL_RADIUS = 0.4;
+/**
+ * **描いた球の半径** m（＝地面に置くときの中心の高さ）。従来はジオメトリの 0.4m を
+ * そのまま使っていたので、1.5倍に描いた球は 0.2m だけ地面にめり込んでいた
+ * （フェーズNN-61で拡大後の半径から導出するようにして解消。真上から見下ろす画面なので
+ * 見た目の差は 3.8px ぶん浮くだけで、判定にはもともと一切効かない）。
+ */
+const BALL_RADIUS = BALL_REAL_RADIUS * CHICCHAI_BALL_SCALE;
 /**
  * 人間守備がボールを保持したまま「刺せる走者がいない」状態が続いたとき、プレーを
  * 畳むまでの猶予。原作に自動送球は無い（送球はプレイヤーがA+塁指定で行う。説明書p21）
@@ -397,6 +447,14 @@ const CATCH_MIN_PLAY_SEC = 0.3;
  * 値は「外野の定位置から静止球までのおおよその距離 ÷ FIELDER_SPEED」から逆算
  * （深い打球で約20m ÷ 8.5m/s ≈ 2.4秒。追跡開始が遅れがちな人間操作でも
  * 拾い直しの機会が実際にあるように少し余裕を持たせる）。
+ *
+ * **ただしこの猶予は「誰も近づいていないとき」にしか進まない**（テストプレイの指摘。
+ * 下記 `restingT` の更新）。固定の2.5秒だけで打ち切ると、**20mより遠くで静止した打球は
+ * 野手が全力で走っている最中に自動でヒットになる**（実機で再現：最寄りの野手が
+ * 14.8m手前にいるのに二塁打が確定した）＝「まだ球を取ってもいないのに次の打者へ移る」。
+ * 逆に**誰も近づいていなければ従来どおり2.5秒で打ち切る**ので、守備が動かないときの
+ * テンポは1mmも変わらない。プレー全体には `MAX_PLAY_SEC` の上限があるので、
+ * 近づき続ける限り待つ形にしても決着しないことは起きない。
  */
 const RESTING_PICKUP_GRACE_SEC = 2.5;
 /** CPU守備が確保後に送球するまでの反応時間（人間の1.5秒待ちより短く即応させる） */
@@ -628,6 +686,10 @@ interface RunnerVisual {
  *   'stealThrow' = 盗塁されている（A+方向で塁へ送球。説明書p13）。
  * でっかいモードで攻撃側が人間のとき（main.ts が出す。フィールドプレー中ではない）：
  *   'steal' = 走者がいて盗塁を仕掛けられる（投球中にB+方向）。
+ *   'takeLead' = **まだ投げていない**うちにリードを取りに行ける（Bでにらみ合いへ。
+ *     フェーズKK-58）。'steal' と**同じ枠を入れ替える**＝同じBが投球前と投球中で違う
+ *     意味になるので、両方を並べると「いまどちらが効くのか」が読めない
+ *     （'bunt' / 'buntTwoStrikes' と同じ「1つの操作の2つの状態」の持ち方）。
  *   'battingEffect' = 打者が一時効果を切れる（Gで1打席だけ。フェーズM-33）。
  *   'bunt' / 'buntTwoStrikes' = バントの構えを取っている（フェーズY-46／AA-48）。
  *     **2ストライクだけ文言が変わる**＝そこではファウルが三振になる（'hold' と
@@ -648,6 +710,7 @@ export type PlayPromptKind =
   | 'pickoff'
   | 'leadStart'
   | 'lead'
+  | 'takeLead'
   | 'steal'
   | 'battingEffect'
   | 'bunt'
@@ -884,6 +947,13 @@ export function createFieldPlayController(opts: {
    */
   onPlayPrompt?: (prompt: PlayPrompt) => void;
   /**
+   * 捕球・送球の音のきっかけ（ブラッシュアップ：効果音）。**音はこのシーンが持たない**
+   * （`onDefenseResult` と同じ分担）ので、プレーの局面が「飛んでいる／転がっている／
+   * 送球中 → 野手が持った」に変わったら 'catch'、「→ 送球中」に変わったら 'throw' を報せる。
+   * 判定には一切触らない（局面の切り替わりを見ているだけ）。
+   */
+  onFieldSound?: (kind: 'catch' | 'throw') => void;
+  /**
    * 走者ID→その走者の走る速さ m/s（走力＝RUNの反映。フェーズB-8）。
    * ロスターを知っているのは main.ts なので、能力値の解決はそちらに任せてここは
    * 「速さを問い合わせる」だけにしてある（このシーンは選手データに依存しない）。
@@ -982,6 +1052,7 @@ export function createFieldPlayController(opts: {
     onSettled,
     onDefenseResult,
     onPlayPrompt,
+    onFieldSound,
     runnerSpeedOf,
     canBikeOf,
     canDropkickOf,
@@ -1008,6 +1079,8 @@ export function createFieldPlayController(opts: {
   const fielderById = new Map<FielderId, FielderEntity>(fielders.map((f) => [f.id, f]));
 
   let phase: PlayPhase = null;
+  /** 音のために覚えておく直前の局面（`onFieldSound`。切り替わりの向きで捕球か送球かを決める） */
+  let soundPhase: PlayPhase = null;
   /**
    * このプレーの入口（'batted'=打球 launch / 'pickoff'=けん制球 startPickoff /
    * 'steal'=盗塁 startSteal）。けん制・盗塁はリードの進行・CPUの判断・決着の種類
@@ -1124,6 +1197,11 @@ export function createFieldPlayController(opts: {
   let elapsed = 0;
   /** ボールが静止してからの経過秒（RESTING_PICKUP_GRACE_SEC との比較用） */
   let restingT = 0;
+  /**
+   * 静止球へいちばん近い野手のこれまでの最短距離（テストプレイの指摘）。
+   * **縮んでいる間は猶予を数え直す**＝追いついている最中に打ち切らない。
+   */
+  let restingNearest = Infinity;
   /** このプレー開始時点のアウト数（タッチアップの可否判定に使う） */
   let outsBefore = 0;
   /** タッチアップの局面（フライ捕球→走者は帰塁済み、まだ誰も送球していない）か */
@@ -1594,6 +1672,9 @@ export function createFieldPlayController(opts: {
     for (const f of fielders) {
       const p = fielderPos[f.id];
       const down = isFielderDown(f.id);
+      // グラブは投げない側の手（マウンドの野手は投手の ARM で左右が入れ替わる）
+      const glove = gloveOf.get(f.group);
+      if (glove) attachGlove(f.group, glove, throwArmFor(f.id).side);
       // 位置を書くと同時に歩き/走りが起きる（歩調も向きも実際に動いた量から。E-25-(c)）
       movePlayerTo(f.group, p.x, finePlayLift(f.id), p.z);
       // 蹴り倒された野手（フェーズF-26-4）は**実際に倒れて起き上がる**（E-25-(e)。
@@ -1703,8 +1784,17 @@ export function createFieldPlayController(opts: {
     }
   }
 
-  function highlightControlled(id: FielderId): void {
-    setPlayerColor(fielderById.get(id)!.group, CONTROLLED_COLOR);
+  /**
+   * その点にいちばん近い野手との距離（全野手＝塁カバーの4人も含む。捕球の候補と同じ
+   * 母集団にそろえる＝「捕れる位置にいるのに猶予だけ進む」が起きない）。
+   */
+  function nearestFielderDistance(x: number, z: number): number {
+    let min = Infinity;
+    for (const f of fielders) {
+      const d = distance(fielderPos[f.id], { x, z });
+      if (d < min) min = d;
+    }
+    return min;
   }
 
   function syncBall(b: BattedBall): void {
@@ -1906,6 +1996,7 @@ export function createFieldPlayController(opts: {
     pauseT = 0;
     elapsed = 0;
     restingT = 0;
+    restingNearest = Infinity;
     possessedTimer = 0;
     holdSafeTimer = 0;
     throwState = null;
@@ -1928,7 +2019,6 @@ export function createFieldPlayController(opts: {
       fielderPos[id] = { ...BASE_POSITIONS[base] };
     }
     holderId = holder;
-    highlightControlled(holder);
     syncFielderMeshes();
 
     runnerVisuals = buildRunnerPlayVisuals(baseRunners, leads);
@@ -1942,6 +2032,7 @@ export function createFieldPlayController(opts: {
 
   function cleanup(): void {
     phase = null;
+    soundPhase = null;
     playKind = 'batted';
     pickoffTimer = 0;
     pickoffIdleTimer = 0;
@@ -2799,7 +2890,6 @@ export function createFieldPlayController(opts: {
     holderId = catcher;
     possessedTimer = 0;
     holdSafeTimer = 0;
-    highlightControlled(catcher);
     const p = fielderPos[catcher];
     ball.position.set(p.x, BALL_RADIUS, p.z);
   }
@@ -3267,7 +3357,6 @@ export function createFieldPlayController(opts: {
     throwHoldTimer = 0;
     ballArriveSec = 0;
     queuedThrowBase = null;
-    highlightControlled(catcher);
     const p = fielderPos[catcher];
     ball.position.set(p.x, BALL_RADIUS, p.z);
     shadow.visible = false;
@@ -3326,7 +3415,6 @@ export function createFieldPlayController(opts: {
     holderId = catcher;
     possessedTimer = 0;
     holdSafeTimer = 0;
-    highlightControlled(catcher);
     const p = fielderPos[catcher];
     ball.position.set(p.x, BALL_RADIUS, p.z);
     shadow.visible = false;
@@ -3351,6 +3439,8 @@ export function createFieldPlayController(opts: {
       pauseT = 0;
       elapsed = 0;
       restingT = 0;
+    restingNearest = Infinity;
+      restingNearest = Infinity;
       possessedTimer = 0;
       tagUpActive = false;
       clearThrowHold();
@@ -3368,14 +3458,13 @@ export function createFieldPlayController(opts: {
       holdSafeTimer = 0;
       const landing = predictLandingAt(initial);
       landingPoint = landing.point;
-      // 一斉移動の対象（塁カバー4人を除く）のうち、着地予測にもっとも近い野手を
-      // ハイライトする（メインで打球を追うことになる野手の視覚ガイド。操作自体は
-      // 原作準拠で全員が同じ方向へ動く）。
+      // 一斉移動の対象（塁カバー4人を除く）のうち、着地予測にもっとも近い野手。
+      // **X-45（CPUの余分な進塁）が守備の時間を見積もるのに使う**（守備側の見た目には
+      // 使わない＝UU-69で「操作中の野手の目印」を外した）。
       const controllablePositions = Object.fromEntries(
         CONTROLLABLE_FIELDERS.map((id) => [id, FIELDER_HOME_POSITIONS[id]]),
       ) as Record<FielderId, Vec2>;
       const chaser = nearestFielder(landing.point, controllablePositions);
-      highlightControlled(chaser);
 
       // 塁上の走者は**投球中に取っていたリードの位置から**走り出す（フェーズY-46）。
       // 見るのは盗塁とまったく同じ `pitchLeads` なので、打者が見送るか打つかで走者の
@@ -3462,6 +3551,8 @@ export function createFieldPlayController(opts: {
       // 打球としての計時はここから（捕球無効の CATCH_MIN_PLAY_SEC も打った瞬間が起点）
       elapsed = 0;
       restingT = 0;
+    restingNearest = Infinity;
+      restingNearest = Infinity;
       possessedTimer = 0;
       holdSafeTimer = 0;
       // 捕手へ飛んでいた投球は打たれてもう無い＝「投球が届くまで投げられない」待ちも
@@ -3509,15 +3600,8 @@ export function createFieldPlayController(opts: {
         }),
       );
 
-      // 打球を追う野手のハイライトは打球のプレーと同じ規則（launch と同じ導出）。
-      // **塁カバーの4人は盗塁のときすでに塁に入っている**ので、そのままにする
-      // （実際の野球でも、走られている場面のカバーはもう始まっている）。
       const landing = predictLanding(initial);
       landingPoint = landing;
-      const controllablePositions = Object.fromEntries(
-        CONTROLLABLE_FIELDERS.map((id) => [id, fielderPos[id]]),
-      ) as Record<FielderId, Vec2>;
-      highlightControlled(nearestFielder(landing, controllablePositions));
 
       ball.visible = true;
       ball.scale.setScalar(BALL_SCALE);
@@ -3528,6 +3612,17 @@ export function createFieldPlayController(opts: {
 
     update(dt) {
       if (phase === null) return;
+      // 捕球・送球の音（局面の切り替わりを1フレーム遅れで拾う＝判定の流れには割り込まない）
+      if (phase !== soundPhase) {
+        if (phase === 'throwing') onFieldSound?.('throw');
+        else if (
+          phase === 'possessed' &&
+          (soundPhase === 'flying' || soundPhase === 'loose' || soundPhase === 'throwing')
+        ) {
+          onFieldSound?.('catch');
+        }
+        soundPhase = phase;
+      }
       const d = Math.min(dt, MAX_DT);
       // 蹴り倒された野手の起き上がり（フェーズF-26-4）はどのフェーズでも進める
       // ＝送球中に蹴られた野手が、送球の到着を待たされて余分に寝ていることが起きない。
@@ -3995,7 +4090,6 @@ export function createFieldPlayController(opts: {
           }
           holderId = receiver;
           fielderPos[holderId] = { ...target };
-          highlightControlled(holderId);
           phase = 'possessed';
           possessedTimer = 0;
           holdSafeTimer = 0;
@@ -4014,7 +4108,19 @@ export function createFieldPlayController(opts: {
       }
       if (ballState) {
         elapsed += d;
-        if (ballState.resting) restingT += d;
+        if (ballState.resting) {
+          // **最寄りの野手が近づいている間は猶予を数え直す**（テストプレイの指摘）。
+          // 「守備が間に合わなかった」で打ち切ってよいのは**誰も追いついていないとき**
+          // だけで、走っている最中に打ち切ると「球を取ってもいないのに次の打者へ移る」。
+          // 判定に使うのは捕球と同じ野手の位置なので、新しい状態も定数も増えていない。
+          const near = nearestFielderDistance(ballState.x, ballState.z);
+          if (near < restingNearest) {
+            restingNearest = near;
+            restingT = 0;
+          } else {
+            restingT += d;
+          }
+        }
         const fallback = decideFallback(ballState, restingT);
         if (fallback) {
           finish(fallback);

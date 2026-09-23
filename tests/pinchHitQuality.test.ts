@@ -98,7 +98,7 @@ describe('采配メニューの代打（describeBatterEntry）', () => {
     expect(new Set(positions).size).toBe(1);
   });
 
-  it('スキルの補正が数字に出る（`カジバノチカラ`＝力+0.35／打率-0.15）', () => {
+  it('スキルの補正が数字に出る（`火事場の力`＝力+0.35／打率-0.15）', () => {
     const id = roster.bench[0];
     const skilled = grantSkill(roster, id, 'kajibanochikara').roster;
     const before = effectiveBatting(roster, id);
@@ -108,15 +108,15 @@ describe('采配メニューの代打（describeBatterEntry）', () => {
       String(displayHomeRuns(after.power)).padStart(2),
     );
     // 札の名前も同じ行に並ぶ（何がこの数字を動かしているのかが読める）
-    expect(describeBatterEntry(skilled, id)).toContain('カジバノチカラ');
+    expect(describeBatterEntry(skilled, id)).toContain('火事場の力');
   });
 
   it('好調は数字と理由が同じ行に並ぶ（D-19。ラッキー7なら全員）', () => {
     const id = roster.bench[0];
     const plain = describeBatterEntry(roster, id);
     const hot = describeBatterEntry(roster, id, LUCKY_INNING);
-    expect(plain).not.toContain('ゼッコーチョー');
-    expect(hot).toContain('ゼッコーチョー');
+    expect(plain).not.toContain('絶好調');
+    expect(hot).toContain('絶好調');
     expect(hot).toContain(
       batterStatCells(effectiveBatting(roster, id, LUCKY_INNING)).slice(0, 2).join(' '),
     );
@@ -137,7 +137,7 @@ describe('打順の表（describeLineupRow）', () => {
   it('打者の行は 打順・守備位置・名前・AV・HR・走力', () => {
     const line = describeLineupRow(roster, 0);
     const stats = effectiveBatting(roster, roster.lineup[0]);
-    expect(line).toContain('1バン');
+    expect(line).toContain('1番');
     expect(line).toContain(roster.players[roster.lineup[0]].name);
     expect(line).toContain(batterStatCells(stats).join(' '));
   });
@@ -146,7 +146,7 @@ describe('打順の表（describeLineupRow）', () => {
     const rows = roster.lineup.map((_, slot) => describeLineupRow(roster, slot));
     const barStarts = rows.map((line) => displayWidth(line.slice(0, line.search(/[●○]/))));
     expect(new Set(barStarts).size).toBe(1);
-    expect(rows[roster.pitcherSlot]).toContain('ERA');
+    expect(rows[roster.pitcherSlot]).toContain('防');
   });
 
   // フェーズEE-52：V-43で試合の間にもこの画面を通るようになったのに、打線の表は
@@ -169,6 +169,6 @@ describe('打順の表（describeLineupRow）', () => {
     const first = describeLineupRow(roster, 0);
     const second = describeLineupRow(swapped, 1);
     // 打順の番号だけが違い、名前と能力値の並びは同じ
-    expect(second.replace('2バン', '1バン')).toBe(first);
+    expect(second.replace('2番', '1番')).toBe(first);
   });
 });

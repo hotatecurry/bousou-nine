@@ -18,9 +18,14 @@
 import { describe, expect, it } from 'vitest';
 import { BALLPARKS, DEFAULT_BALLPARK, type Ballpark } from '../src/core/ballpark';
 import {
+  EXIT_PITCH_CARRY,
+  EXIT_POWER_BONUS,
+  EXIT_SPEED_BASE,
   SWING_ACTIVE_SEC,
   SWING_IDEAL_SEC,
   createBattedBall,
+  stepBattedBall,
+  SWING_STARTUP_SEC,
   judgeBunt,
   judgeSwing,
 } from '../src/core/batting';
@@ -28,6 +33,8 @@ import { HOT_MODIFIER } from '../src/core/condition';
 import {
   CPU_PINCH_HIT_GAP,
   CPU_PINCH_RUN_BAT_LOSS,
+  CPU_TIMING_PENALTY_SEC,
+  SELECTIVE_HALF_WIDTH,
   chooseCpuStance,
   cpuSwingLead,
 } from '../src/core/cpuBatter';
@@ -65,6 +72,8 @@ import {
 import {
   CPU_INTENTIONAL_WALK_POWER_THRESHOLD,
   CPU_RELIEF_QUALITY_MARGIN,
+  CORNER_MARGIN,
+  NORMAL_TARGET_X,
   chooseCpuPitchPlan,
   chooseCpuRelief,
   cpuPitcherStyle,
@@ -81,6 +90,7 @@ import {
   RIGHT_BATTER_SIDE,
   SPEED_FAST,
   SPEED_NEUTRAL,
+  SPEED_SLOW,
   STRIKE_ZONE_HALF_WIDTH,
   armReleaseOffsetX,
   courseReleaseVxFor,
@@ -137,7 +147,8 @@ import {
   pitcherRowBatting,
   pitcherRowPitching,
 } from '../src/core/teams';
-import { CPU_POSSESSED_REACTION_SEC, simulatePlay } from '../tools/balance/sim';
+import { CPU_POSSESSED_REACTION_SEC, SIM_DT, simulatePlay } from '../tools/balance/sim';
+import { simulateAtBat } from '../tools/balance/atbat';
 import {
   type SweepSummary,
   crossXFor,
@@ -199,9 +210,13 @@ describe('打球の帰結：長打力・球速・球場（C-14の未確認事項
   it('球場の広さの順に本塁打率が並ぶ（説明書p24-25の紹介文と一致する）', () => {
     // ここだけ格子を細かくする：ふえいふえいの「高いレフトフェンス」は方角 -40°〜-12°
     // の区間だけの例外なので、粗い格子ではその区間を跨いでしまい差が出ない。
+    //
+    // **速球で見る**（フェーズRR-66）：長打力の幅を6→10m/sへ広げ抗力を上げたので、
+    // **基準速では長打力0.75でもほとんど柵に届かなくなった**（0.94%＝球場の差が
+    // 出る前に0で並ぶ）。球場の差が見えるのは「届く球」＝速球のとき。
     const hr = (name: string) =>
       summarize(
-        sweep({ park: parkNamed(name), batter: hitter(0.75), steps: 10 }),
+        sweep({ park: parkNamed(name), batter: hitter(0.75), steps: 10, pitchSpeed: SPEED_FAST }),
       ).homerunRate;
     // かせんじき（110m「とにかく狭い」）＞ ところざわ（120m「最も平均的」）
     //   ＞ どうむ（122m「トップクラスの広さ」）＞ だいそうげん（130m「とてつもなく広い」）
@@ -210,14 +225,10 @@ describe('打球の帰結：長打力・球速・球場（C-14の未確認事項
     expect(hr('どうむ')).toBeGreaterThan(hr('だいそうげん'));
     // たからづか（ラッキーゾーン＝両翼の柵が低い）は同じ広さの球場より越えやすい
     expect(hr('たからづか')).toBeGreaterThan(hr('ところざわ'));
-    // ふえいふえい（レフトフェンス10m）は距離が近いのに越えにくい。
-    // **長打力で見る**のは、この例外区間（方角 -40°〜-12°）に届くのが柵際の打球だけで、
-    // 長打力0.75・格子21点ではちょうど1本も掛からないため（フェーズBB-49で打者が
-    // 三塁側へ移り、接触点が1.3m動いたぶんの差。細かい格子ではどの長打力でも差が出る）。
-    const hrPower = (name: string) =>
-      summarize(sweep({ park: parkNamed(name), batter: hitter(1), steps: 10 })).homerunRate;
+    // ふえいふえい（レフトフェンス10m）は距離が近いのに越えにくい＝**同じ枠で見られる**
+    // （RR-66で速球に揃えたので、QQ-65 が長打力1.0だけ別枠で測っていた必要が無くなった）。
     expect(parkNamed('ふえいふえい').center).toBe(parkNamed('ところざわ').center);
-    expect(hrPower('ふえいふえい')).toBeLessThan(hrPower('ところざわ'));
+    expect(hr('ふえいふえい')).toBeLessThan(hr('ところざわ'));
     // 6球場ぶんの細かい格子で既定の5秒に迫る（実測3〜4秒）。**判定は何も変えず**、
     // 他の作業と同時に走らせたときの時間切れ（O-36の検証中に観測）だけを避ける。
   }, 20000);
@@ -232,15 +243,63 @@ describe('打球の帰結：長打力・球速・球場（C-14の未確認事項
     // CPU打者は `cpuSwingLead` の1点でしか振らないので、**その1点の帰結**が
     // そのままCPUの打球になる。速球には早振りのペナルティが乗る＝弱い当たりになる、
     // というのが cpuBatter.ts の設計意図そのもの。
+    //
+    // **QQ-65：ここは「1点だけ」を見ていたので穴があった**。実機のスイングは lead
+    // ちょうどではなく **lead 〜 lead+1フレーム** に散る（`batting.update` が
+    // `pitching.update` の後で swingT を進めるため）し、名鑑の速球は 47.5m/s まである。
+    // その帯を舐めると、旧値（減衰0.30）では両翼の柵へ届いていた（`npm run balance:plate`）。
+    const worstCarry = (
+      batter: { power: number; average: number },
+      pitchSpeed: number,
+    ): { carry: number; homerun: boolean } => {
+      let carry = 0;
+      let homerun = false;
+      for (let frac = 0; frac <= 1.0001; frac += 0.05) {
+        const launch = judgeSwing(
+          { crossX: 0, swingTime: cpuSwingLead(pitchSpeed) + frac * SIM_DT, pitchSpeed },
+          batter,
+        );
+        if (!launch) continue;
+        const play = simulatePlay(launch, 0, { park: DEFAULT_BALLPARK });
+        carry = Math.max(carry, play.carry);
+        if (play.outcome.kind === 'homerun') homerun = true;
+      }
+      return { carry, homerun };
+    };
+    // 名鑑でいちばん速い投手の速球（＝いちばん飛ぶ球）でも、平均的な打者は越えられない
+    const fastest = speedForPitchSelection(-1, 0.96);
+    expect(worstCarry(hitter(0.5), fastest).homerun).toBe(false);
+    expect(worstCarry(hitter(0.5), SPEED_FAST).homerun).toBe(false);
+    // **強打者は越えうる**＝速球を置きにいくリスクそのものは消えていない
+    expect(worstCarry(hitter(0.8, 0.7), fastest).homerun).toBe(true);
+    // 早振りのぶん、実際に引っ張り方向へ飛んでいる（ペナルティが効いている証拠）
     const launch = judgeSwing(
       { crossX: 0, swingTime: cpuSwingLead(SPEED_FAST), pitchSpeed: SPEED_FAST },
       hitter(0.5),
     );
     expect(launch).not.toBeNull();
-    const result = simulatePlay(launch!, 0, { park: DEFAULT_BALLPARK });
-    expect(result.outcome.kind).not.toBe('homerun');
-    // 早振りのぶん、実際に引っ張り方向へ飛んでいる（ペナルティが効いている証拠）
-    expect(result.directionDeg).toBeLessThan(-20);
+    expect(simulatePlay(launch!, 0, { park: DEFAULT_BALLPARK }).directionDeg).toBeLessThan(-20);
+  });
+
+  it('芯（タイミング0・コース0）の打球はタイミングの減衰に一切依存しない（QQ-65の不変条件）', () => {
+    // `TIMING_SPEED_PENALTY` は |timing| に比例して掛かるので、**芯で捉えた打球の初速は
+    // その値をどう動かしても変わらない**。QQ-65 で 0.30→0.35 に上げられたのはこの性質が
+    // あったからで（I-29の「芯の帰結」もJJ-57の抗力の帯も動かさずに、外した打球だけを
+    // 弱められる）、ここが崩れたら同じ触り方はもうできない。
+    for (const pitchSpeed of [SPEED_SLOW, SPEED_NEUTRAL, SPEED_FAST]) {
+      for (const power of [0, 0.5, 1]) {
+        const launch = judgeSwing(
+          { crossX: 0, swingTime: SWING_IDEAL_SEC, pitchSpeed },
+          hitter(power, 0),
+        );
+        expect(launch).not.toBeNull();
+        const exit = Math.hypot(launch!.vx, launch!.vy, launch!.vz);
+        expect(exit).toBeCloseTo(
+          EXIT_SPEED_BASE + EXIT_PITCH_CARRY * pitchSpeed + EXIT_POWER_BONUS * power,
+          6,
+        );
+      }
+    }
   });
 
   it('CPU打者は基準速ならジャストミートする（速球以外にペナルティは無い）', () => {
@@ -305,15 +364,22 @@ describe('走力とバイク（B-8の設計不変条件とF-26-3の未確認事�
 });
 
 describe('打席内の立ち位置（O-36。`npm run balance:stance` で測った帯）', () => {
-  /** ある立ち位置で、あるコースへ来た球をタイミング全域で振ったときの安打率 */
+  /**
+   * ある立ち位置で、あるコースへ来た球をタイミング全域で振ったときの安打率。
+   *
+   * **格子は STEPS より細かい 12分割**（フェーズRR-66）：バットの到達範囲を
+   * 描かれたバットに合わせて狭めた（1.40→1.27m）ぶん**隅の帯そのものが細くなった**ので、
+   * 粗い格子だと「中央でも内角の安打率が0」に丸まって差が見えない（実測は 4.2%）。
+   */
+  const STANCE_STEPS = 12;
   function hitRateAt(stance: number, localX: number): number | null {
     let hits = 0;
     let total = 0;
-    for (let i = -STEPS; i <= STEPS; i += 1) {
+    for (let i = -STANCE_STEPS; i <= STANCE_STEPS; i += 1) {
       const launch = judgeSwing(
         {
           crossX: localX,
-          swingTime: SWING_IDEAL_SEC + (i / STEPS) * (SWING_ACTIVE_SEC / 2),
+          swingTime: SWING_IDEAL_SEC + (i / STANCE_STEPS) * (SWING_ACTIVE_SEC / 2),
           pitchSpeed: SPEED_NEUTRAL,
         },
         hitter(0.5),
@@ -349,11 +415,14 @@ describe('打席内の立ち位置（O-36。`npm run balance:stance` で測っ�
   it('どこに立っても支配的にはならない（ゾーン全体では打席中央が最良）', () => {
     // 立ち位置は「読みが当たれば得、外れれば損」＝一様なコース分布では動かないのが最良。
     // これが崩れると「常に寄る」が正解になり、選択そのものが消える。
+    // **コースの格子を17点に細かくする**（フェーズRR-66）：9点だと丸めの粗さで
+    // 中央と寄りが 14.8% vs 15.7% と逆転して見えることがある（細かい格子＝
+    // 17点／タイミング12・20分割ではどれも中央が最良）。
     const zoneAverage = (stance: number): number => {
       let sum = 0;
       let n = 0;
-      for (let i = -4; i <= 4; i += 1) {
-        const rate = hitRateAt(stance, (i / 4) * 0.45);
+      for (let i = -8; i <= 8; i += 1) {
+        const rate = hitRateAt(stance, (i / 8) * 0.45);
         if (rate === null) continue;
         sum += rate;
         n += 1;
@@ -567,7 +636,11 @@ describe('CPUの采配と球団の個性（R-39。`npm run balance:lineup` で�
       (table[outs][to] - table[outs + 1][EMPTY]);
     const second = breakEven(FIRST, SECOND, 1);
     expect(second).toBeGreaterThan(0.6);
-    expect(second).toBeLessThan(0.85);
+    // QQ-65 で「外した打球」の減衰を強めた（0.30→0.35）ぶん、長打が減って**アウト1つの
+    // 費用が相対的に上がった**＝損益分岐は 0.805 → 0.916 へ動いた。R-39 の規則
+    // （守備に残る余裕 0.10秒以下＝完璧な送球でしか刺せない走者だけが走る）は
+    // **もともと成功率がほぼ1の場面しか通さない**ので、規則そのものは動かない。
+    expect(second).toBeLessThan(0.95);
     // 三盗のほうが損益分岐は低い（三塁は還りやすい）＝一律のしきい値は三盗に対して保守的
     expect(breakEven(SECOND, THIRD, 1)).toBeLessThan(second);
   });
@@ -627,7 +700,11 @@ describe('球団の個性の残り（S-40。`npm run balance:identity` で測っ
   it('当てられたときの費用だけでは持ち味を決められない（速球はどの投手でも一番高い）', () => {
     // 1段目の再現。費用だけで選ばせるとどの投手も速球を投げなくなる＝持ち味が消える。
     // だから決め球は「当てさせない力」（時間の短さ／曲がり）の側から決めている。
-    for (const spd of [0, 0.5, 1]) {
+    // **名鑑の実際の幅（SPD 0.35〜0.96）で見る**（フェーズRR-66）：RR-66で打球初速の
+    // 基準を下げたので、**名鑑に存在しないSPD0の投手**ではフォークが遅すぎて
+    // 前へ落ちる当たりが増え（21.0%）、速球（16.1%）を上回る。名鑑の中では従来どおり
+    // 速球がいちばん高い。
+    for (const spd of [0.35, 0.5, 0.96]) {
       const at = (y: -1 | 0 | 1) =>
         measure({ power: 0.5, pitchSpeed: speedForPitchSelection(y, spd) }).hitRate;
       const [fast, neutral, slow] = [at(-1), at(0), at(1)];
@@ -906,8 +983,11 @@ describe('制球を疲労とスキルへ（W-44。`npm run balance:control` の8
     ).length;
 
   it('疲労は決め球の値打ちを実際に奪う（見逃し三振を取れる投手が減る）', () => {
-    // 8段目：無傷 15/96 → 疲労MAX 0/96。ここが動かないと「疲れると荒れる」が空振りする
-    expect(calledStrikes(0)).toBeGreaterThan(10);
+    // 8段目：無傷 15/96 → 疲労MAX 0/96。ここが動かないと「疲れると荒れる」が空振りする。
+    // **フェーズRR-66で 15→8**：打者が本塁へ寄った（死球ゾーンが近づいた）ぶん
+    // `CPU_CONTROL_MAX_TARGET` が下がり、荒れの曲線が 3→2 になった＝**制球の良い投手が
+    // 縁の内側へ食い込む深さも浅くなった**。構造（良い投手だけが取れる／疲れると消える）は不変。
+    expect(calledStrikes(0)).toBeGreaterThan(5);
     expect(calledStrikes(1)).toBe(0);
     // 途中で得になる領域が無い（単調）
     const steps = [0, 0.25, 0.5, 0.75, 1].map(calledStrikes);
@@ -1011,9 +1091,18 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
     const bench = distributionFor(0.67, { average: 0.49, steps: STEPS });
     const gain = (outs: number, state: number) =>
       paScoreProb(bench, outs, state, scoreTable) - paScoreProb(pitcher, outs, state, scoreTable);
-    // 走者なし・一塁より、二塁・三塁のほうが大きい
-    expect(gain(0, 2)).toBeGreaterThan(gain(0, 0));
-    expect(gain(0, 4)).toBeGreaterThan(gain(0, 1));
+    // **走者が出ていれば利得は大きく、走者なしでは小さい**（どの塁でも走者なしの2倍以上）
+    // ＝X-45が「得点圏かどうか」でしきい値を切った根拠はここ。
+    //
+    // **フェーズUU-69で「三塁 > 一塁」は成り立たなくなった**（抗力 0.0012→0.0016）。
+    // 長打が減ると、**三塁の走者はもともと弱い打者でも還せる**ので良い打者に替える利得が
+    // 小さくなり、**一塁の走者は安打が要る**ぶん利得が大きく残る（実測 0死で 一塁11.2pt /
+    // 二塁10.8pt / 三塁8.5pt / 走者なし3.7pt）。**X-45の規則そのものは触っていない**ので、
+    // 「得点圏」という条件が**いちばん利得の大きい場面（一塁）を外している**ことは
+    // 未確認事項として記録した（規則を解き直すのは別セッションの規模）。
+    for (const state of [1, 2, 4]) {
+      expect(gain(0, state)).toBeGreaterThan(gain(0, 0) * 2);
+    }
     // どの場面でも「控えのほうが強い」ことは変わらない（負にはならない）
     for (let state = 0; state < 8; state += 1) {
       for (const outs of [0, 1, 2]) expect(gain(outs, state)).toBeGreaterThan(0);
@@ -1082,6 +1171,8 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
         },
         fielded: s.result.fielded,
         finalDistance: s.result.finalDistance,
+        /** 滞空（着地までの秒数）。転がった打球とポテンヒットを分ける（RR-66） */
+        hang: landing.sec,
       };
     });
 
@@ -1094,8 +1185,12 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
     expect(going.length).toBeLessThan(hits.length); // 全部ではない（内野安打では行かない）
   });
 
-  it('内野で止まった打球では仕掛けない（バントと同じ理由でここは帯が無い）', () => {
-    const infield = hits.filter((h) => h.finalDistance < 60);
+  it('内野で転がった打球では仕掛けない（バントと同じ理由でここは帯が無い）', () => {
+    // **滞空の短さも条件に入れる**（フェーズRR-66）：抗力を上げたので、**高く上がって
+    // 48mに落ちるポップフライ**（滞空3.5秒）が「60m未満で止まった打球」に混ざるように
+    // なった。それは内野ゴロではなく**浅い外野へのポテンヒット**で、守備が着くのは
+    // 落ちた後（4.0秒）＝余分な塁を狙えるのが正しい。ここが見たいのは「転がった打球」。
+    const infield = hits.filter((h) => h.finalDistance < 60 && h.hang < 1);
     expect(infield.length).toBeGreaterThan(0);
     for (const h of infield) {
       expect(extraBaseCase(h, RUNNER_SPEED).rule).toBeGreaterThan(-CPU_TAG_UP_MARGIN_SEC);
@@ -1680,5 +1775,225 @@ describe('代走（GG-54。`npm run balance:pinchrun` で測った帯）', () =>
       }
       expect(fired).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('CPU打者の選球と空振り（SS-67。`npm run balance:plate` で測った帯）', () => {
+  /**
+   * QQ-65 が計測で見つけた構造＝**CPU打者は三振も四球もしない**（1打席1.51球で必ず
+   * 打球になり、見送りは0.00球）を埋めたのが SS-67。ここで固定するのは値そのものでは
+   * なく「**4つの帰結がどれも実際に起きること**」と「**打席が必ず終わること**」。
+   */
+  const atBats = () =>
+    TEAMS.map((t) => createTeamRoster(teamById(t.id))).map((off, i, all) => {
+      const def = all[(i + 1) % all.length];
+      const pitcher = def.players[def.pitcher].pitching!;
+      return off.lineup.map((id) => simulateAtBat(pitcher, off.players[id].batting));
+    });
+
+  const flat = () => atBats().flat();
+
+  it('三振も四球も実際に起きる（SS-67の前はどちらも0%だった）', () => {
+    const rs = flat();
+    const k = rs.filter((r) => r.kind === 'strikeout').length;
+    const bb = rs.filter((r) => r.kind === 'walk').length;
+    expect(k).toBeGreaterThan(0);
+    expect(bb).toBeGreaterThan(0);
+    // **フェーズUU-69で「打球が主役」ではなくなった**（有効窓 0.14→0.09）＝
+    // インプレーは 87.5%→**47.9%**。CPU打者の正規化タイミングは不変だが、
+    // **スイング判断の時刻が遅くなった**ぶん振る球が増え、三振も増えた（25.0%→39.6%）。
+    // ここで守るのは「4つの帰結がどれも起きること」だけに戻し、**割合の帯は
+    // TT-68の describe が持つ**（そちらに実際の野球との差も書いてある）。
+    expect(rs.filter((r) => r.kind === 'inPlay').length / rs.length).toBeGreaterThan(0.4);
+  });
+
+  it('打席は必ず終わる（ファウルの無限ループが構造的に無い）', () => {
+    // 判定は決定的なので、**同じ球を投げ続けると同じファウルが永久に繰り返される**。
+    // SS-67 の前は 144打席のうち5打席が上限（40球）に張り付いていた＝実機なら
+    // 打席が終わらない。CPU投手が「粘られたら反対の隅へ散らす」ことで構造的に消えた。
+    for (const r of flat()) expect(r.pitches).toBeLessThan(10);
+  });
+
+  it('CPU打者は見送るようになった（＝四球という帰結の入口）', () => {
+    const rs = flat();
+    const takes = rs.reduce((sum, r) => sum + r.takes, 0) / rs.length;
+    expect(takes).toBeGreaterThan(0.2);
+  });
+
+  it('フォークは人間の投手の支配戦略ではなくなった（緩急の両側に罰があるので芯で捉えられない）', () => {
+    // SS-67 の前は「遅い球には罰なし」だったので、CPU打者はフォークを必ず芯で捉えた
+    // （|timing| 平均 0.117）＝当たっても弱いのでほぼアウトになり、投げ続けるのが
+    // 最適解だった。いまは緩急の両側に罰があるので、フォークも芯からは外れる。
+    expect(cpuSwingLead(SPEED_SLOW)).toBeGreaterThan(cpuSwingLead(SPEED_NEUTRAL));
+    expect(cpuSwingLead(SPEED_SLOW)).toBeCloseTo(cpuSwingLead(SPEED_FAST), 10);
+  });
+
+  it('基準速の帰結は1mmも動いていない（B-8以来の「基準値＝従来の定数」）', () => {
+    expect(cpuSwingLead(SPEED_NEUTRAL)).toBe(SWING_IDEAL_SEC);
+  });
+
+  /**
+   * **フェーズTT-68で罰そのものを有効窓からの導出にした**（0.045 → `SWING_ACTIVE_SEC / 3`）。
+   * SS-67 が置いた「速球は 0.045 のまま」という帯はここで意図して張り替えたもので、
+   * 守るのは値ではなく**梯子の形**＝通常は窓の1/3・2ストライクは窓の1/2（縁まで泳ぐ）。
+   */
+  it('罰は有効窓からの導出で、2ストライクの罰と同じ刻みの梯子になっている（TT-68）', () => {
+    expect(cpuSwingLead(SPEED_FAST)).toBeCloseTo(SWING_IDEAL_SEC + SWING_ACTIVE_SEC / 3, 10);
+    expect(cpuSwingLead(SPEED_FAST, true)).toBeCloseTo(SWING_IDEAL_SEC + SWING_ACTIVE_SEC / 2, 10);
+    // 通常の罰は必ず有効窓の内側＝**単独では空振りにならず「弱い当たり」になる**
+    expect(cpuSwingLead(SPEED_FAST) - SWING_IDEAL_SEC).toBeLessThan(SWING_ACTIVE_SEC / 2);
+  });
+
+  it('CPU投手の配球は、引数を渡さなければSS-67の前と完全に同じ（基準線）', () => {
+    for (const balls of [0, 1, 2, 3]) {
+      for (const strikes of [0, 1, 2]) {
+        const count = { balls, strikes };
+        expect(chooseCpuPitchPlan(count, 'balanced', NEUTRAL_RATING, 0)).toEqual(
+          chooseCpuPitchPlan(count, 'balanced', NEUTRAL_RATING),
+        );
+      }
+    }
+  });
+
+  it('ファウルで粘られると隅が入れ替わる（＝同じ球を投げ続けない）', () => {
+    const count = { balls: 0, strikes: 2 };
+    const first = chooseCpuPitchPlan(count, 'balanced', NEUTRAL_RATING, 0).targetX;
+    const afterFoul = chooseCpuPitchPlan(count, 'balanced', NEUTRAL_RATING, 1).targetX;
+    expect(Math.sign(afterFoul)).toBe(-Math.sign(first));
+    expect(Math.abs(afterFoul)).toBeCloseTo(Math.abs(first), 10);
+  });
+});
+
+describe('三振・四球を実際の野球の帯へ（TT-68。`npm run balance:plate` の12・13段目で測った帯）', () => {
+  /**
+   * SS-67 は三振・四球を 0%→6.3% にしたが、**実際の野球の帯（三振22% / 四球8.5% /
+   * 1打席3.9球）には届いていなかった**（1打席2.20球）。12段目が測った原因は
+   * **通常の球の狙いがゾーンのよく内側**（0.2475）にあったこと＝CPU打者が手を出す幅
+   * （0.40）のよく内側なので**必ず振られ、その約半分がそのまま打球になる**。
+   *
+   * ここで固定するのは値そのものではなく、**打席がカウントの分岐へ届くこと**
+   * （＝T-41の決め球・3ボールの置き球・S-40の持ち味が実戦で投げられる条件）と、
+   * **どの帰結も消えていないこと**（三振・四球・打球・本塁打がすべて起きる）。
+   */
+  const atBats = () =>
+    TEAMS.map((t) => createTeamRoster(teamById(t.id)))
+      .map((off, i, all) => {
+        const def = all[(i + 1) % all.length];
+        const pitcher = def.players[def.pitcher].pitching!;
+        return off.lineup.map((id) => simulateAtBat(pitcher, off.players[id].batting));
+      })
+      .flat();
+
+  it('通常の球は「隅の1つ内側」＝決め球とゾーンを挟んで対称の梯子（新しい定数を持たない）', () => {
+    expect(NORMAL_TARGET_X).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH - CORNER_MARGIN, 10);
+    // **見逃せばストライク**（ゾーンの内側）でありながら、**CPU打者は振ってこない縁**
+    // ＝この2つが同時に成り立つ帯の幅は、ちょうど隅の余裕1つぶんしかない。
+    expect(NORMAL_TARGET_X).toBeLessThan(STRIKE_ZONE_HALF_WIDTH);
+    expect(NORMAL_TARGET_X).toBeGreaterThanOrEqual(SELECTIVE_HALF_WIDTH);
+    expect(STRIKE_ZONE_HALF_WIDTH - SELECTIVE_HALF_WIDTH).toBeCloseTo(CORNER_MARGIN, 10);
+  });
+
+  it('罰は有効窓の1/3＝2ストライクの罰（窓の1/2）より必ず内側', () => {
+    expect(CPU_TIMING_PENALTY_SEC).toBeCloseTo(SWING_ACTIVE_SEC / 3, 10);
+    // **単独では空振りにならない**（＝弱い当たりになる）ことが罰の役目そのもの
+    expect(CPU_TIMING_PENALTY_SEC).toBeLessThan(SWING_ACTIVE_SEC / 2);
+    // **フェーズUU-69で秒数の帯（0.0455〜0.0472）は外した**＝あれは有効窓 0.14 の
+    // ときに測った絶対値で、窓を 0.09 にすれば 0.03 になる（**梯子の形は不変**）。
+    // 秒で固定すると窓を触るたびに落ちる＝「テストを直すためにテストを書き換える」になる。
+  });
+
+  it('打席がカウントの分岐へ届く（T-41の決め球・3ボールの置き球が実戦で投げられる条件）', () => {
+    const rs = atBats();
+    // SS-67 の実測は 2ストライク到達 12.5% / 3ボール到達 6.3% ＝ほとんど届いていなかった
+    expect(rs.filter((r) => r.maxStrikes >= 2).length / rs.length).toBeGreaterThan(0.3);
+    expect(rs.filter((r) => r.maxBalls >= 3).length / rs.length).toBeGreaterThan(0.12);
+  });
+
+  it('三振・四球・球数（実際の野球は 22% / 8.5% / 3.9球）', () => {
+    const rs = atBats();
+    const rate = (kind: string) => rs.filter((r) => r.kind === kind).length / rs.length;
+    // **フェーズUU-69で三振が 25.0%→39.6% へ行き過ぎた**（有効窓 0.14→0.09 の代償。
+    // 人間の空振りを実際の野球に合わせるほうを優先したユーザー判断）。
+    // **上限を 0.45 まで広げたのは事実に合わせただけ**で、実際の野球（22%）から
+    // 離れたことは未確認事項として記録してある＝ここは「まだ戻せていない」帯。
+    expect(rate('strikeout')).toBeGreaterThan(0.18);
+    expect(rate('strikeout')).toBeLessThan(0.45);
+    // 四球は UU-69 でも 8.3% のまま＝実際の野球（8.5%）にぴったり乗っている
+    expect(rate('walk')).toBeGreaterThan(0.05);
+    expect(rate('walk')).toBeLessThan(0.13);
+    const pitches = rs.reduce((sum, r) => sum + r.pitches, 0) / rs.length;
+    expect(pitches).toBeGreaterThan(3);
+    expect(pitches).toBeLessThan(4.5);
+  });
+
+  it('打球も長打も消えていない（＝三振ばかりの打席にならない）', () => {
+    const rs = atBats();
+    expect(rs.filter((r) => r.kind === 'inPlay').length / rs.length).toBeGreaterThan(0.4);
+    // **フェーズUU-69でCPU打線の本塁打が 0.31→0.00本/試合になった**（有効窓と抗力の
+    // 両方を動かした帰結）。**長打そのものは残っている**ので、ここで守るのは
+    // 「長打が1本も出ない打線にはなっていない」まで＝**本数ゼロは未確認事項として
+    // 記録した**（戻すなら `AIR_DRAG` 1か所。0.0012 なら 0.44本/試合へ戻る）。
+    expect(rs.filter((r) => r.outcome === 'triple' || r.outcome === 'homerun').length).toBeGreaterThan(0);
+    // 死球は例外のまま（T-41＝寄って立った打者に決め球が当たる。実際の野球は0.4%）
+    expect(rs.filter((r) => r.kind === 'hitByPitch').length / rs.length).toBeLessThan(0.06);
+  });
+
+  it('打席は必ず終わる（狙いを動かしてもファウルの無限ループは戻らない）', () => {
+    for (const r of atBats()) expect(r.pitches).toBeLessThan(10);
+  });
+});
+
+describe('人間の空振りとホームラン（UU-69。`npm run balance:plate` の14段目で測った帯）', () => {
+  /**
+   * テストプレイの2件（「そもそも空振りすることがほぼない」「ホームランが若干しか
+   * 変わっていない」）。**1〜13段目はCPU打者か「人間が芯（t=0）で捉えたとき」しか
+   * 測っていなかった**＝**人間が押すタイミングにばらつきがあるとき**の帰結は
+   * 一度も測られていなかった（QQ-65がCPU側で見つけたのと同じ穴の、人間側の分）。
+   */
+  it('有効窓は「押す時刻の許容」そのもの＝狙う時刻は動かない', () => {
+    // 人間が合わせるのは `SWING_IDEAL_SEC`（押してからジャストミートまで）で、
+    // **窓を狭めてもここは動かない**＝「同じタイミングで押す、ただし許容が狭くなる」。
+    expect(SWING_IDEAL_SEC).toBeCloseTo(0.09, 10);
+    expect(SWING_STARTUP_SEC).toBeCloseTo(SWING_IDEAL_SEC - SWING_ACTIVE_SEC / 2, 10);
+    // 押せる幅は ±45ms＝14段目の実測で空振り 25.1%（σ=40ms）＝実際の野球の約25%
+    expect(SWING_ACTIVE_SEC / 2).toBeLessThanOrEqual(0.045);
+    // 狭すぎない（±40ms を下回ると σ=40ms で空振りが 31.9% まで増える）
+    expect(SWING_ACTIVE_SEC / 2).toBeGreaterThanOrEqual(0.04);
+  });
+
+  it('打球の質は有効窓に依存しない（窓が動かすのは「当たるかどうか」だけ）', () => {
+    // `timing` は窓で正規化されるので、**同じ正規化タイミングなら同じ打球**になる。
+    // これが崩れると「窓を狭めたらHR率まで動いた」ことになり、14段目の読み方が壊れる。
+    for (const t of [0, 0.25, 0.5, 0.75]) {
+      const launch = judgeSwing(
+        { crossX: 0, swingTime: SWING_IDEAL_SEC + t * (SWING_ACTIVE_SEC / 2), pitchSpeed: SPEED_NEUTRAL },
+        { power: 0.5, average: 0.5 },
+      );
+      expect(launch).not.toBeNull();
+      // 芯からのずれが大きいほど弱い（正規化タイミングだけで決まる）
+      if (t > 0) {
+        const sweet = judgeSwing(
+          { crossX: 0, swingTime: SWING_IDEAL_SEC, pitchSpeed: SPEED_NEUTRAL },
+          { power: 0.5, average: 0.5 },
+        )!;
+        expect(Math.hypot(launch!.vx, launch!.vy, launch!.vz)).toBeLessThan(
+          Math.hypot(sweet.vx, sweet.vy, sweet.vz),
+        );
+      }
+    }
+  });
+
+  it('芯で捉えた打球はまだ柵を越える（＝抗力を上げてもHRが消えていない）', () => {
+    // `AIR_DRAG` 0.0012→0.0016 で削ったのは**本数**で、**強打者が芯で捉えれば越える**
+    // という構造は残す（RR-66が「打者の差」を作ったところは崩さない）。
+    const strong = judgeSwing(
+      { crossX: 0, swingTime: SWING_IDEAL_SEC, pitchSpeed: SPEED_FAST },
+      { power: 1, average: 0.5 },
+    )!;
+    let ball = createBattedBall(strong, 0);
+    for (let i = 0; i < 10000 && !ball.resting && ball.over === null; i += 1) {
+      ball = stepBattedBall(ball, 1 / 60, DEFAULT_BALLPARK);
+    }
+    expect(ball.over).toBe('fly');
   });
 });

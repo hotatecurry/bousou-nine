@@ -32,6 +32,7 @@ import {
   judgePitch,
 } from '../src/core/pitch';
 import {
+  CORNER_MARGIN,
   CPU_CONTROL_CURVE,
   CPU_CONTROL_EDGE,
   CPU_CONTROL_MAX_TARGET,
@@ -130,17 +131,22 @@ describe('chooseCpuPitchPlan：制球を渡さなければT-41の前と完全に
     }
   });
 
-  it('制球0.5の狙いはT-41の前の式そのもの（通常＝ゾーン半幅×0.55／決め球＝半幅+0.05）', () => {
+  it('制球0.5の狙いは「隅の内側／隅の外側」の梯子そのもの（TT-68で通常も隅の1つ内側へ）', () => {
     const normal = chooseCpuPitchPlan({ balls: 0, strikes: 0 }, 'balanced', NEUTRAL_RATING);
-    expect(Math.abs(normal.targetX)).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH * 0.55, 10);
+    expect(Math.abs(normal.targetX)).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH - CORNER_MARGIN, 10);
     const putaway = chooseCpuPitchPlan({ balls: 0, strikes: 2 }, 'balanced', NEUTRAL_RATING);
-    expect(Math.abs(putaway.targetX)).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH + 0.05, 10);
+    expect(Math.abs(putaway.targetX)).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH + CORNER_MARGIN, 10);
+    // 通常と決め球はゾーンを挟んで対称＝**新しい定数を持たない1刻みの梯子**（TT-68）
+    expect(STRIKE_ZONE_HALF_WIDTH - Math.abs(normal.targetX)).toBeCloseTo(
+      Math.abs(putaway.targetX) - STRIKE_ZONE_HALF_WIDTH,
+      10,
+    );
   });
 
-  it('制球が中央値以上の投手は「通常の球」も従来のまま（内へ寄せて甘くしない）', () => {
+  it('制球が中央値以上の投手は「通常の球」も同じ狙い（内へ寄せて甘くしない）', () => {
     for (const control of [0.5, 0.75, 1]) {
       const plan = chooseCpuPitchPlan({ balls: 0, strikes: 0 }, 'balanced', control);
-      expect(Math.abs(plan.targetX)).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH * 0.55, 10);
+      expect(Math.abs(plan.targetX)).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH - CORNER_MARGIN, 10);
     }
   });
 });
@@ -277,7 +283,11 @@ describe('曲線（CPU_CONTROL_CURVE）は計測が決めた（npm run balance:c
           'hitByPitch';
       });
     expect(reaches(CPU_CONTROL_CURVE)).toBe(true);
-    expect(reaches(2)).toBe(false);
+    // **1段緩い曲線では届かない**＝採用値が「届く最小」であることの確認。
+    // フェーズRR-66で打者が本塁へ寄った（死球ゾーンが 0.9〜1.7 → 0.65〜1.45）ぶん
+    // **同じ荒れでも体に近づく**ので、曲線は 3→2 で足りるようになった（上限も
+    // `BATTER_ZONE_MIN_X` から導出されるので一緒に下がる）。
+    expect(reaches(CPU_CONTROL_CURVE - 1)).toBe(false);
   });
 
   it('死球ゾーンへ届くのは「例外」の範囲にとどまる（名鑑96人のうち一握り）', () => {

@@ -315,16 +315,19 @@ describe('shouldCpuSwing：立ち位置は「届くか」にだけ効く（選�
   const flightAt = (x: number) => createPitchFlight(x, SPEED_NEUTRAL, 0);
   const count = { balls: 0, strikes: 0 };
 
-  it('寄っていれば、中央では見送る外角の球を振りに行く', () => {
-    const x = at(BAT_REACH_OUTSIDE_X - 0.05);
-    expect(shouldCpuSwing(flightAt(x), { balls: 0, strikes: 2 })).toBe(false);
-    expect(shouldCpuSwing(flightAt(x), { balls: 0, strikes: 2 }, RIGHT_BATTER_SIDE, NEAR)).toBe(
-      true,
+  // **フェーズSS-67で選球の幅が到達範囲の内側に入った**（2ストライクでも `ゾーン+隅` まで）
+  // ので、**打席の中央では幅のほうが先に効く**＝立ち位置は選球の結果に出ない。
+  // 到達範囲が幅より内側へ縮む「離れて／寄って立った打席」でだけ、届くかどうかが表に出る。
+  it('離れて立てば、外角の球は届かなくなる（＝立ち位置が効くのは届くかどうかだけ）', () => {
+    const x = at(-0.5);
+    expect(shouldCpuSwing(flightAt(x), { balls: 0, strikes: 2 })).toBe(true);
+    expect(shouldCpuSwing(flightAt(x), { balls: 0, strikes: 2 }, RIGHT_BATTER_SIDE, FAR)).toBe(
+      false,
     );
   });
 
-  it('寄っていれば、内角いっぱいの球は見送る（届かないので）', () => {
-    const x = at(BAT_REACH_INSIDE_X);
+  it('寄って立てば、内角の球は届かなくなる', () => {
+    const x = at(0.5);
     expect(shouldCpuSwing(flightAt(x), { balls: 0, strikes: 2 })).toBe(true);
     expect(shouldCpuSwing(flightAt(x), { balls: 0, strikes: 2 }, RIGHT_BATTER_SIDE, NEAR)).toBe(
       false,
@@ -338,13 +341,20 @@ describe('shouldCpuSwing：立ち位置は「届くか」にだけ効く（選�
     expect(shouldCpuSwing(flightAt(x), count, RIGHT_BATTER_SIDE, 0)).toBe(false);
   });
 
-  it('スイング判断と接触判定が同じ範囲を見ている（振ると決めたのに届かない、が無い）', () => {
+  it('振ると決めたのに届かない、が無い（判断と接触が同じ `batReachFor` を見ている）', () => {
+    // **フェーズSS-67で「届くのに見送る」は起きるようになった**（選球の幅が到達範囲の
+    // 内側に入ったので、届く球でも幅の外なら見送る＝それが四球・見逃し三振を生む）。
+    // 逆向き（振ると決めたのに届かない）が無いことは設計の不変条件のまま。
     for (const stance of [NEAR, -0.1, 0, 0.1, FAR]) {
       for (let i = -20; i <= 20; i += 1) {
         const x = (i / 20) * 1.2;
-        const decided = shouldCpuSwing(flightAt(x), { balls: 0, strikes: 2 }, RIGHT_BATTER_SIDE, stance);
-        const contacts = swingWorld(x, stance) !== null;
-        expect(decided).toBe(contacts);
+        const decided = shouldCpuSwing(
+          flightAt(x),
+          { balls: 0, strikes: 2 },
+          RIGHT_BATTER_SIDE,
+          stance,
+        );
+        if (decided) expect(swingWorld(x, stance)).not.toBeNull();
       }
     }
   });

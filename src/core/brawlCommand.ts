@@ -239,5 +239,5 @@ export function commandNotation(command: CommandId, facing: FightFacing): string
     .map((dir) => ARROW[facing === 1 ? dir : MIRROR[dir]])
     .join('');
   // 溜めだけは「ためる」ことがコマンドの本体なので、1つ目の矢印に印を添える
-  return command === 'charge' ? `${arrows[0]}タメ${arrows.slice(1)}` : arrows;
+  return command === 'charge' ? `${arrows[0]}溜め${arrows.slice(1)}` : arrows;
 }

@@ -1,281 +1,399 @@
 /**
- * 8bit風効果音（WebAudio合成、外部音声ファイル不使用）。
+ * 効果音（ブラッシュアップで全面的に作り直した。WebAudio合成・外部の音声ファイルは使わない）。
+ *
+ * それまでは「矩形波1本＋短いノイズ」で鳴らしていたので、どの音も軽く気の抜けた音だった
+ * （テストプレイ「SEがしょぼい」）。いまは**実物の音の成り立ち**を重ねて作る：
+ *
+ * - **打球音**＝硬い木が割れる高域のクリック＋木の胴鳴り（数本の倍音が別々の速さで消える）
+ *   ＋低い芯の「ドン」＋球場の返り。**打球の強さ（初速）で明るさ・重さ・返りの量が変わる**
+ *   ＝芯を外した当たりは鈍く、芯で捉えた当たりは甲高く響く（手応えが耳で分かる）。
+ * - **ミット**＝革を叩く帯域のノイズ＋乾いたクリック＋低い胴。速い球ほど鋭い。
+ * - **歓声**は `crowd.ts`（場内のざわめきと、プレーに応じた沸き方）。
  *
  * 桜井ノウハウ照合（sakurai_all.txt）：
- * - ファミコンの音源構成は矩形波2・三角波1・ノイズ1・DPCM1。矩形波は旋律、
- *   三角波はベースや鈍い衝撃音、ノイズはヒット音・爆発音に使われることが多い、
- *   という言及を踏まえ、旋律的な音（ファンファーレ等）は矩形波、低く重い一撃は
- *   三角波、打撃・銃声・KOなどの衝撃音はノイズバッファで表現する。
- * - 「アタック強め・残響ほどほど」（立ち上がりを速く、瞬時にピークへ）と、
- *   「ヒットストップで画面が止まっている間に主要な音は鳴り終わっているのが理想」
- *   という言及を踏まえ、すべての効果音は attack を短く（既定5ms）、余韻を
- *   ヒットストップの尺（打撃0.05〜0.11秒、銃0.3秒）に収まる長さで設計している。
- * - 「音の優先度や大きさはプレイヤーに大きく関係するものをより大きくする」
- *   （スマブラの例：撃墜音が最大、次にヒット音、その次に必殺技音…の順）に
- *   準拠し、ここでも 決着（ホームラン・KO・勝敗）を最大音量、命中
- *   （打撃・銃命中・乱闘ヒット）をその次、発射/攻撃モーションをさらにその次、
- *   空振り・ファウル・アウトは控えめ、という音量階層にした。
- * - 「名作に音が悪いものなし」という言及もあり、演出・見た目と同じく
- *   本セッションのスコープに含めた（PROGRESS.md「音響基盤ごとHUD・演出
- *   セッションで導入」の持ち越しに対応）。
+ * - 「アタック強め・残響ほどほど」「ヒットストップで画面が止まっている間に主要な音は
+ *   鳴り終わっているのが理想」＝打球音の芯は最初の0.1秒に集め、返りだけを後ろへ流す。
+ * - 「音の優先度や大きさはプレイヤーに大きく関係するものをより大きくする」＝決着
+ *   （本塁打・KO・勝敗）を最大、命中（打球・銃・乱闘の打撃）をその次、動作（スイング・
+ *   送球）をさらに下、という音量の階層は従来のまま守る。
+ * - 「名作に音が悪いものなし」。
  *
- * ブラウザの自動再生ポリシー対策：AudioContextはユーザー操作前は
- * suspended のままなので、最初のキー入力（keydown＝ユーザージェスチャー）で
- * resume する。テスト（jsdom/vitest）には AudioContext が存在しないため、
- * すべての関数は取得できない場合に何もせず戻る（no-op）。
+ * **判定には一切触らない**。鳴らすきっかけは実際のゲームイベントの発生元（main.ts）が持つ。
+ * AudioContext の無い環境（テスト）やユーザー操作の前は、どの関数も何もしない。
  */
+import { type AudioGraph, audio, envelope, whiteNoiseBuffer } from './engine';
+import { crowd } from './crowd';
 
-let sharedCtx: AudioContext | null = null;
-let masterGain: GainNode | null = null;
+const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
-function getCtx(): AudioContext | null {
-  if (typeof window === 'undefined') return null;
-  if (!sharedCtx) {
-    const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!Ctor) return null;
-    sharedCtx = new Ctor();
-  }
-  return sharedCtx;
-}
-
-function getMasterGain(c: AudioContext): GainNode {
-  if (!masterGain) {
-    masterGain = c.createGain();
-    masterGain.gain.value = 0.9;
-    masterGain.connect(c.destination);
-  }
-  return masterGain;
-}
-
-if (typeof window !== 'undefined') {
-  const unlock = () => {
-    getCtx()?.resume();
-    window.removeEventListener('keydown', unlock);
-  };
-  window.addEventListener('keydown', unlock);
-}
-
-interface ToneOptions {
-  /** 矩形波＝旋律向き、三角波＝低く鈍い音向き（ファミコン音源の使い分けに準拠） */
-  type?: 'square' | 'triangle';
-  /** ピーク音量（0〜1） */
-  gain?: number;
-  /** 立ち上がり秒数（アタック強め＝短いほど良い、既定5ms） */
-  attack?: number;
-  /** ピークから減衰しきるまでの秒数（既定は duration と同じ） */
-  decay?: number;
-  /** 指定すると、鳴っている間に周波数をこの値まで直線的に滑らせる（下降音でKO感等を出す） */
-  slideTo?: number;
-}
-
-/** 単発の音（矩形波/三角波）を鳴らす。 */
-function tone(freq: number, duration: number, opts: ToneOptions = {}): void {
-  const c = getCtx();
-  if (!c) return;
-  const { type = 'square', gain = 0.2, attack = 0.005, decay = duration, slideTo } = opts;
-  const osc = c.createOscillator();
-  osc.type = type;
-  const t0 = c.currentTime;
-  osc.frequency.setValueAtTime(freq, t0);
-  if (slideTo !== undefined) {
-    osc.frequency.linearRampToValueAtTime(slideTo, t0 + attack + decay);
-  }
-  const g = c.createGain();
-  g.gain.setValueAtTime(0, t0);
-  g.gain.linearRampToValueAtTime(gain, t0 + attack);
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + attack + decay);
-  osc.connect(g).connect(getMasterGain(c));
-  osc.start(t0);
-  osc.stop(t0 + attack + decay + 0.02);
-}
-
-interface NoiseOptions {
-  gain?: number;
-  /** 指定すると簡易フィルタを通す（低域寄り＝重い衝撃音、高域寄り＝軽い/鋭い音） */
-  filterFreq?: number;
-  filterType?: BiquadFilterType;
-}
-
-/** ノイズバッファ1回分の衝撃音（打撃・銃声・KOなど、ファミコンのノイズ音源相当）。 */
-function noiseBurst(duration: number, opts: NoiseOptions = {}): void {
-  const c = getCtx();
-  if (!c) return;
-  const { gain = 0.25, filterFreq, filterType = 'lowpass' } = opts;
-  const length = Math.max(1, Math.floor(c.sampleRate * duration));
-  const buffer = c.createBuffer(1, length, c.sampleRate);
-  const data = buffer.getChannelData(0);
-  for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;
-
-  const src = c.createBufferSource();
-  src.buffer = buffer;
-  const t0 = c.currentTime;
-  const g = c.createGain();
-  g.gain.setValueAtTime(gain, t0); // アタック強め：ノイズは最初から全開にする
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
-
-  let node: AudioNode = src;
-  if (filterFreq) {
-    const filter = c.createBiquadFilter();
-    filter.type = filterType;
-    filter.frequency.value = filterFreq;
-    node = node.connect(filter);
-  }
-  node.connect(g).connect(getMasterGain(c));
-  src.start(t0);
-  src.stop(t0 + duration + 0.02);
-}
-
-interface Note {
-  freq: number;
+interface NoiseOpts {
+  at?: number;
   dur: number;
-  /** 再生開始までの遅延秒数 */
-  delay: number;
-  type?: 'square' | 'triangle';
-  gain?: number;
+  gain: number;
+  type?: BiquadFilterType;
+  freq?: number;
+  q?: number;
+  /** 鳴っている間にフィルタの周波数をここまで動かす（風切り音の「ヒュッ」） */
+  freqEnd?: number;
+  attack?: number;
+  /** 残響へ送る量（0..1） */
+  send?: number;
+  pan?: number;
 }
 
-/** ファンファーレ等、複数の音を時間差で鳴らす（setTimeoutでスケジュール。UI演出用途で十分な精度）。 */
-function sequence(notes: readonly Note[]): void {
-  if (!getCtx()) return;
-  for (const n of notes) {
-    setTimeout(() => tone(n.freq, n.dur, { type: n.type, gain: n.gain }), n.delay * 1000);
+/** 帯域を絞ったノイズの一発 */
+function noise(g: AudioGraph, o: NoiseOpts): void {
+  const { ctx } = g;
+  const t = o.at ?? ctx.currentTime;
+  const src = ctx.createBufferSource();
+  src.buffer = whiteNoiseBuffer(ctx);
+  const filter = ctx.createBiquadFilter();
+  filter.type = o.type ?? 'bandpass';
+  filter.frequency.setValueAtTime(o.freq ?? 1000, t);
+  if (o.freqEnd !== undefined) {
+    filter.frequency.exponentialRampToValueAtTime(Math.max(20, o.freqEnd), t + o.dur);
+  }
+  filter.Q.value = o.q ?? 0.8;
+  const amp = ctx.createGain();
+  envelope(amp.gain, t, o.gain, o.attack ?? 0.002, o.dur);
+  src.connect(filter).connect(amp);
+  route(g, amp, o.send ?? 0, o.pan ?? 0);
+  // バッファの頭を毎回ずらす（同じ波形の繰り返しが耳に付かないように）
+  src.start(t, Math.random() * 1.5, o.dur + 0.1);
+}
+
+interface ToneOpts {
+  at?: number;
+  type?: OscillatorType;
+  freq: number;
+  freqEnd?: number;
+  dur: number;
+  gain: number;
+  attack?: number;
+  send?: number;
+  pan?: number;
+}
+
+/** 音程のある一発（胴鳴りの倍音・低い芯・ゴング） */
+function tone(g: AudioGraph, o: ToneOpts): void {
+  const { ctx } = g;
+  const t = o.at ?? ctx.currentTime;
+  const osc = ctx.createOscillator();
+  osc.type = o.type ?? 'sine';
+  osc.frequency.setValueAtTime(o.freq, t);
+  if (o.freqEnd !== undefined) {
+    osc.frequency.exponentialRampToValueAtTime(Math.max(20, o.freqEnd), t + o.dur);
+  }
+  const amp = ctx.createGain();
+  envelope(amp.gain, t, o.gain, o.attack ?? 0.002, o.dur);
+  osc.connect(amp);
+  route(g, amp, o.send ?? 0, o.pan ?? 0);
+  osc.start(t);
+  osc.stop(t + o.dur + (o.attack ?? 0.002) + 0.05);
+}
+
+/** 効果音のバスへ（＋残響へ送る・左右に振る） */
+function route(g: AudioGraph, node: AudioNode, send: number, pan: number): void {
+  let out: AudioNode = node;
+  if (pan !== 0) {
+    const p = g.ctx.createStereoPanner();
+    p.pan.value = pan;
+    out = node.connect(p);
+  }
+  out.connect(g.sfx);
+  if (send > 0) {
+    const s = g.ctx.createGain();
+    s.gain.value = send;
+    out.connect(s).connect(g.reverbSend);
   }
 }
 
-// ---- 効果音カタログ ----
+/** ゴング（乱闘の開始・決着）。金属の非整数倍の倍音がゆっくり消える */
+function bell(g: AudioGraph, at: number, base: number, gain: number): void {
+  const partials: [number, number, number][] = [
+    [1, 1.0, 1.6],
+    [2.76, 0.55, 1.0],
+    [5.4, 0.3, 0.55],
+    [8.93, 0.16, 0.3],
+  ];
+  for (const [ratio, level, decay] of partials) {
+    tone(g, { at, freq: base * ratio, dur: decay, gain: gain * level, send: 0.35 });
+  }
+  noise(g, { at, dur: 0.02, gain: gain * 0.6, type: 'highpass', freq: 3000 });
+}
 
 export const sfx = {
-  /** 空振り（バットが空を切る音）。優先度は低め（桜井：空振りは目立たせすぎない帯） */
+  // ---- 投打 ----
+
+  /** スイングの風切り（振り出した瞬間。人間もCPUも同じ音） */
+  swing(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.2, gain: 0.32, type: 'bandpass', freq: 420, freqEnd: 1900, q: 1.2, attack: 0.05 });
+    noise(g, { dur: 0.16, gain: 0.12, type: 'highpass', freq: 2600, attack: 0.06 });
+  },
+
+  /** 空振り・蹴りの空振り（風切りだけ。スイングの音と同じ系統で短い） */
   swingMiss(): void {
-    noiseBurst(0.08, { gain: 0.12, filterFreq: 3000, filterType: 'highpass' });
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.16, gain: 0.26, type: 'bandpass', freq: 520, freqEnd: 1700, q: 1.3, attack: 0.03 });
   },
 
-  /** バット接触音。打球初速(m/s)に比例して強く・高くする（強い当たりほど重い手応え） */
+  /**
+   * 打球音。**初速（m/s）で音の性格が変わる**：芯で捉えた強い当たりは甲高く長く響き
+   * （カーン）、芯を外した弱い当たりは鈍く短い（ゴツッ）。バントもこの音の弱い端。
+   */
   hit(exitSpeed: number): void {
-    const power = Math.min(1, exitSpeed / 45);
-    noiseBurst(0.05, { gain: 0.2 + 0.15 * power, filterFreq: 1200 + 800 * power, filterType: 'bandpass' });
-    tone(180 + 220 * power, 0.09, { type: 'triangle', gain: 0.18 + 0.12 * power });
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    const p = clamp01((exitSpeed - 18) / 28);
+    const level = 0.45 + 0.55 * p;
+    // 1. 硬い木が割れる瞬間のクリック
+    noise(g, { at: t, dur: 0.014, gain: 0.95 * level, type: 'highpass', freq: 2400 + 1600 * p, q: 0.7 });
+    // 2. 木の胴鳴り（倍音ごとに消える速さが違う＝「カーン」の尾）
+    const body = 760 + 260 * p;
+    tone(g, { at: t, freq: body, freqEnd: body * 0.97, dur: 0.07 + 0.16 * p, gain: 0.34 * level, send: 0.25 + 0.4 * p });
+    tone(g, { at: t, freq: body * 2.13, freqEnd: body * 2.1, dur: 0.05 + 0.1 * p, gain: 0.2 * level, send: 0.2 });
+    tone(g, { at: t, freq: body * 3.55, dur: 0.03 + 0.05 * p, gain: 0.11 * level });
+    // 3. 低い芯（手に来る重さ）。弱い当たりほど相対的に濁る
+    tone(g, { at: t, freq: 170 - 40 * p, freqEnd: 70, dur: 0.09, gain: 0.42 * (0.5 + 0.5 * p) });
+    noise(g, { at: t, dur: 0.05, gain: 0.35 * (1 - 0.5 * p), type: 'lowpass', freq: 900 });
+    // 4. 強い当たりは場内がどよめく
+    crowd.react('ooh', 0.2 + 0.6 * p * p);
   },
 
-  /** ファウル（打球音より控えめな軽い音） */
+  /** ミット（捕手が投球を受けた）。速い球ほど鋭い「バシッ」 */
+  mitt(pitchSpeed = 36): void {
+    const g = audio();
+    if (!g) return;
+    const p = clamp01((pitchSpeed - 28) / 16);
+    noise(g, { dur: 0.045, gain: 0.55 + 0.35 * p, type: 'bandpass', freq: 1300 + 700 * p, q: 0.9, send: 0.18 });
+    noise(g, { dur: 0.012, gain: 0.25 + 0.35 * p, type: 'highpass', freq: 3600 });
+    tone(g, { freq: 230, freqEnd: 110, dur: 0.06, gain: 0.38 });
+  },
+
+  /** 野手の捕球（グラブ）。ミットより柔らかい「パスッ」 */
+  catchBall(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.04, gain: 0.34, type: 'bandpass', freq: 1150, q: 1.0, send: 0.1 });
+    tone(g, { freq: 200, freqEnd: 120, dur: 0.05, gain: 0.22 });
+  },
+
+  /** 送球（投げた瞬間の短い風切り） */
+  throwBall(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.13, gain: 0.2, type: 'bandpass', freq: 800, freqEnd: 1900, q: 1.4, attack: 0.02 });
+  },
+
+  /** 投球のリリース（ごく小さい風切り。速い球ほど鋭い） */
+  pitchRelease(pitchSpeed = 36): void {
+    const g = audio();
+    if (!g) return;
+    const p = clamp01((pitchSpeed - 28) / 16);
+    noise(g, { dur: 0.12, gain: 0.1 + 0.08 * p, type: 'bandpass', freq: 900 + 700 * p, freqEnd: 2200, q: 1.5, attack: 0.02 });
+  },
+
+  /** ファウル（打球音はもう鳴っている。場内の「あー」だけ） */
   foul(): void {
-    noiseBurst(0.06, { gain: 0.12, filterFreq: 900, filterType: 'bandpass' });
+    crowd.react('groan', 0.25);
   },
 
-  /** 通常の死球（銃ではない）。鈍い衝撃音 */
+  /** 死球（体に当たる鈍い音＋場内のどよめき） */
   hitByPitch(): void {
-    tone(140, 0.14, { type: 'triangle', gain: 0.22 });
-    noiseBurst(0.05, { gain: 0.15, filterFreq: 500, filterType: 'lowpass' });
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: 105, freqEnd: 55, dur: 0.16, gain: 0.55 });
+    noise(g, { dur: 0.1, gain: 0.45, type: 'lowpass', freq: 600, send: 0.12 });
+    crowd.react('gasp', 0.6);
   },
 
-  /** アウト成立（フライアウト/フォースアウト等）。演出は控えめな下降音 */
+  /** アウト（締まった「ドッ」＋場内の反応） */
   out(): void {
-    tone(220, 0.08, { type: 'square', gain: 0.12, slideTo: 160 });
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: 120, freqEnd: 62, dur: 0.12, gain: 0.34 });
+    noise(g, { dur: 0.06, gain: 0.22, type: 'lowpass', freq: 700 });
+    crowd.react('groan', 0.35);
   },
 
-  /** 安打（単打〜三塁打共通の着弾音）。塁打の大小はHUDバナー側で演出を分ける */
+  /** 安打・セーフ（場内が沸く） */
   base(): void {
-    sequence([
-      { freq: 523.25, dur: 0.08, delay: 0, gain: 0.18 },
-      { freq: 659.25, dur: 0.12, delay: 0.07, gain: 0.18 },
-    ]);
+    crowd.react('cheer', 0.6);
   },
 
-  /** 三振 */
+  /** 三振（ミットの音は判定の瞬間に鳴っている。場内の「おおー」） */
   strikeout(): void {
-    sequence([
-      { freq: 392.0, dur: 0.1, delay: 0, gain: 0.16 },
-      { freq: 293.66, dur: 0.18, delay: 0.09, gain: 0.16 },
-    ]);
+    crowd.react('ooh', 0.5);
   },
 
-  /** 四死球（穏やかなブザー音） */
+  /** 四球（場内のざわめきが少し上がる） */
   walk(): void {
-    tone(330, 0.16, { type: 'square', gain: 0.14 });
+    crowd.react('murmur', 0.45);
   },
 
-  /**
-   * ホームラン。桜井ノウハウ「決着イベントは最大音量」に準拠し、低域の一撃＋
-   * ノイズの着弾に、上昇アルペジオのファンファーレを重ねる。
-   */
+  /** 本塁打（場内が総立ちで沸く。ファンファーレは BGM の側＝`music.jingle`） */
   homerun(): void {
-    noiseBurst(0.12, { gain: 0.3, filterFreq: 800, filterType: 'lowpass' });
-    tone(140, 0.16, { type: 'triangle', gain: 0.3 });
-    sequence([
-      { freq: 523.25, dur: 0.12, delay: 0.05, gain: 0.22 },
-      { freq: 659.25, dur: 0.12, delay: 0.17, gain: 0.22 },
-      { freq: 783.99, dur: 0.12, delay: 0.29, gain: 0.22 },
-      { freq: 1046.5, dur: 0.35, delay: 0.41, gain: 0.26 },
-    ]);
+    crowd.react('roar', 1);
   },
 
-  /**
-   * CPU投手が銃を構えた予兆（フェーズF-26-2）。**発射音より前に、はっきり別の音**で
-   * 鳴らす：予兆は「これから避けられない一撃が来る」ことだけを伝える合図なので、
-   * 発射（gunShot）と聞き分けられないと予兆の役目を果たさない。
-   * 撃鉄を起こす硬い音＋不安を煽る上昇で、シリアス演出のトーンに合わせる。
-   */
+  // ---- 銃（シリアス演出） ----
+
+  /** CPU投手が銃を構えた予兆。撃鉄を起こす金属音＋張り詰めた低音（発射音とはっきり別の音） */
   gunAim(): void {
-    noiseBurst(0.04, { gain: 0.2, filterFreq: 3500, filterType: 'highpass' });
-    tone(180, 0.5, { type: 'square', gain: 0.14, slideTo: 320 });
-  },
-
-  /**
-   * 一時効果を切った（フェーズM-33）。**押した瞬間の手応えだけ**を返す短い上昇音で、
-   * 効果そのものはHUDの数字と行で見せる（⑧のトーン「ゲーム側は一切ツッコまない」＝
-   * 大仰なファンファーレは鳴らさない）。切った本人にも相手にも同じ音が聞こえる＝
-   * **相手が切ったことは隠さない**（意思決定材料は隠さない）。
-   */
-  skillActivate(): void {
-    tone(440, 0.18, { type: 'square', gain: 0.12, slideTo: 880 });
-  },
-
-  /** 銃の発射音（命中/外れ問わず鳴る。命中時はさらに gunHit を重ねる） */
-  gunShot(): void {
-    noiseBurst(0.09, { gain: 0.26, filterFreq: 2200, filterType: 'lowpass' });
-    tone(90, 0.1, { type: 'triangle', gain: 0.2 });
-  },
-
-  /** 銃命中（シリアス演出。発射音の上に低く重い一撃を追加する） */
-  gunHit(): void {
-    tone(70, 0.28, { type: 'triangle', gain: 0.32, slideTo: 40 });
-  },
-
-  /** 乱闘：攻撃モーション（ヒットの有無に関わらず、繰り出した瞬間に鳴る） */
-  brawlAttack(): void {
-    noiseBurst(0.05, { gain: 0.1, filterFreq: 2500, filterType: 'highpass' });
-  },
-
-  /** 乱闘：命中。ガード時は軽減された軽い音、素通し時は重い音（ダメージの手応えに合わせる） */
-  brawlHit(guarded: boolean): void {
-    if (guarded) {
-      tone(660, 0.06, { type: 'square', gain: 0.14 });
-    } else {
-      noiseBurst(0.08, { gain: 0.24, filterFreq: 700, filterType: 'lowpass' });
-      tone(150, 0.1, { type: 'triangle', gain: 0.22 });
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    for (const [dt, f] of [
+      [0, 3400],
+      [0.11, 2600],
+    ] as const) {
+      noise(g, { at: t + dt, dur: 0.012, gain: 0.5, type: 'highpass', freq: 3500 });
+      tone(g, { at: t + dt, freq: f, dur: 0.035, gain: 0.18, type: 'triangle' });
     }
+    tone(g, { at: t + 0.15, freq: 52, freqEnd: 60, dur: 1.2, gain: 0.3, attack: 0.5, type: 'triangle' });
+    crowd.react('gasp', 0.8);
   },
 
-  /** 乱闘：開始の合図 */
+  /** 銃の発射（命中・外れを問わず鳴る。命中時は gunHit を重ねる） */
+  gunShot(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    noise(g, { at: t, dur: 0.012, gain: 1.0, type: 'highpass', freq: 1800 });
+    noise(g, { at: t, dur: 0.22, gain: 0.9, type: 'lowpass', freq: 7000, freqEnd: 700, send: 0.85 });
+    tone(g, { at: t, freq: 80, freqEnd: 34, dur: 0.3, gain: 0.85, send: 0.4 });
+  },
+
+  /** 銃の命中（重い衝撃＋場内が凍りつく） */
+  gunHit(): void {
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: 72, freqEnd: 38, dur: 0.32, gain: 0.7 });
+    noise(g, { dur: 0.16, gain: 0.45, type: 'lowpass', freq: 500, send: 0.3 });
+  },
+
+  // ---- スキル ----
+
+  /** 一時効果・スキルの発動（きらめく上昇音。押した手応えだけを返す） */
+  skillActivate(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    const notes = [1046.5, 1318.5, 1568, 2093, 2637];
+    notes.forEach((f, i) => {
+      tone(g, { at: t + i * 0.035, freq: f, dur: 0.22, gain: 0.12, send: 0.35, type: 'triangle' });
+    });
+    noise(g, { at: t, dur: 0.35, gain: 0.08, type: 'highpass', freq: 6000, attack: 0.08, send: 0.3 });
+  },
+
+  /** バイクの点火（エンジンが吹け上がる） */
+  bikeIgnite(): void {
+    const g = audio();
+    if (!g) return;
+    const { ctx } = g;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(48, t);
+    osc.frequency.exponentialRampToValueAtTime(150, t + 0.35);
+    osc.frequency.exponentialRampToValueAtTime(110, t + 0.7);
+    const shaper = ctx.createWaveShaper();
+    const curve = new Float32Array(256);
+    for (let i = 0; i < 256; i += 1) {
+      const x = (i / 255) * 2 - 1;
+      curve[i] = Math.tanh(x * 3);
+    }
+    shaper.curve = curve;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 1100;
+    const amp = ctx.createGain();
+    envelope(amp.gain, t, 0.32, 0.05, 0.75);
+    osc.connect(shaper).connect(lp).connect(amp);
+    route(g, amp, 0.1, 0);
+    osc.start(t);
+    osc.stop(t + 0.9);
+  },
+
+  // ---- 乱闘 ----
+
+  /** 乱闘：技を繰り出した（拳の風切り） */
+  brawlAttack(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.11, gain: 0.3, type: 'bandpass', freq: 600, freqEnd: 2200, q: 1.1, attack: 0.02 });
+  },
+
+  /** 乱闘：命中。ガードされたら硬い「ガッ」、素通しなら重い「ドゴッ」 */
+  brawlHit(guarded: boolean): void {
+    const g = audio();
+    if (!g) return;
+    if (guarded) {
+      noise(g, { dur: 0.05, gain: 0.45, type: 'bandpass', freq: 2200, q: 2.5, send: 0.12 });
+      tone(g, { freq: 540, freqEnd: 420, dur: 0.06, gain: 0.2, type: 'triangle' });
+      return;
+    }
+    tone(g, { freq: 135, freqEnd: 52, dur: 0.18, gain: 0.7 });
+    noise(g, { dur: 0.1, gain: 0.5, type: 'lowpass', freq: 950, send: 0.15 });
+    noise(g, { dur: 0.018, gain: 0.4, type: 'highpass', freq: 2600 });
+    crowd.react('ooh', 0.35);
+  },
+
+  /** 乱闘：開始のゴング（カーン、カーン）＋場内がどよめく */
   brawlStart(): void {
-    sequence([
-      { freq: 220, dur: 0.08, delay: 0, gain: 0.16 },
-      { freq: 220, dur: 0.08, delay: 0.1, gain: 0.16 },
-    ]);
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    bell(g, t, 880, 0.3);
+    bell(g, t + 0.32, 880, 0.3);
+    crowd.react('roar', 0.7);
   },
 
-  /** 乱闘：KO。決着イベントとして最大音量クラスに設定 */
+  /** 乱闘：KO（重い一撃＋ゴングの連打＋総立ち） */
   ko(): void {
-    noiseBurst(0.16, { gain: 0.34, filterFreq: 600, filterType: 'lowpass' });
-    tone(110, 0.32, { type: 'triangle', gain: 0.34, slideTo: 55 });
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    tone(g, { at: t, freq: 110, freqEnd: 40, dur: 0.4, gain: 0.8, send: 0.3 });
+    noise(g, { at: t, dur: 0.2, gain: 0.55, type: 'lowpass', freq: 700, send: 0.3 });
+    for (let i = 0; i < 3; i += 1) bell(g, t + 0.25 + i * 0.16, 900, 0.26);
+    crowd.react('roar', 1);
   },
 
-  /** 試合終了（勝敗確定） */
+  /** 試合終了（場内が沸く。勝敗のジングルは BGM の側） */
   win(): void {
-    sequence([
-      { freq: 523.25, dur: 0.14, delay: 0, gain: 0.22 },
-      { freq: 523.25, dur: 0.14, delay: 0.16, gain: 0.22 },
-      { freq: 783.99, dur: 0.4, delay: 0.32, gain: 0.26 },
-    ]);
+    crowd.react('cheer', 0.9);
+  },
+
+  // ---- メニュー ----
+
+  /** カーソル移動（小さく乾いた音） */
+  menuMove(): void {
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: 1650, dur: 0.035, gain: 0.08, type: 'triangle' });
+    noise(g, { dur: 0.008, gain: 0.06, type: 'highpass', freq: 5000 });
+  },
+
+  /** 決定（明るく上がる2音） */
+  menuConfirm(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    tone(g, { at: t, freq: 988, dur: 0.06, gain: 0.12, type: 'square' });
+    tone(g, { at: t + 0.06, freq: 1480, dur: 0.12, gain: 0.12, type: 'square' });
+  },
+
+  /** 戻る・取り消し（下がる2音） */
+  menuCancel(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    tone(g, { at: t, freq: 740, dur: 0.06, gain: 0.1, type: 'square' });
+    tone(g, { at: t + 0.06, freq: 494, dur: 0.1, gain: 0.1, type: 'square' });
   },
 };

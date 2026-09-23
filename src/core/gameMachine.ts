@@ -146,6 +146,18 @@ export type GameEvent =
   | { type: 'PITCH_THROWN' }
   | { type: 'PITCH_RESULT'; judgement: PitchJudgement }
   /**
+   * **デバッグモード専用**（フェーズPP-64。`src/debug/practice.ts`）＝**カウントを 0-0 に
+   * 戻すだけ**。アウト・得点・打順・イニング・塁・投球数のどれにも触らないので、
+   * **三振・四球になる球をこれに差し替えると打席が終わらない**（＝同じ場面を永遠に
+   * 繰り返して投球や打撃を確認できる）。
+   *
+   * **試合のルールではない**ので `withProgress` を通さない（通す必要が無い＝カウントは
+   * 決着に関わらない唯一の状態）。本番の経路からは一度も送られない（送るのは
+   * デバッグモードの main.ts だけ）＝この1イベントが「判定には触らない」という
+   * デバッグモードの柱そのもので、これ以外に `core` へ足したものは無い。
+   */
+  | { type: 'DEBUG_RESET_COUNT' }
+  /**
    * 敬遠（フェーズQ-38）。**投げずに打者を一塁へ歩かせる**（実際の野球の申告敬遠）。
    * `side` は宣言した側＝守備側で、攻撃側から飛んできても何も起きない
    * （`reduceIntentionalWalk`）。投球そのものが無いので `PITCH_THROWN` は伴わない
@@ -942,6 +954,10 @@ export const gameMachine = setup({
           actions: assign(({ context, event }) =>
             withProgress(reducePitchResult(context, event.judgement)),
           ),
+        },
+        // デバッグモード専用（フェーズPP-64）。カウント以外は1つも書き換えない。
+        DEBUG_RESET_COUNT: {
+          actions: assign(() => ({ count: { balls: 0, strikes: 0 } })),
         },
         // 敬遠（フェーズQ-38）。押し出しで点が入りうる（＝9回裏ならサヨナラもある）ので、
         // 四球とまったく同じく withProgress を通す。

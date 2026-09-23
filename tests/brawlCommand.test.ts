@@ -177,7 +177,7 @@ describe('commandNotation: 表示は判定と同じ数列から起こす', () =>
   });
 
   it('溜めは「ためる」ことが本体なので印を添える', () => {
-    expect(commandNotation('charge', 1)).toBe('←タメ→');
+    expect(commandNotation('charge', 1)).toBe('←溜め→');
   });
 
   it('一回転は4方向をそのまま並べる', () => {

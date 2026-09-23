@@ -17,15 +17,13 @@ import {
   BATTER_STANCE_MOVE_SPEED,
   CATCH_Z,
   NEUTRAL_RATING,
-  PITCHER_PLATE_Z,
   PLATE_Z,
   RELEASE_Z,
   RIGHT_BATTER_SIDE,
   NEUTRAL_PITCH_ARM,
   RUBBER_MOVE_SPEED,
-  SPEED_FAST_DELTA,
   SPEED_NEUTRAL,
-  SPEED_SLOW_DELTA,
+  armReleaseHeight,
   armReleaseOffsetX,
   batterStandX,
   clampRubberX,
@@ -34,6 +32,8 @@ import {
   createPitchFlight,
   judgePitch,
   neutralSpeedFor,
+  pitchFastness,
+  pitchSlowness,
   plateCrossingX,
   releaseXFor,
   speedForPitchSelection,
@@ -74,7 +74,14 @@ import {
   setPlayerFacing,
   setPlayerPose,
 } from '../entities/player';
-import { gunMuzzleOf } from '../entities/props';
+import { createProp, gunMuzzleOf } from '../entities/props';
+import {
+  DEKKAI_CAMERA_LOOK_AT,
+  DEKKAI_CAMERA_POS,
+  DEKKAI_FOV_DEG,
+  dekkaiBallLook,
+  pitchArcPath,
+} from '../core/camera';
 import type { Bases, Count } from '../core/rules';
 import { CPU_PITCH_INTERVAL_SEC, PITCH_SETTLE_SEC } from '../core/tempo';
 import type { VirtualPad } from '../input/keyboard';
@@ -87,10 +94,12 @@ import type { VirtualPad } from '../input/keyboard';
 export const DEKKAI_CAMERA_FAR = 500;
 
 export function createDekkaiCamera(aspect: number): THREE.PerspectiveCamera {
-  const camera = new THREE.PerspectiveCamera(40, aspect, 0.1, DEKKAI_CAMERA_FAR);
-  // 本塁（捕手）のやや後方・頭上から投手方向（-Z）を見る
-  camera.position.set(0, 4.5, CATCH_Z + 8);
-  camera.lookAt(0, 1.5, PITCHER_PLATE_Z);
+  const camera = new THREE.PerspectiveCamera(DEKKAI_FOV_DEG, aspect, 0.1, DEKKAI_CAMERA_FAR);
+  // 本塁（捕手）のやや後方・頭上から投手方向（-Z）を見る。**置き場所は core/camera.ts**
+  // （フェーズNN-61）＝ボールの見かけの大きさがカメラからの距離で決まるので、
+  // テストと `npm run balance:ball` が同じ値を読める場所に置いてある。
+  camera.position.set(DEKKAI_CAMERA_POS.x, DEKKAI_CAMERA_POS.y, DEKKAI_CAMERA_POS.z);
+  camera.lookAt(DEKKAI_CAMERA_LOOK_AT.x, DEKKAI_CAMERA_LOOK_AT.y, DEKKAI_CAMERA_LOOK_AT.z);
   return camera;
 }
 
@@ -102,23 +111,22 @@ const WINDUP_SEC = 0.35;
  * 球の飛行・判定はこの値を一切見ないので、長くしても投球そのものは変わらない。
  */
 const PITCH_FOLLOW_SEC = 0.3;
-const RELEASE_HEIGHT = 1.5;
-const CATCH_HEIGHT = 1.0;
 /** タブ非アクティブ復帰などで dt が跳ねたときの暴走防止 */
 const MAX_DT = 0.1;
 /**
  * 緩急を見た目で伝える視覚演出（高低はゾーン判定に無関係・原作準拠）。
- * 遅い球（＝上入力で選ぶフォーク/チェンジアップ）は本塁手前で沈む（ドロップ）、
- * 速球は進行方向に伸びる（残像相当）。実機テストプレイの指摘で、旧実装は
- * 遅い球を「山なりに上へ」浮かせており「上を押すと球が上に変化して原作と真逆」
- * だったため、フォークらしく下へ沈む表現に変更した。
+ * 遅い球（＝上入力で選ぶフォーク/チェンジアップ）は弧を描いて手元で落ち、
+ * 速球は進行方向に残像を引く。**式と値は `core/camera.ts` に集約してある**
+ * （フェーズPP-63。`pitchArcPath` / `dekkaiBallLook`）＝「球がどう見えるか」の
+ * 調整先を散らさない（NN-61の見かけの大きさ・LL-59の選手の縮尺と同じ場所）。
+ *
+ * ここに残るのは残像の向きを three へ渡すための作業用ベクトルだけ。伸ばす向きは
+ * 毎フレーム変わる（＝画面上の進行方向）ので、球のローカル+Zをその向きへ合わせてから
+ * そのローカル軸だけを伸ばす。毎フレーム new しないよう使い回す。
  */
-const FORK_DROP_MAX = 1.5;
-const FAST_STRETCH_MAX = 1.4;
+const TRAIL_FROM = new THREE.Vector3(0, 0, 1);
+const TRAIL_AXIS = new THREE.Vector3();
 
-function clamp01(v: number): number {
-  return Math.max(0, Math.min(1, v));
-}
 
 /**
  * 投球の判定に効く投手の能力値。**定義は `core/pitch.ts` にある**
@@ -286,27 +294,34 @@ export function createPitchingController(opts: {
 
   function syncBallMesh(f: PitchFlight): void {
     if (ballDetached) return;
-    const progress = (f.z - RELEASE_Z) / (CATCH_Z - RELEASE_Z);
-    // 遅い球ほどフォークらしく本塁手前で沈む（ドロップ）。q は 0（リリース）→1（本塁）で、
-    // q^2 の重みにより「終盤に向けて加速度的に落ちる」＝手元でストンと落ちる見た目にする。
-    //
     // **中心はその投手の基準速**（`neutralSpeedFor`）から取る（フェーズO-35で気づいて直した）。
     // 従来はグローバルな `SPEED_NEUTRAL` を中心にしていたので、**速球派の投手のフォークは
     // 「あまり遅くない球」として浅くしか沈まず**、軟投派の速球は伸びなかった。
-    // あわせて**速球側のクランプ漏れも直した**：SPDの高い投手の速球（最大48m/s）は
-    // `fastness` が 2.0 に達し、意図した上限（`FAST_STRETCH_MAX`）の 1.6倍まで
-    // 伸びていた（接続前からあった見た目のバグ）。
     const neutral = neutralSpeedFor(pitcherProfile?.().speed);
-    const slowness = clamp01((neutral - f.vz) / SPEED_SLOW_DELTA);
-    const q = Math.min(1, Math.max(0, (f.z - RELEASE_Z) / (PLATE_Z - RELEASE_Z)));
-    const drop = FORK_DROP_MAX * slowness * q * q;
-    const fastness = clamp01((f.vz - neutral) / SPEED_FAST_DELTA);
-    ball.scale.set(1, 1, 1 + FAST_STRETCH_MAX * fastness);
-    ball.position.set(
-      f.x,
-      RELEASE_HEIGHT + (CATCH_HEIGHT - RELEASE_HEIGHT) * progress - drop,
-      f.z,
+    // **球はその投手の腕の先から出て、ミットへ落ちる**（MM-60＋フェーズPP-63）。
+    // 弧は `core/camera.ts` の `pitchArcPath`＝**リリースの高さからミットの高さへ重力で
+    // 落ちる放物線**で、大きさは飛行時間（＝球速）だけで決まる。基準速以上の球は弧なし
+    // ＝PP-63の前と完全に同じ直線。高低はゾーン判定に無関係（説明書p19準拠）なので
+    // **ここから下はすべて見た目だけ**（NN-61が置いていた地面の下限は、弧が必ずミットの
+    // 高さで終わるので構造的に不要になった）。
+    const path = pitchArcPath(f.z, f.vz, armReleaseHeight(arm()), pitchSlowness(f.vz, neutral));
+    // **画面上の大きさの距離補正（NN-61）と残像（PP-63）を1か所で組む**。残像は画面上の
+    // 進行方向へ伸ばす（旧実装はワールドZ＝視線に沿っていたので画面にほぼ出なかった）ので、
+    // 弧の傾きから縦の速度を作って渡す＝**弧と残像が同じ1つの式から出る**。
+    const look = dekkaiBallLook(
+      { x: f.x, y: path.y, z: f.z },
+      { x: f.vx, y: path.slope * f.vz, z: f.vz },
+      pitchFastness(f.vz, neutral),
     );
+    ball.position.set(look.center.x, look.center.y, look.center.z);
+    if (look.axis) {
+      // 伸ばす向きへローカル+Zを合わせてから、その軸だけ伸ばす（球なので他の軸は等倍）
+      TRAIL_AXIS.set(look.axis.x, look.axis.y, look.axis.z);
+      ball.quaternion.setFromUnitVectors(TRAIL_FROM, TRAIL_AXIS);
+    } else {
+      ball.quaternion.identity();
+    }
+    ball.scale.set(look.scale, look.scale, look.scale * (1 + look.trail));
   }
 
   /**
@@ -568,9 +583,16 @@ export function createCpuPitcherController(
      * ＝腕の側の隅へは楽に、逆側へは狭く曲げられる。省略時は右のオーバースロー。
      */
     pitcherArm?: () => PitchArm;
+    /**
+     * この打席でファウルにされた球数（フェーズSS-67）。**粘られたら反対の隅へ散らす**
+     * ＝ファウルはカウントを動かさないので、これが無いと**まったく同じ球を投げ続ける**
+     * （判定は決定的なので同じ結果＝ファウルが永久に繰り返され、打席が終わらない）。
+     * 省略時は 0＝SS-67の前とまったく同じ配球。
+     */
+    foulsInAtBat?: () => number;
   } = {},
 ): CpuPitcherController {
-  const { pitcherProfile, pitcherControl, pitcherArm } = opts;
+  const { pitcherProfile, pitcherControl, pitcherArm, foulsInAtBat } = opts;
   let plan: CpuPitchPlan | null = null;
   /** その球の形（リリース位置・曲げ方）。plan と同時に解いて1球のあいだ使い回す */
   let shape: CpuPitchShape | null = null;
@@ -585,7 +607,12 @@ export function createCpuPitcherController(
         // 決め球（追い込んだ1球）だけは投手の持ち味で決まる（フェーズS-40）。
         // 狙いがゾーンの縁からどれだけ外れるかは制球で決まる（フェーズT-41）。
         // どちらも能力値からの導出なので、ここで別に状態を持つことはない。
-        plan = chooseCpuPitchPlan(count, cpuPitcherStyle(profile), pitcherControl?.());
+        plan = chooseCpuPitchPlan(
+          count,
+          cpuPitcherStyle(profile),
+          pitcherControl?.(),
+          foulsInAtBat?.() ?? 0,
+        );
         // 曲がりを織り込んだリリース位置をここで解く。以後この球の間は解き直さない
         // （＝球速も曲がりも「投げると決めた瞬間の能力値」で一貫する）。
         shape = planCpuPitchShape(
@@ -653,10 +680,27 @@ const SWING_TOTAL_SEC = SWING_SWEEP_SEC + SWING_RECOVER_SEC;
  * （applyStance 参照）。
  */
 const STANCE_YAW = 0.6;
-const SWING_YAW_RANGE = 2.4;
+/**
+ * スイングで体が回る角度。**フェーズRR-66で 2.4→1.6**：実機で計測したところ、
+ * **バット先端が本塁の上を通るのが t=0.067秒**なのに対し、**判定が芯と言うのは
+ * t=0.090秒**（`SWING_IDEAL_SEC`）で、**当たった瞬間に止まる画面（ヒットストップ）では
+ * バットがもう振り抜かれた後**になっていた。回る速さを落とすと通過が 0.089秒＝
+ * **判定の芯とそろう**（実測）。振り抜きそのものは腕の伸び（`applySwing`）が担う。
+ */
+const SWING_YAW_RANGE = 1.6;
 /** バントの姿勢（バットを投手方向へ出して止めた角度。振り抜かないので固定） */
 const BUNT_YAW = -0.35;
-/** バットの長さ（握りから先端まで。バットは手のノードの子＝握りが原点） */
+/**
+ * バットの長さ（握りから先端まで。バットは手のノードの子＝握りが原点）。
+ *
+ * **フェーズRR-66で 1.1→1.6**（テストプレイの「絶対バットが当たっていない場面でも
+ * 当たる」）。実機で先端の軌跡を測ると、**バットは本塁（x=0）にすら届いていなかった**
+ * （先端の最大 -0.32m）＝**ストライクゾーンの球でさえ、描かれたバットは通っていない**。
+ * 判定側の到達範囲（`BAT_REACH_OUTSIDE_X`＝打者ローカル -0.75）は**実際の野球の
+ * 手の届く範囲とほぼ同じ**で正しく、**ずれていたのは見た目のほう**だった
+ * （このゲームは判定の横寸法が実物の約2倍＝OO-62が球の大きさで確かめた比と同じ）。
+ * 1.6m は**先端が判定の限界（ワールド +0.76m）にちょうど届く**長さ（実機で計測）。
+ */
 const BAT_LENGTH = 1.1;
 /**
  * 打者の仕切り直し（フェーズE-23）：次の打者が打席へ歩いて入ってくる開始位置。
@@ -809,13 +853,18 @@ export function createBattingController(opts: {
   // バット（フェーズE-25-(c)）。**打者の手のノードの子**にするので、握りの位置・角度は
   // 姿勢（構え・スイング・バント）が決める＝腕を動かせばバットが必ず付いてくる
   // （E-25-1が残した「腕は下ろしたままバットだけ宙に浮く」の解消）。
-  // ジオメトリは握りが原点・先端が -Y（前腕の延長）になるようずらしてある。
-  const batGeometry = new THREE.BoxGeometry(0.11, BAT_LENGTH, 0.11);
-  batGeometry.translate(0, -BAT_LENGTH / 2, 0);
-  const bat = new THREE.Mesh(
-    batGeometry,
-    new THREE.MeshLambertMaterial({ color: 0xd2a24c }),
-  );
+  // 部品は Blender 製（`createProp('Bat')`。ブラッシュアップで箱から木のバットへ）。
+  // 握りが原点・先端が -Y（前腕の延長）で、**握りから先端までちょうど `BAT_LENGTH`**
+  // （判定の到達範囲は描かれたバットが覆う範囲に合わせてある＝フェーズRR-66。
+  // `assets-src/scripts/build_props.py` が同じ長さで作る）。
+  const bat = createProp('Bat');
+  // **部品の長さが判定の約束とずれていたら投げる**（Blender で作り直したときに黙って
+  // 「見えているバットと当たる範囲が違う」へ戻らないように。player.ts が関節の欠けで
+  // 投げるのと同じ扱い）
+  const batReach = -new THREE.Box3().setFromObject(bat).min.y;
+  if (Math.abs(batReach - BAT_LENGTH) > 0.02) {
+    throw new Error(`Bat の長さ ${batReach.toFixed(3)}m が BAT_LENGTH ${BAT_LENGTH}m と違う`);
+  }
 
   /**
    * 今の打席の左右。判定と見た目で必ず同じ値を使うため、フレーム先頭で一度だけ

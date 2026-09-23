@@ -297,7 +297,7 @@ describe('FighterLoadout: スキルによる装備', () => {
     }
   });
 
-  it('技名はカタカナ8文字以内（HUDの技表の幅がデータで崩れない）', () => {
+  it('技名は全角8文字以内（HUDの技表の幅がデータで崩れない）', () => {
     for (const name of Object.values(MOVE_NAME)) {
       expect(name.length).toBeLessThanOrEqual(8);
     }

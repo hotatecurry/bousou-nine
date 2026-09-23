@@ -294,14 +294,14 @@ describe('制球の補正はERAそのものへ書き戻る（HUDの防御率が�
     const before = pitcherCardText(roster);
     const after = pitcherCardText(grantSkill(roster, pitcher, 'shinenseigyo').roster);
     expect(after).not.toBe(before);
-    const eraOf = (text: string) => text.match(/ERA\s*([\d.]+)/)?.[1];
+    const eraOf = (text: string) => text.match(/防御率\s*([\d.]+)/)?.[1];
     expect(Number(eraOf(after))).toBeLessThan(Number(eraOf(before)));
   });
 
   it('制球の札を持たない投手のカードはW-44の前と同じ（平常時の表示は不変）', () => {
     const { roster, pitcher } = rosterWithStarter();
     const era = roster.players[pitcher].pitching!.era;
-    expect(pitcherCardText(roster)).toContain(`ERA${formatEra(era)}`);
+    expect(pitcherCardText(roster)).toContain(`防御率${formatEra(era)}`);
   });
 
   it('制球の補正を持たない札はERAを動かさない（他の軸に漏れない）', () => {

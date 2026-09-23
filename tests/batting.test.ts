@@ -67,8 +67,11 @@ function worldX(localX: number, side: BatterSide = RIGHT_BATTER_SIDE): number {
   return batterFrameX(localX, side);
 }
 
-function idealContact(pitchSpeed: number, localX = 0): BattedBallLaunch {
-  const launch = judgeSwing({ crossX: worldX(localX), swingTime: SWING_IDEAL_SEC, pitchSpeed });
+function idealContact(pitchSpeed: number, localX = 0, power = 0): BattedBallLaunch {
+  const launch = judgeSwing(
+    { crossX: worldX(localX), swingTime: SWING_IDEAL_SEC, pitchSpeed },
+    { power, average: 0 },
+  );
   if (!launch) throw new Error('接触しなかった');
   return launch;
 }
@@ -85,6 +88,7 @@ function simulate(initial: BattedBall, park: Ballpark = DEFAULT_BALLPARK): Batte
 /** 既定の球場（ところざわ）の中堅フェンスまでの距離。フェンス際のテストの基準にする */
 const CENTER_FENCE = fenceAt(DEFAULT_BALLPARK, 0).distance;
 const KASENJIKI = ballparkById('kasenjiki');
+const DAISOUGEN = ballparkById('daisougen');
 
 /** 最初の着地まで打球を飛ばす */
 function flyUntilLanding(initial: BattedBall): BattedBall {
@@ -156,10 +160,12 @@ describe('judgeSwing（タイミング判定）', () => {
 
   it('タイミングがずれるほど初速が落ちる', () => {
     const ideal = launchSpeed(idealContact(SPEED_NEUTRAL));
+    // ずれは**有効窓に対する割合**で書く（|timing| = 0.5）＝窓の広さ
+    // （`SWING_ACTIVE_SEC`）を触っても「ずれたら弱くなる」という意図だけが残る
     const off = launchSpeed(
       judgeSwing({
         crossX: 0,
-        swingTime: SWING_IDEAL_SEC + 0.05,
+        swingTime: SWING_IDEAL_SEC + SWING_ACTIVE_SEC / 4,
         pitchSpeed: SPEED_NEUTRAL,
       })!,
     );
@@ -344,19 +350,26 @@ describe('isFairPosition', () => {
 
 describe('打撃の統合挙動（スイング→打球→落下）', () => {
   /**
-   * フェーズC-14以降、この当たり（能力値なしの打者が速球をジャストミート）は
-   * **球場によって帰結が変わる**：狭いかせんじき（中堅110m）なら越え、最も平均的な
-   * ところざわ（同120m）では中堅フェンスの手前で失速して直撃になる。
-   * 球場を選ぶことがそのままHRの出やすさの選択になっている、ということの確認。
+   * フェーズC-14以降、この当たりは**球場によって帰結が変わる**（狭いかせんじき＝中堅110m
+   * なら越え、平均的なところざわ＝同120mでは失速する）。
+   *
+   * **フェーズRR-66から、同じくらい「打者によって」変わる**：長打力の幅を6→10m/sへ広げ、
+   * 抗力を上げたので、**長打力0（名鑑の下限より下）は芯で捉えてもどの球場も越えない**。
+   * そのため、球場の差を見るこの2つは**中距離打者（長打力0.5）**で測る。
    */
-  it('速球をジャストミートで芯に当てると、狭い球場なら本塁打になる', () => {
-    const state = simulate(createBattedBall(idealContact(SPEED_FAST), 0), KASENJIKI);
+  it('速球をジャストミートで芯に当てると、中距離打者なら本塁打になる', () => {
+    const state = simulate(createBattedBall(idealContact(SPEED_FAST, 0, 0.5), 0), KASENJIKI);
     expect(state.over).toBe('fly');
     expect(isFairPosition(state.x, state.z)).toBe(true);
   });
 
-  it('同じ当たりでも平均的な球場（ところざわ）ではフェンスを越えない', () => {
-    const state = simulate(createBattedBall(idealContact(SPEED_FAST), 0));
+  it('同じ当たりでも非力な打者（長打力0）はフェンスを越えない（RR-66）', () => {
+    const state = simulate(createBattedBall(idealContact(SPEED_FAST), 0), KASENJIKI);
+    expect(state.over).toBeNull();
+  });
+
+  it('同じ当たりでもとてつもなく広い球場（だいそうげん）では越えない', () => {
+    const state = simulate(createBattedBall(idealContact(SPEED_FAST, 0, 0.5), 0), DAISOUGEN);
     expect(state.over).toBeNull();
   });
 
@@ -391,11 +404,15 @@ describe('打撃の統合挙動（スイング→打球→落下）', () => {
       const next = stepPitchFlight(flight, 0, DT);
       const cross = contactPlaneCrossing(flight, next);
       if (cross) {
-        const launch = judgeSwing({
-          crossX: cross.x,
-          swingTime: SWING_IDEAL_SEC,
-          pitchSpeed: flight.vz,
-        });
+        const launch = judgeSwing(
+          {
+            crossX: cross.x,
+            swingTime: SWING_IDEAL_SEC,
+            pitchSpeed: flight.vz,
+          },
+          // RR-66：長打力0の打者は芯で捉えてもどの球場も越えない＝ここは中距離打者で見る
+          { power: 0.5, average: 0 },
+        );
         expect(launch).not.toBeNull();
         const state = simulate(createBattedBall(launch!, cross.x), KASENJIKI);
         expect(state.over).toBe('fly');
@@ -510,7 +527,10 @@ describe('judgeSwing（打者の能力値：フェーズB-8）', () => {
         KASENJIKI,
       );
     expect(hit(0).over).toBeNull(); // 9番打者クラス（power 0.15）は越えない
-    expect(hit(0.5).over).toBe('fly'); // 中距離打者以上は越える
+    // RR-66で長打力の幅が6→10m/sへ広がり、抗力も上がった＝**境目が上がった**
+    // （かせんじき・基準速では 0.5 では越えず、0.75 から越える）。
+    expect(hit(0.5).over).toBeNull();
+    expect(hit(0.75).over).toBe('fly'); // 長打力のある打者は越える
     expect(hit(0.95).over).toBe('fly'); // 4番（power 0.95）
   });
 

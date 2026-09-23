@@ -438,8 +438,11 @@ const AVG_COLUMN_WIDTH = 4;
 /** 本塁打数の欄の幅（`28`／`3`） */
 const HR_COLUMN_WIDTH = 2;
 
-/** 打者の能力値の列の見出し（値のセルとまったく同じ幅で持つ＝見出しと値が縦に揃う） */
-export const BATTER_STAT_HEADERS = ['AV  ', 'HR', 'ソウリョク'] as const;
+/**
+ * 打者の能力値の列の見出し（値のセルとまったく同じ幅で持つ＝見出しと値が縦に揃う）。
+ * 打率＝`.312`（半角4）・本（本塁打数）＝`28`（半角2）・走力＝バー10目盛りぶん（全角5）。
+ */
+export const BATTER_STAT_HEADERS = ['打率', '本', '走力　　　'] as const;
 
 /**
  * 打者1人ぶんの能力値のセル（打率・本塁打数・走力）。**スキルと好調は呼び出し側が
@@ -458,7 +461,8 @@ export function batterStatCells(stats: BatterStats): string[] {
  * 揃えておかないと**投手の行だけ走力のバーが横にずれる**（比べるための表示にならない）。
  */
 export function eraStatCell(era: number): string {
-  return `ERA${formatEra(era)}`.padEnd(AVG_COLUMN_WIDTH + 1 + HR_COLUMN_WIDTH);
+  // 「防」＝防御率（全角1文字＝半角2つぶん）。打率＋本の2列ぶん（半角7）に収める
+  return `防${formatEra(era)}`.padEnd(AVG_COLUMN_WIDTH + HR_COLUMN_WIDTH);
 }
 
 /**
@@ -1521,6 +1525,39 @@ export function recordGunShot(roster: TeamRoster): TeamRoster {
       [pitcher]: gunShotsOf(roster, pitcher) + 1,
     },
   };
+}
+
+/**
+ * 守備位置の表示名（ブラッシュアップ：文字）。**内部の記号（CF・SS…）はデータと判定の約束の
+ * まま**で、画面に出すときだけ日本語にする。カードは2文字（中堅）、表は1文字（中）。
+ */
+export const POSITION_LABEL: Record<FieldingPosition, string> = {
+  P: '投手',
+  C: '捕手',
+  '1B': '一塁',
+  '2B': '二塁',
+  '3B': '三塁',
+  SS: '遊撃',
+  LF: '左翼',
+  CF: '中堅',
+  RF: '右翼',
+};
+
+/** 表の列に入れる1文字の守備位置（全角1文字＝半角の `CF` と同じ幅） */
+export const POSITION_SHORT: Record<FieldingPosition, string> = {
+  P: '投',
+  C: '捕',
+  '1B': '一',
+  '2B': '二',
+  '3B': '三',
+  SS: '遊',
+  LF: '左',
+  CF: '中',
+  RF: '右',
+};
+
+export function positionLabel(position: FieldingPosition): string {
+  return POSITION_LABEL[position];
 }
 
 /** その選手が守っている位置（守備についていない＝代打で入ったばかりの選手なら null） */

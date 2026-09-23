@@ -47,9 +47,11 @@ import {
   type PitchCall,
   batterStandX,
   LEFT_BATTER_SIDE,
+  NEUTRAL_PITCH_ARM,
   NEUTRAL_RATING,
   RIGHT_BATTER_SIDE,
   batterFrameX,
+  judgePitch,
   fatiguedBreak,
   fatiguedControl,
   fatiguedSpeed,
@@ -75,6 +77,7 @@ import {
   effectivePlay,
   fatigueOf,
   fielderThrowArm,
+  positionLabel,
   gunRemainingOf,
   isHot,
   isPitcherAtBat,
@@ -112,7 +115,7 @@ import {
   withNextGame,
 } from './core/run';
 import { isLuckyInning } from './core/condition';
-import { type EdgeMarker, edgeMarker } from './core/camera';
+import { type EdgeMarker, dekkaiBallScale, edgeMarker } from './core/camera';
 import {
   type AtBatMarker,
   type InterludeKind,
@@ -131,6 +134,7 @@ import {
   MAX_LEAD,
   STEAL_LEAD,
   baseFromPadDirection,
+  canTakeLeadOff,
   chooseCpuSteals,
   cpuStealDefenseSlack,
   resolveCarriedLeads,
@@ -149,6 +153,9 @@ import {
 import { chooseCpuRelief, shouldCpuIntentionalWalk, shouldCpuShoot } from './core/cpuPitcher';
 import { batterAimX } from './core/gun';
 import { sfx } from './audio/sfx';
+import { music } from './audio/music';
+import { crowd } from './audio/crowd';
+import { audioSettings, setAudioSettings } from './audio/engine';
 import {
   type VirtualPad,
   PLAYER1_KEYS,
@@ -158,6 +165,16 @@ import {
   createRolePad,
 } from './input/keyboard';
 import { type MatchSelection, runRosterPlanSelect, runTeamSelect } from './ui/teamSelect';
+import {
+  type KnockSetup,
+  type PracticeMode,
+  INITIAL_KNOCK,
+  KNOCK_RUNNER_PATTERNS,
+  PRACTICE_KEYS,
+  cycleKnock,
+  knockLaunch,
+  practiceHudLines,
+} from './debug/practice';
 import {
   type IntentionalWalkTarget,
   type PinchRunTarget,
@@ -186,6 +203,7 @@ import {
   createBrawlFighters,
 } from './scenes/brawlScene';
 import {
+  attachGlove,
   createPlayer,
   preloadPlayerModel,
   setPlayerColor,
@@ -197,21 +215,37 @@ import { preloadStadiumModel } from './entities/stadium';
 import { createBall } from './entities/ball';
 import { createReticle } from './entities/reticle';
 import { type PlayPromptLine, createHud } from './ui/hud/hud';
+import { preloadPixelFont } from './ui/hud/pixelText';
+// ドットフォント（DotGothic16・SIL OFL 1.1）。日本語は使う字のぶんだけ小分けで読み込まれる
+import '@fontsource/dotgothic16/400.css';
+import { setOutlineViewport } from './render/toon';
+import { setTextureAnisotropy } from './render/textures';
+import { createLightRig, groundFocusOf } from './render/lighting';
 
 // ---- Three.js セットアップ（単一Scene） ----
 
 const app = document.getElementById('app')!;
-const renderer = new THREE.WebGLRenderer({ antialias: false });
+// 描画の質（ブラッシュアップ：グラフィック）。**アンチエイリアスを入れ、高DPIの画面では
+// 実際の画素数で描く**（それまでは antialias:false・等倍で、縁がギザギザにかくついていた）。
+// 画素比は2で頭打ち＝4Kの画面で4倍の画素を塗って重くならないように。
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+const pixelRatio = (): number => Math.min(window.devicePixelRatio || 1, 2);
+renderer.setPixelRatio(pixelRatio());
 renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+setOutlineViewport(window.innerWidth, window.innerHeight, pixelRatio());
+// 地面の模様（芝の刈り目）は浅い角度で見るので、異方性フィルタを上限まで効かせる
+setTextureAnisotropy(renderer.capabilities.getMaxAnisotropy());
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
+(window as unknown as { __ftScene: THREE.Scene }).__ftScene = scene; // DEBUG TEMP
 scene.background = new THREE.Color(0x101820);
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-const sun = new THREE.DirectionalLight(0xffffff, 1.2);
-sun.position.set(30, 60, 20);
-scene.add(sun);
+// 光源は太陽＋空の照り返しの2つだけ（トゥーンの階調は太陽の向きで段が決まる）。
+// 影はモードごとに「いま映っている場所の周り」へ寄せる（`renderFrame`）。
+const lightRig = createLightRig(scene);
 
 /**
  * この試合の球場（フェーズC-14）。**チーム選択（runTeamSelect）で決まるまで確定しない**
@@ -272,6 +306,9 @@ await preloadStadiumModel();
 // スキルの持ち物（フェーズE-25-(e)。バイク・銃）。走者・投手に持たせるのはこの直後なので、
 // 人型と同じく**作るより前に**読み込む。
 await preloadProps();
+// 文字（ブラッシュアップ）。英数・かなを先に読み込んでおく＝最初の画面から代わりの字で
+// 描かれることがない（漢字は使うぶんだけ後から読み込まれ、HUDは読み込み後に描き直す）
+await preloadPixelFont();
 
 const pitcher = createPlayer(PITCHER_COLOR);
 pitcher.position.copy(FIELD_POSITIONS.mound);
@@ -294,6 +331,13 @@ setPlayerFacing(catcher, Math.PI);
 // 起動時に一度書くだけでよい（投手・打者と違い、捕手の見た目は状態を持たない）。
 setPlayerPose(catcher, { kind: 'crouch' });
 scene.add(catcher);
+
+// グラブとミット（ブラッシュアップ：グラフィック）。**投げない側の手**に持たせる。
+// 捕手は右投げの既定のまま動かない。投手は継投で左右が入れ替わるので、状態が変わる
+// たびに持ち替える（`refresh`）。
+const pitcherGlove = createProp('Glove');
+attachGlove(pitcher, pitcherGlove, NEUTRAL_PITCH_ARM.side);
+attachGlove(catcher, createProp('Mitt'), NEUTRAL_PITCH_ARM.side);
 
 const ball = createBall();
 scene.add(ball);
@@ -334,12 +378,38 @@ const brawlCamera = createBrawlCamera(aspect());
 let activeCamera: THREE.PerspectiveCamera = dekkaiCamera;
 
 window.addEventListener('resize', () => {
+  renderer.setPixelRatio(pixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
+  setOutlineViewport(window.innerWidth, window.innerHeight, pixelRatio());
   for (const cam of [dekkaiCamera, chicchaiCamera, brawlCamera]) {
     cam.aspect = aspect();
     cam.updateProjectionMatrix();
   }
 });
+
+/** 影を寄せる注視点（毎フレーム書き直す作業用） */
+const shadowFocus = new THREE.Vector3();
+/** 乱闘の舞台の中心（`brawlScene.ts` の STAGE_Z と同じ場所をカメラから導く） */
+const brawlStageFocus = new THREE.Vector3();
+
+/**
+ * 1フレームを描く。**描画はすべてここを通す**＝影の範囲（いま映っているモードの
+ * 注視点の周り）を毎フレーム合わせてから描く。モードの判定は `activeCamera` から行う
+ * （どのカメラで描くかが決まれば、影を落とす場所も決まる）。
+ */
+function renderFrame(): void {
+  if (activeCamera === chicchaiCamera) {
+    lightRig.update('chicchai', groundFocusOf(chicchaiCamera, shadowFocus));
+  } else if (activeCamera === brawlCamera) {
+    brawlCamera.getWorldPosition(brawlStageFocus);
+    brawlStageFocus.z += 6.5;
+    brawlStageFocus.y = 0;
+    lightRig.update('brawl', brawlStageFocus);
+  } else {
+    lightRig.update('dekkai', shadowFocus.set(0, 0, -8));
+  }
+  renderer.render(scene, activeCamera);
+}
 
 // ---- ステートマシン起動 ----
 //
@@ -378,6 +448,8 @@ function refresh(): void {
   // （実機テストプレイで、鳥瞰視点にこれらが写り込み守備対象と紛らわしいと判明した
   // ため非表示にする。詳細はPROGRESS.md「実装メモ」）。
   const showDekkaiActors = mode !== 'chicchai' && mode !== 'brawl';
+  // 投手のグラブは投げない側の手（継投で右投げ・左投げが入れ替わる）
+  attachGlove(pitcher, pitcherGlove, currentPitchArm().side);
   pitcher.visible = showDekkaiActors;
   batter.visible = showDekkaiActors;
   catcher.visible = showDekkaiActors;
@@ -398,6 +470,76 @@ function refresh(): void {
     run ? runProgress(run) : undefined,
     resolveCarriedLeads(game.baseRunners, carriedLeads),
   );
+  syncMusic();
+}
+
+/**
+ * 場面から流す曲を決める（ブラッシュアップ：BGM）。**状態が変わるたびに呼ぶ**（同じ曲なら
+ * 何もしない＝`music.play` の側が重ねない）。
+ *
+ * - 抽選画面・試合の間の画面＝抽選の曲（考える時間）
+ * - 乱闘＝乱闘の曲
+ * - **得点圏に走者がいる＝チャンスの曲**（応援歌風。攻撃側・守備側どちらにとっても
+ *   山場なので、どちらが人間でも同じ曲にする＝`hud` のカードと同じ「今の対戦」の扱い）
+ * - それ以外＝試合の曲。決着した後はループを流さない（勝敗のジングルだけ）。
+ */
+function syncMusic(): void {
+  if (!gameStarted) return;
+  if (runScreenOpen || draftOpen) {
+    music.play('draft');
+    return;
+  }
+  if (currentMode() === 'brawl') {
+    music.play('brawl');
+    return;
+  }
+  const ctx = gameActor.getSnapshot().context;
+  if (ctx.winner !== null) return;
+  music.play(ctx.bases.second || ctx.bases.third ? 'chance' : 'game');
+}
+
+/** チーム選択（タイトル）へ戻るときの音：場内のざわめきを止め、タイトルの曲にする */
+function backToTitleAudio(): void {
+  crowd.stopAmbience();
+  music.play('title');
+}
+
+/**
+ * **M キーで BGM のオン/オフ**（ブラッシュアップ）。ゲームの操作（①のキー表）とは別の
+ * 本体の設定なので、1P・2Pのどちらのキーとも重ならない M に置く。設定は窓を閉じても
+ * 覚えておく（`audio/engine.ts`）。切り替えた瞬間だけ画面の上に小さく出す。
+ */
+function installMusicToggle(): void {
+  const toast = document.createElement('div');
+  toast.style.cssText = `
+    position: fixed;
+    top: calc(12px * var(--ui-scale, 1));
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    padding: calc(4px * var(--ui-scale, 1)) calc(10px * var(--ui-scale, 1));
+    background: rgba(6, 10, 36, 0.9);
+    border: 2px solid #f4f4f4;
+    color: #ffe066;
+    font-family: 'DotGothic16', 'MS Gothic', monospace;
+    font-size: calc(16px * var(--ui-scale, 1));
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 250ms;
+  `;
+  document.body.appendChild(toast);
+  let hideTimer: ReturnType<typeof setTimeout> | null = null;
+  window.addEventListener('keydown', (e) => {
+    if (e.code !== 'KeyM' || e.repeat) return;
+    const next = !audioSettings().music;
+    setAudioSettings({ music: next });
+    toast.textContent = next ? '♪ BGM オン' : '♪ BGM オフ（Mで戻す）';
+    toast.style.opacity = '1';
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      toast.style.opacity = '0';
+    }, 1400);
+  });
 }
 
 // 試合終了は winner が確定して以降、状態変化のたびに何度も refresh() が呼ばれ続けるため
@@ -419,9 +561,14 @@ function subscribeActors(): void {
   gameActor.subscribe(() => {
     refresh();
     batting.syncStance();
-    if (gameActor.getSnapshot().context.winner !== null && !winAnnounced) {
+    const decided = gameActor.getSnapshot().context.winner;
+    if (decided !== null && !winAnnounced) {
       winAnnounced = true;
       sfx.win();
+      // 勝敗のジングル（ブラッシュアップ：BGM）。**人間が勝ったか**で曲を変える
+      // （2P PLAY は両側が人間なので必ず勝利の曲）。ループ曲はここで止める＝決着の後は静かに。
+      music.stop();
+      music.jingle(controllers[decided] !== 'cpu' ? 'win' : 'lose');
       // 決着の表示（サヨナラのバナー・スコアボード・勝者）を読み切る間を置いてから
       // ランの画面へ移る（メインループが消化する）。
       resultPauseRemaining = GAME_RESULT_PAUSE_SEC;
@@ -476,6 +623,27 @@ let run: RunState | null = null;
 let twoPlayerMatch: { away: TeamId; home: TeamId } | null = null;
 /** ランの画面（試合結果・次の相手・チーム選択）が開いている間は全アクターを止める */
 let runScreenOpen = false;
+
+// ---- デバッグモード（フェーズPP-64。詳細は `src/debug/practice.ts`） ----
+//
+// **null なら通常のプレイ**＝この3つの変数を見ている場所以外、main.ts は1つも変わっていない
+// （デバッグ用の別経路を作らず、**試合状態へ送るイベントを選ぶ**だけ＝本番と同じ帰結が出る）。
+
+/** いま走っているデバッグモード（null＝通常のプレイ） */
+let practice: PracticeMode | null = null;
+/** `pitch` モードで、CPU打者が振るか（数字キー1で切替。既定は振らない＝投球だけを見る） */
+let practiceSwing = false;
+/** `field` モードのノックの設定（方向・種類・走者） */
+let practiceKnock: KnockSetup = INITIAL_KNOCK;
+
+/** デバッグ行を書き直す（設定を触ったときと試合開始時だけ呼ぶ） */
+function syncPracticeHud(): void {
+  hud.setDebugLine(
+    practice === null
+      ? null
+      : practiceHudLines(practice, { swing: practiceSwing, knock: practiceKnock }),
+  );
+}
 
 function currentHalf(): Half {
   return gameActor.getSnapshot().context.half;
@@ -891,14 +1059,14 @@ function brawlLoadouts(): BrawlLoadouts {
  */
 function brawlHintText(): string {
   const half = currentHalf();
-  const lines = ['ラントウ!'];
+  const lines = ['乱闘！'];
   for (const side of ['batter', 'pitcher'] as const) {
     const team = side === 'batter' ? battingTeam(half) : fieldingTeam(half);
     const player = playerOfSide(controllers, team);
     if (!player) continue;
     const label = isTwoPlayer(controllers) ? `${PLAYER_LABEL[player]} ` : '';
     const keys = player === 'p2' ? { a: '[2]', b: '[1]' } : { a: 'K', b: 'J' };
-    lines.push(`${label}${keys.a}:コウゲキ ${keys.b}:ガード マエ+${keys.b}:ナゲ`);
+    lines.push(`${label}${keys.a}:攻撃 ${keys.b}:ガード 前+${keys.b}:投げ`);
     for (const hint of brawl.moveHints(side)) {
       lines.push(`${label}${hint.name} ${hint.notation}+${keys.a}`);
     }
@@ -931,6 +1099,9 @@ const cpuPitcher = createCpuPitcherController(pitcher, {
   pitcherControl: currentPitcherControl,
   // 投球腕（フェーズCC-50）＝**逆算の窓が腕のぶんずれる**。狙うコースは1つも動かない。
   pitcherArm: currentPitchArm,
+  // ファウルで粘られた球数（フェーズSS-67）＝**粘られたら反対の隅へ散らす**。
+  // これが無いと同じ球を投げ続けて打席が終わらない（`cpuFoulsInAtBat` の説明を参照）。
+  foulsInAtBat: cpuFoulsInAtBat,
 });
 
 // 投球（ファミスタ'90説明書p19準拠）：人間が投手側のときはA/Dでプレート上を移動、
@@ -973,6 +1144,34 @@ let pendingPitch: { call: PitchCall; swung: boolean } | null = null;
  * 保留し、盗塁の決着を反映した後に呼ぶ（applyPendingPitch）。
  */
 function applyPitchCall(call: PitchCall, swung: boolean): void {
+  if (practice) {
+    // デバッグモード（フェーズPP-64）＝**打席が終わる球だけ試合状態へ送らず、カウントを
+    // 0-0 に戻す**。判定そのものは本番と同じ純粋関数（`callAfterSwing`→`applyPitch`）を
+    // 通してバナーも同じように出すので、**確認したいこと（判定・演出）は1つも欠けない**。
+    if (call === 'hitByPitch') {
+      sfx.hitByPitch();
+      hud.playBanner('walk', 'デッドボール');
+      gameActor.send({ type: 'DEBUG_RESET_COUNT' });
+      return;
+    }
+    sfx.mitt();
+    const judgement = callAfterSwing(call, swung);
+    const outcome = applyPitch(gameActor.getSnapshot().context.count, judgement);
+    if (outcome.kind === 'strikeout') {
+      sfx.strikeout();
+      hud.playBanner('strikeout', '三振！');
+      gameActor.send({ type: 'DEBUG_RESET_COUNT' });
+    } else if (outcome.kind === 'walk') {
+      sfx.walk();
+      hud.playBanner('walk', 'フォアボール');
+      gameActor.send({ type: 'DEBUG_RESET_COUNT' });
+    } else {
+      if (judgement === 'ball') hud.playBanner('ball', 'ボール');
+      else hud.playBanner('strike', 'ストライク');
+      gameActor.send({ type: 'PITCH_RESULT', judgement });
+    }
+    return;
+  }
   if (call === 'hitByPitch') {
     // v1: スイング中でも死球を優先（銃システムの死球フローと同一経路）
     sfx.hitByPitch();
@@ -981,7 +1180,8 @@ function applyPitchCall(call: PitchCall, swung: boolean): void {
     modeActor.send({ type: 'DEAD_BALL' });
     return;
   }
-  if (swung) sfx.swingMiss(); // 空振り（callAfterSwingにより判定は常にstrikeになる）
+  // 捕手が受けた球（見逃し・空振り）はミットの音。空振りの風切りは振り出した瞬間に鳴っている
+  sfx.mitt();
   const judgement = callAfterSwing(call, swung);
   // applyPitch を先読みして三振/四球の演出（バナー+効果音）をここで一度だけ発火する
   // （gameMachine 内部でも同じ純粋関数で同じ判定が行われるが、副作用のない再計算なので
@@ -989,7 +1189,7 @@ function applyPitchCall(call: PitchCall, swung: boolean): void {
   const outcome = applyPitch(gameActor.getSnapshot().context.count, judgement);
   if (outcome.kind === 'strikeout') {
     sfx.strikeout();
-    hud.playBanner('strikeout', 'サンシン!');
+    hud.playBanner('strikeout', '三振！');
   } else if (outcome.kind === 'walk') {
     sfx.walk();
     hud.playBanner('walk', 'フォアボール');
@@ -1026,6 +1226,32 @@ function cpuStanceTarget(): number {
   return chooseCpuStance(lastPitch && lastPitch.batterId === batterId ? lastPitch.localX : null);
 }
 
+/**
+ * この打席でファウルにされた球数（フェーズSS-67）。**CPU投手が粘られたら
+ * 反対の隅へ散らす**ための材料で、`lastPitch` とまったく同じ「打者の識別で
+ * 突き合わせる」形にしてある（打席が替われば 0 に戻る）。
+ *
+ * ファウルは**カウントを動かさない**ので、これが無いとCPU投手は2ストライクから
+ * まったく同じ球を投げ続け、判定が決定的である以上**同じファウルが永久に繰り返される**
+ * （実測：144打席のうち5打席が40球の上限に張り付いた＝実機なら打席が終わらない）。
+ */
+let foulsThisAtBat: { batterId: string; fouls: number } | null = null;
+
+function cpuFoulsInAtBat(): number {
+  const ctx = gameActor.getSnapshot().context;
+  const batterId = currentBatterId(ctx.rosters[battingTeam(ctx.half)]);
+  return foulsThisAtBat && foulsThisAtBat.batterId === batterId ? foulsThisAtBat.fouls : 0;
+}
+
+function countFoulInAtBat(): void {
+  const ctx = gameActor.getSnapshot().context;
+  const batterId = currentBatterId(ctx.rosters[battingTeam(ctx.half)]);
+  foulsThisAtBat =
+    foulsThisAtBat && foulsThisAtBat.batterId === batterId
+      ? { batterId, fouls: foulsThisAtBat.fouls + 1 }
+      : { batterId, fouls: 1 };
+}
+
 const pitching = createPitchingController({
   pitcher,
   ball,
@@ -1049,7 +1275,10 @@ const pitching = createPitchingController({
   pitcherArm: currentPitchArm,
   // スタミナ消耗（フェーズB-11）は**リリースの瞬間に1球ずつ**記録する。判定側で数えると
   // 打たれた球（判定を経ずに打球のプレーへ移る）が抜け落ちる。
-  onRelease: () => gameActor.send({ type: 'PITCH_THROWN' }),
+  onRelease: () => {
+    sfx.pitchRelease();
+    gameActor.send({ type: 'PITCH_THROWN' });
+  },
   onJudged: (call) => {
     // 判定確定＝この球は終わり。次の球のためにCPU投手の狙いをリセットする
     // （リセットを忘れると次の ready フェーズで前の球の狙いを使い回してしまう）。
@@ -1074,7 +1303,16 @@ const pitching = createPitchingController({
     // 既存のジャストミート判定でそのまま行う（曲げ球で予測が外れれば人間同様に凡打/空振りになる）。
     // **盗塁中も同じ判断をそのまま通す**（フェーズH-28。ユーザー判断：CPUもヒットエンドランを
     // やる）＝規則は従来どおり決定的なままで、⑧の「CPUも対等」が走らせて打つ場面にも及ぶ。
-    if (!isBattingHuman() && crossesSwingDecisionPoint(prev, next)) {
+    // デバッグモード（フェーズPP-64）：`pitch` は数字キーの切替に従い、`field` は
+    // ノックで打球を作るのでCPU打者は振らない（＝投げた球が勝手にプレーへ移らない）。
+    const cpuMaySwing = practice === null ? true : practice === 'pitch' ? practiceSwing : false;
+    // 判断の時刻はカウントで変わる（フェーズSS-67）＝**追い込まれると窓の縁まで泳ぐ**
+    // ので、決め球（S-40の持ち味の球）に空振りが生まれる。
+    if (
+      cpuMaySwing &&
+      !isBattingHuman() &&
+      crossesSwingDecisionPoint(prev, next, gameActor.getSnapshot().context.count)
+    ) {
       // 打席の左右はCPU打者にも同じように効く（左打者は届く範囲がXについて鏡像）。
       // 立ち位置（フェーズO-36）も同じ＝**寄っているCPU打者は内角を見送る**（届かないので）。
       if (
@@ -1085,14 +1323,20 @@ const pitching = createPitchingController({
           currentBatterStance(),
         )
       ) {
-        batting.trySwing();
+        if (batting.trySwing()) sfx.swing();
       }
     }
     // CPU打者の立ち位置の材料（フェーズO-36）＝**この打席で直前に本塁を通過したコース**。
     // 打たれた球は打撃面（本塁より手前）で終わるのでここには来ない＝記憶に残るのは
     // 「見送った/空振りした球」だけになる。
+    // **フェーズSS-67：ストライクだった球だけを材料にする**。SS-67でCPU打者がボール球を
+    // 見送るようになった結果、それまでほぼ動かなかったこの立ち位置が毎打席動くように
+    // なり、**外れた球へ寄る→次の内角で死球**が頻発した（実測 死球 6.3%）。
+    // 打者が芯を合わせに行く先は「ストライクが来ているコース」であって、外れた球では
+    // ない＝O-36の狙い（同じコースへ続けて投げると狙われる）はそのままに、
+    // **荒れ球へ踏み込む**という副作用だけが消える。
     const crossed = plateCrossingX(prev, next);
-    if (crossed !== null) {
+    if (crossed !== null && judgePitch(crossed, currentBatterSide(), currentBatterStance()) === 'strike') {
       const ctx = gameActor.getSnapshot().context;
       lastPitch = {
         batterId: currentBatterId(ctx.rosters[battingTeam(ctx.half)]),
@@ -1110,10 +1354,10 @@ const pitching = createPitchingController({
 // （安打・本塁打）のみで、守備側主導の送球判定/フライアウトには付かない
 // （chicchaiScene.ts FieldPlayOutcome のコメント参照）。
 const HIT_BANNER: Record<HitType, { kind: 'homerun' | 'triple' | 'double' | 'single'; text: string }> = {
-  homerun: { kind: 'homerun', text: 'ホームラン!' },
-  triple: { kind: 'triple', text: 'スリーベース!' },
-  double: { kind: 'double', text: 'ツーベース!' },
-  single: { kind: 'single', text: 'ヒット!' },
+  homerun: { kind: 'homerun', text: 'ホームラン！' },
+  triple: { kind: 'triple', text: 'スリーベース！' },
+  double: { kind: 'double', text: 'ツーベース！' },
+  single: { kind: 'single', text: 'ヒット！' },
 };
 
 // 守備・走塁：操作野手の捕球/送球（fieldPlay.action、A割り当て）と
@@ -1162,7 +1406,10 @@ const fieldPlay = createFieldPlayController({
   },
   // バイクの点火（F-26-8。消費型 `ニトロ` のチャージを1つ使う）。常設の `バイク` 持ちなら
   // `useVerb` が何もしないので、シーンからは常に同じように報せてよい。
-  onBikeIgnite: (runnerId) => recordVerbUse(runnerId, 'baiku'),
+  onBikeIgnite: (runnerId) => {
+    sfx.bikeIgnite();
+    recordVerbUse(runnerId, 'baiku');
+  },
   // ヒットエンドランの窓（フェーズH-28）。**Kがスイングになる条件（onA）と同じ関数**を
   // 渡すので、画面に出るヒントと実際に効く操作が食い違わない。
   canHitAndRun: hitAndRunOpen,
@@ -1175,10 +1422,10 @@ const fieldPlay = createFieldPlayController({
   onDefenseResult: (kind) => {
     if (kind === 'out') {
       sfx.out();
-      hud.playBanner('out', 'アウト!');
+      hud.playBanner('out', 'アウト！');
     } else {
       sfx.base();
-      hud.playBanner('safe', 'セーフ!');
+      hud.playBanner('safe', 'セーフ！');
     }
   },
   // ちっちゃいモードの操作ヒント：人間が攻撃側なら走塁（説明書p19：タッチアップの
@@ -1187,6 +1434,8 @@ const fieldPlay = createFieldPlayController({
   // 確保中は塁間に走者がいる間だけランダンプレイ（説明書p25：「B+方向」）を画面に
   // 出す（既存の「意思決定材料は隠さない」方針。状況が変われば消える）。
   onPlayPrompt: (prompt) => hud.showPlayPrompt(promptLines(prompt)),
+  // 野手の捕球（グラブ）と送球（風切り）の音（ブラッシュアップ：効果音）
+  onFieldSound: (kind) => (kind === 'catch' ? sfx.catchBall() : sfx.throwBall()),
   onSettled: (outcome) => {
     const wasSteal = stealActive;
     stealActive = false;
@@ -1202,6 +1451,8 @@ const fieldPlay = createFieldPlayController({
         // 2ストライク後は三振。事実は打球（`BattedBall.bunt`）が運んでくるので、
         // ここは振り分けるだけ。
         const judgement = outcome.bunt ? 'buntFoul' : 'foul';
+        // 粘られた球数を数える（フェーズSS-67）＝次の球でCPU投手が隅を入れ替える。
+        countFoulInAtBat();
         // 判定コール（フェーズE-23）。ファウルだけは打球のプレー側で決着するので、
         // ストライク/ボールと違ってここで出す。**三振になる場合は三振のコール**に
         // 差し替える（`applyPitchCall` と同じ「純粋関数で先読みして演出を一度だけ出す」形で、
@@ -1210,7 +1461,7 @@ const fieldPlay = createFieldPlayController({
         const foulOutcome = applyPitch(beforeCtx.count, judgement);
         if (foulOutcome.kind === 'strikeout') {
           sfx.strikeout();
-          hud.playBanner('strikeout', 'バントファウル\nサンシン!');
+          hud.playBanner('strikeout', 'バントファウル\n三振！');
         } else {
           sfx.foul();
           hud.playBanner('foul', 'ファウル');
@@ -1228,6 +1479,9 @@ const fieldPlay = createFieldPlayController({
         // 耐えた走者は深いまま。これが「けん制で走者を釘付けにする／耐えて走る」という
         // 読み合いの入れ物で、真実はこの1か所（直近の走塁プレーの終了時の値）だけにある。
         carriedLeads = outcome.leads;
+        // デバッグモード（フェーズPP-64）は**結果を記録しない**＝プレーは従来どおり
+        // 走って見えるが、アウト・得点・塁の状態は元のまま（同じ場面をもう一度作れる）。
+        if (practice) break;
         gameActor.send({
           type: 'RUNNER_PLAY_RESOLVED',
           outsAdded: outcome.outsAdded,
@@ -1242,10 +1496,13 @@ const fieldPlay = createFieldPlayController({
         // その都度出しているので、ここでは二重に出さない）。
         if (outcome.hit) {
           const banner = HIT_BANNER[outcome.hit];
-          if (outcome.hit === 'homerun') sfx.homerun();
-          else sfx.base();
+          if (outcome.hit === 'homerun') {
+            sfx.homerun();
+            music.jingle('homerun');
+          } else sfx.base();
           hud.playBanner(banner.kind, banner.text);
         }
+        if (practice) break;
         gameActor.send({
           type: 'PLAY_RESOLVED',
           outsAdded: outcome.outsAdded,
@@ -1322,8 +1579,13 @@ const batting = createBattingController({
     cpuPitcher.reset();
     const exitSpeed = Math.hypot(batted.vx, batted.vy, batted.vz);
     sfx.hit(exitSpeed); // ヒットストップの尺(下記)内で鳴り切るよう短く設計済み（sfx.ts参照）
-    // 接触点でボールを止めて静止表示。カット（BATTED_BALL）は静止明けに送る
-    ball.scale.set(1, 1, 1);
+    // 接触点でボールを止めて静止表示。カット（BATTED_BALL）は静止明けに送る。
+    // ヒットストップの間もまだでっかいモードのカメラなので、**拡大率も投球中と同じ
+    // 距離補正で書く**（フェーズNN-61。素の1.0倍に戻すと、接触の瞬間だけ球が実寸＝
+    // 本塁の見かけより小さく縮んで見える）。**残像（PP-63）はここで戻す**＝打った球は
+    // もう投球ではないので伸ばさない（等倍にすれば球なので、向きは戻さなくても同じ形）。
+    const k = dekkaiBallScale(batted);
+    ball.scale.set(k, k, k);
     ball.position.set(batted.x, batted.y, batted.z);
     pendingBatted = batted;
     hitStopRemaining = HIT_STOP_BASE_SEC + HIT_STOP_PER_SPEED * exitSpeed;
@@ -1368,19 +1630,19 @@ function atBatMarkerOf(ctx: GameContext): AtBatMarker {
 /** その「間」に何を見せるか（ただ止まっている時間にしないための中身） */
 function interludeText(kind: InterludeKind, ctx: GameContext): string {
   if (kind === 'inningChange') {
-    const half = ctx.half === 'top' ? 'オモテ' : 'ウラ';
+    const half = ctx.half === 'top' ? '表' : '裏';
     // ラッキー7（フェーズD-19。説明書p17）は**この回に入る瞬間にだけ**言う。攻守交代の間は
     // もともと「次はどの回か」を見せる場所なので、打線全員が好調になるという回の性質も
     // ここに置くのが素直（②「間を延ばすときは間に見せるものとセットで設計する」）。
     // 以降は打者カードの `ゼッコーチョー!` とバットの回転が、打席ごとに同じことを伝える。
-    if (isLuckyInning(ctx.inning)) return `ラッキーセブン!\n${ctx.inning}カイ ${half}`;
-    return `コウタイ\n${ctx.inning}カイ ${half}`;
+    if (isLuckyInning(ctx.inning)) return `ラッキーセブン！\n${ctx.inning}回${half}`;
+    return `攻守交代\n${ctx.inning}回${half}`;
   }
   // 打者交代：何番・どの守備位置の誰が打席に立つか（采配メニューの見出しと同じ粒度）
   const roster = ctx.rosters[battingTeam(ctx.half)];
   const position = currentBatterPosition(roster);
   const name = roster.players[currentBatterId(roster)].name;
-  return `${roster.lineupIndex + 1}バン${position ? ` ${position}` : ''}\n${name}`;
+  return `${roster.lineupIndex + 1}番${position ? ` ${positionLabel(position)}` : ''}\n${name}`;
 }
 
 function clearInterlude(): void {
@@ -1400,6 +1662,7 @@ function updateInterlude(ctx: GameContext, dt: number): boolean {
   if (kind) {
     interlude = { kind, remaining: INTERLUDE_SEC[kind] };
     hud.showInterlude(interludeText(kind, ctx));
+    if (kind === 'inningChange') music.jingle('change');
     // 次の打者が打席へ歩いて入る（間がちょうど終わる頃に打席に収まる）。
     // 立ち位置（フェーズO-36）も打者ごとに仕切り直す：見た目は startEntrance が 0 へ戻し、
     // CPUの材料（直前の球のコース）はここで捨てる＝**両方が同じ瞬間に初期化される**。
@@ -1519,7 +1782,7 @@ function tryCpuGun(ctx: GameContext): boolean {
   // （撃たれる側が離れて立っていれば、狙いもその位置へ動く）。
   gun.aimAt(batterAimX(currentBatterSide(), currentBatterStance()));
   sfx.gunAim();
-  hud.playBanner('gunAim', `${fielding.players[fielding.pitcher].name}\nジュウヲ カマエタ!`);
+  hud.playBanner('gunAim', `${fielding.players[fielding.pitcher].name}\n銃を構えた！`);
   gunTelegraphRemaining = GUN_TELEGRAPH_SEC;
   return true;
 }
@@ -1662,6 +1925,9 @@ function startPickoff(): void {
 // 個別に捕まえるより、状態から導出するほうが取りこぼしがない）。
 let cpuPickoffUsed = false;
 let cpuStealUsed = false;
+// 人間の攻撃側が自分からにらみ合いへ入るのも1打席1回まで（フェーズKK-58。`canTakeLead`）。
+// CPU投手のけん制と同じ枷にしてあるので、**同じ打席で投げ合う回数が両者そろって1回**になる。
+let offenseLeadUsed = false;
 let lastPlateAppearanceKey = '';
 
 /**
@@ -1695,7 +1961,7 @@ function announceStaminaDrop(ctx: GameContext): void {
   const id = roster.pitcher;
   if (staminaDropAnnounced.has(id) || fatigueOf(roster, id) <= 0) return;
   staminaDropAnnounced.add(id);
-  hud.playBanner('stamina', `${roster.players[id].name}\nキュウイ ダウン`);
+  hud.playBanner('stamina', `${roster.players[id].name}\n球威ダウン`);
 }
 
 /**
@@ -1741,6 +2007,7 @@ function syncPlateAppearance(ctx: GameContext): void {
   lastPlateAppearanceKey = key;
   cpuPickoffUsed = false;
   cpuStealUsed = false;
+  offenseLeadUsed = false;
   cpuGunUsed = false;
   // 打席が変われば走者は塁に戻って構え直す＝持ち越したリード（フェーズL-32）も無効になる
   carriedLeads = {};
@@ -1793,7 +2060,7 @@ function tryCpuPinchHit(ctx: GameContext): void {
   gameActor.send({ type: 'SUBSTITUTE_BATTER', side, benchIndex: index });
   // 交代したこと自体を見せる（`tryCpuRelief` の「リリーフ」と同じ扱い）。打者カードは
   // refresh で追従するが、切り替わった瞬間はバナーでないと見落とす。
-  hud.playBanner('stamina', `${incoming}\nダイダ`);
+  hud.playBanner('stamina', `${incoming}\n代打`);
 }
 
 /**
@@ -1847,7 +2114,7 @@ function tryCpuPinchRun(ctx: GameContext): void {
   gameActor.send({ type: 'SUBSTITUTE_RUNNER', side, base: 'first', benchIndex: index });
   // 塁の上の走者が入れ替わったことは状況パネルの走力のバー（FF-53）に出るが、
   // **切り替わった瞬間はバナーでないと見落とす**（代打・リリーフと同じ扱い）。
-  hud.playBanner('stamina', `${incoming}\nダイソウ`);
+  hud.playBanner('stamina', `${incoming}\n代走`);
 }
 
 /**
@@ -1926,12 +2193,20 @@ function cpuStealOptions(ctx: GameContext): CpuStealOptions {
  * 投球の残り時間（pitching.timeToCatcher）がそのまま走者の持ち時間なので、**モーションを
  * 見てすぐ走れば間に合い、遅れれば刺される**。
  *
- * **投球前なら、けん制のにらみ合いへ**：投手はまだボールを持っているので、走り出した
- * 走者はその塁へ投げられて刺される（実際の野球で「投手が投げるまで走れない」のと同じ）。
- * 既存のけん制の経路（startPickoff＋進塁）をそのまま使う。
+ * **投球前なら、リードを取りにけん制のにらみ合いへ入る**（フェーズKK-58）。
+ * **走り出さない**のが要点で、そこから先は II-56 の世界＝方向キーを押している間だけ
+ * リードが伸び、K で帰塁、もう一度 J で走り出す（従来の「投球前のJ＝走り出して刺される」
+ * 帰結はこの2度目のJに移った）。**入るのは1打席に1回まで**（`offenseLeadUsed`）。
+ *
+ * これが要るのは II-56 と JJ-57 が噛み合って**リードという操作が到達できなくなっていた**
+ * ため：人間の走者がリードを伸ばせるのは**けん制モード中だけ**（II-56）なのに、CPUが
+ * けん制モードへ入るのは**リード>0の走者がいるときだけ**（JJ-57）で、リードが持ち越されるのは
+ * `finalLeads` が `ledOff` の走者に対してだけ＝**一度も塁を離れていない走者は永久に
+ * 離れられない**という循環になっていた。入口を攻撃側に置けば循環が切れる。
  *
  * target は人間なら十字キーの絶対塁指定（**無指定＝走れる走者全員のダブルスチール**。
- * フェーズL-32）、CPUなら `chooseCpuSteals` が返す起点の塁の配列。
+ * フェーズL-32）、CPUなら `chooseCpuSteals` が返す起点の塁の配列。**投球前の分岐を
+ * 通るのは人間だけ**（CPU攻撃側の呼び出しは `pitching.isPitchLive()` で門番されている）。
  */
 function startSteal(target: BaseKey | null | Array<'first' | 'second' | 'third'>): void {
   const ctx = gameActor.getSnapshot().context;
@@ -1956,11 +2231,25 @@ function startSteal(target: BaseKey | null | Array<'first' | 'second' | 'third'>
     modeActor.send({ type: 'STEAL' });
     return;
   }
-  // 投球前：投手がボールを持ったままのけん制のにらみ合いに、走者だけが走り出した状態
-  // （持ち越したリードはこちらの入口でも同じように効く）
-  fieldPlay.startPickoff(ctx.baseRunners, ctx.outs, resolveCarriedLeads(ctx.baseRunners, carriedLeads));
-  fieldPlay.sendRunner();
-  modeActor.send({ type: 'PICKOFF' });
+  // 投球前：走者が自分からにらみ合いへ入る（フェーズKK-58）。**投手側の入口
+  // （`startPickoff`）とまったく同じ**＝持ち越したリードから始まり、窓の長さも
+  // CPUの投げる判断も1か所のまま（攻撃側専用のけん制を作らない）。
+  if (!canTakeLead()) return;
+  offenseLeadUsed = true;
+  startPickoff();
+}
+
+/**
+ * 攻撃側が自分からけん制のにらみ合いへ入れるか（フェーズKK-58）。規則そのものは
+ * `core/fielding.ts` の `canTakeLeadOff`（純粋関数）にあり、ここは**いまの状態を
+ * そこへ渡すだけ**（`shouldCpuPickoff` に `resolveCarriedLeads` の結果を渡すのと同じ形）。
+ *
+ * `dekkaiOffenseOpen`（画面が止まっている間はどの操作も動かない）は呼び出し側の
+ * `canStartSteal` が既に見ているので、ここでは重ねない。
+ */
+function canTakeLead(): boolean {
+  const bases = gameActor.getSnapshot().context.bases;
+  return canTakeLeadOff(bases, offenseLeadUsed, pitching.isBusy());
 }
 
 /**
@@ -1995,7 +2284,10 @@ function syncStealPrompt(): void {
     kinds.push(twoStrikes ? 'buntTwoStrikes' : 'bunt');
   }
   if (open && battingEffectReady() !== null) kinds.push('battingEffect');
-  if (open && canStartSteal()) kinds.push('steal');
+  // 盗塁とリード取りは**同じ枠を入れ替える**（フェーズKK-58）：同じJが投球前は
+  // 「にらみ合いへ入る」・投球中は「盗塁」なので、両方並べると押した結果が読めない。
+  // 使い切った後・投球中は従来どおり `steal`＝KK-58の前と同じ案内に戻る。
+  if (open && canStartSteal()) kinds.push(canTakeLead() ? 'takeLead' : 'steal');
   // 中身が変わったときだけ書き換える（毎フレームHUDを組み直さないための既存の作法）
   const key = kinds.join(',');
   if (key === dekkaiPromptShown) return;
@@ -2043,6 +2335,51 @@ const projected = new THREE.Vector3();
  * プレー外では focus が null になり、リグはそれを「次のプレーは瞬時に合わせる」の
  * 合図として使う＝モードの切り替えが瞬時カット（原作準拠）であることと辻褄が合う。
  */
+/**
+ * ノックを1本打ち出す（フェーズPP-64の `field` モード）。
+ *
+ * **打球のプレーの入口は本番とまったく同じ**（`fieldPlay.launch` → `BATTED_BALL`）＝
+ * 捕球・送球・タッチ・走者の帰結はすべて本番の判定がそのまま出る。違うのは
+ * **打球の出どころが打撃ではなくノックの設定**であることと、**結果を記録しない**ことだけ。
+ */
+function fireKnock(): void {
+  if (!practice || fieldPlay.isActive()) return;
+  const ctx = gameActor.getSnapshot().context;
+  const roster = ctx.rosters[battingTeam(ctx.half)];
+  // 走者は**攻撃側の打線の上から**置く（名鑑の選手なので走力もそのまま効く＝
+  // 「足の速い走者だと送球が間に合わない」まで本番と同じ条件で見られる）。
+  const pattern = KNOCK_RUNNER_PATTERNS[practiceKnock.runners].bases;
+  const runners: BaseRunners = { first: null, second: null, third: null };
+  pattern.forEach((base, i) => {
+    runners[base] = roster.lineup[(roster.lineupIndex + 1 + i) % roster.lineup.length];
+  });
+  fieldPlay.launch(knockLaunch(practiceKnock), runners, currentBatterRunnerId(), ctx.outs);
+  modeActor.send({ type: 'BATTED_BALL' });
+  syncChicchaiCamera(0);
+}
+
+/**
+ * デバッグモードの数字キー（フェーズPP-64）。**ゲームのキーマップ（`input/keyboard.ts`）には
+ * 1つも足さない**ので、本番の操作は1つも奪われない（`practice` が null の間は何も起きない）。
+ */
+window.addEventListener('keydown', (e) => {
+  if (!practice || e.repeat) return;
+  if (practice === 'pitch' && e.code === PRACTICE_KEYS.toggleSwing) {
+    practiceSwing = !practiceSwing;
+    syncPracticeHud();
+    return;
+  }
+  if (practice !== 'field') return;
+  if (e.code === PRACTICE_KEYS.cycleDirection) practiceKnock = cycleKnock(practiceKnock, 'direction');
+  else if (e.code === PRACTICE_KEYS.cycleKind) practiceKnock = cycleKnock(practiceKnock, 'kind');
+  else if (e.code === PRACTICE_KEYS.cycleRunners) practiceKnock = cycleKnock(practiceKnock, 'runners');
+  else if (e.code === PRACTICE_KEYS.knock) {
+    fireKnock();
+    return;
+  } else return;
+  syncPracticeHud();
+});
+
 function syncChicchaiCamera(dt: number): void {
   const focus = fieldPlay.cameraFocus();
   chicchaiRig.update(focus, dt);
@@ -2113,7 +2450,7 @@ function resolveCpuDraft(ctx: GameContext, side: TeamSide): void {
   });
   hud.playBanner(
     'stamina',
-    `アイテ ノ スキル\n${roster.players[picked.holderId].name} ${skillDef(picked.skillId).name}`,
+    `相手のスキル\n${roster.players[picked.holderId].name} ${skillDef(picked.skillId).name}`,
   );
 }
 
@@ -2123,6 +2460,9 @@ function resolveCpuDraft(ctx: GameContext, side: TeamSide): void {
  */
 function syncSkillDraft(ctx: GameContext): boolean {
   if (draftOpen) return true;
+  // デバッグモード（フェーズPP-64）では抽選そのものを起こさない＝**確認したい局面の前に
+  // 3択画面が挟まらない**（スキルの効果を見たいときは、通常のプレイで引くか名鑑を触る）。
+  if (practice) return false;
   if (gameIsOver()) return false;
   const marker = draftMarkerOf(ctx);
   if (marker === lastDraftMarker) return false;
@@ -2143,6 +2483,7 @@ function syncSkillDraft(ctx: GameContext): boolean {
   }
 
   draftOpen = true;
+  syncMusic();
   const roster = drawn.rosters[pending.side];
   runSkillDraft(app, pads[player], {
     draft: pending.draft,
@@ -2174,6 +2515,7 @@ function syncSkillDraft(ctx: GameContext): boolean {
       skillId: choice.skillId,
     });
     draftOpen = false;
+    syncMusic();
   });
   return true;
 }
@@ -2262,6 +2604,7 @@ function resetPerGameState(): void {
   lastPlateAppearanceKey = '';
   cpuPickoffUsed = false;
   cpuStealUsed = false;
+  offenseLeadUsed = false;
   cpuGunUsed = false;
   staminaDropAnnounced.clear();
   stealActive = false;
@@ -2307,6 +2650,7 @@ function startGame(setup: GameSetup): void {
     rerolls: setup.rerolls,
     fatigue: setup.fatigue,
   });
+  crowd.startAmbience();
   refresh();
 }
 
@@ -2321,6 +2665,34 @@ function startGame(setup: GameSetup): void {
  */
 function startMatch(selection: MatchSelection): void {
   controllers = controllersFor(selection.mode, selection.humanSide);
+  practice = selection.practice ?? null;
+  practiceSwing = false;
+  practiceKnock = INITIAL_KNOCK;
+  // **null なら消える**ので、デバッグモードの後に通常のプレイを始めても行が残らない
+  // （デバッグの状態はここ1か所でしか切り替わらない）。
+  syncPracticeHud();
+  if (practice) {
+    // デバッグモード（フェーズPP-64）は**ランの外＝1試合完結**（2P PLAY と同じ扱い）。
+    // ランに通すと扉・抽選・勝敗の画面が挟まるが、ここで見たいのは1つの局面だけ。
+    run = null;
+    twoPlayerMatch = null;
+    startGame({
+      away: selection.away,
+      home: selection.home,
+      plans: selection.plans,
+      // シードは固定＝**同じ場面が毎回同じ条件で出る**（好調・系統の絞り込みも動かない）。
+      // 確認したいものだけを動かす、という道具の性質に合わせてある。
+      seed: 1,
+      skills: {},
+      uses: {},
+      rerolls: {},
+      fatigue: {},
+      park: selection.park,
+    });
+    gameStarted = true;
+    hudRoot.style.display = '';
+    return;
+  }
   if (selection.mode === '2p') {
     run = null;
     twoPlayerMatch = { away: selection.away, home: selection.home };
@@ -2387,8 +2759,8 @@ async function openMatchEndScreen(): Promise<void> {
   await matchEnd(app, anyPad, {
     headline:
       winnerPlayer === null
-        ? 'ヒキワケ'
-        : `${winnerPlayer === 'p1' ? '1P' : '2P'} ノ カチ!`,
+        ? '引き分け'
+        : `${winnerPlayer === 'p1' ? '1P' : '2P'}の勝ち！`,
     score: `${ctx.rosters.away.team.short} ${ctx.score.away} - ${ctx.score.home} ${ctx.rosters.home.team.short}`,
     lines: [
       `1P: ${ctx.rosters[sideOfPlayer(controllers, 'p1') ?? 'away'].team.name}`,
@@ -2396,6 +2768,7 @@ async function openMatchEndScreen(): Promise<void> {
     ],
   });
   hudRoot.style.display = 'none';
+  backToTitleAudio();
   const selection = await runTeamSelect(app, pads);
   startMatch(selection);
   runScreenOpen = false;
@@ -2413,6 +2786,7 @@ async function openRunScreen(): Promise<void> {
   }
   const finished = run;
   runScreenOpen = true;
+  syncMusic();
   const ctx = gameActor.getSnapshot().context;
   const won = ctx.winner === finished.side;
   // **勝敗を記録する前に問う**（記録した後は「負けた」という事実が勝ち数の差にしか残らない）
@@ -2447,9 +2821,9 @@ async function openRunScreen(): Promise<void> {
       game: state.game + 1,
     });
     const index = await runNextSelect(app, pads.p1, {
-      headline: `${state.game}シアイメ カチ!`,
+      headline: `${state.game}試合目 勝利！`,
       score: `${ctx.rosters.away.team.short} ${ctx.score.away} - ${ctx.score.home} ${ctx.rosters.home.team.short}`,
-      progress: `ツギハ ${state.game + 1}/${RUN_GAMES} シアイメ`,
+      progress: `次は ${state.game + 1}/${RUN_GAMES}試合目`,
       opponentSkills: skillCount(preview.skills),
       // 温存の判断（フェーズU-42）はここでする＝次の試合へ何回持っていけるかを見せる
       rerollsLeft: rerollsLeft(carriedRerolls),
@@ -2465,7 +2839,7 @@ async function openRunScreen(): Promise<void> {
       teamId: state.teamId,
       plan: state.plan,
       carried: { skills: carried, uses: carriedUses, fatigue: carriedFatigue },
-      headline: `${state.game + 1}シアイメ`,
+      headline: `${state.game + 1}試合目`,
     });
     run = withNextGame(state, door, carried, carriedUses, carriedRerolls, carriedFatigue, plan);
     startGame(gameSetupOf(run));
@@ -2482,6 +2856,7 @@ async function openRunScreen(): Promise<void> {
   });
   // 新しいランはチーム選択からやり直す（保存はしない＝セッション内だけのラン）。
   hudRoot.style.display = 'none';
+  backToTitleAudio();
   const selection = await runTeamSelect(app, pads);
   startMatch(selection);
   runScreenOpen = false;
@@ -2580,7 +2955,7 @@ function intentionalWalkTarget(ctx: GameContext): IntentionalWalkTarget {
  */
 function declareIntentionalWalk(side: TeamSide): void {
   sfx.walk();
-  hud.playBanner('walk', 'ケイエン');
+  hud.playBanner('walk', '敬遠');
   gameActor.send({ type: 'INTENTIONAL_WALK', side });
 }
 
@@ -2610,7 +2985,7 @@ function onA(player: PlayerSlot): void {
         pitching.startPitch();
       } else {
         // 打者側のA＝スイング
-        if (pitching.isPitchLive()) batting.trySwing();
+        if (pitching.isPitchLive() && batting.trySwing()) sfx.swing();
       }
       break;
     case 'chicchai':
@@ -2758,6 +3133,11 @@ for (const player of PLAYER_SLOTS) {
 // 2P/CPU操作分離のチーム選択（runTeamSelect）が完了するまでループを開始しない
 // （選択画面がプレイヤーの入力をブロックする、原作にはない追加の起動前ステップ）。
 
+// タイトル（チーム選択）の曲。音はブラウザの決まりで最初のキー入力まで鳴らないので、
+// ここでは「鳴らしたい曲」を頼んでおくだけ（解除された瞬間に鳴り始める）。
+music.play('title');
+installMusicToggle();
+
 runTeamSelect(app, pads).then((selection) => {
   // 選んだモード（フェーズD-20）・16球団のカード（フェーズB-12/C-13）・球場（C-14）・
   // 試合前の采配（C-15）から**試合を始める**（1P PLAY はラン＝フェーズF-26-6、
@@ -2772,7 +3152,7 @@ runTeamSelect(app, pads).then((selection) => {
     // 采配メニュー・抽選画面・ランの画面の表示中は全アクター静止（Start=ポーズの文言どおり）。
     // メニュー自体の入力はrunManagerMenuが登録したpad.onPressハンドラで完結する。
     if (menuOpen || draftOpen || runScreenOpen) {
-      renderer.render(scene, activeCamera);
+      renderFrame();
       return;
     }
 
@@ -2783,7 +3163,7 @@ runTeamSelect(app, pads).then((selection) => {
     if (gameIsOver()) {
       resultPauseRemaining -= dt;
       if (resultPauseRemaining <= 0) void openRunScreen();
-      renderer.render(scene, activeCamera);
+      renderFrame();
       return;
     }
 
@@ -2820,7 +3200,7 @@ runTeamSelect(app, pads).then((selection) => {
         // 描かれてしまい、瞬時カットが「一瞬ずれた画」から始まることになる。
         syncChicchaiCamera(0);
       }
-      renderer.render(scene, activeCamera);
+      renderFrame();
       return;
     }
 
@@ -2832,7 +3212,7 @@ runTeamSelect(app, pads).then((selection) => {
         gameActor.send({ type: 'HIT_BY_PITCH' });
         modeActor.send({ type: 'DEAD_BALL' });
       }
-      renderer.render(scene, activeCamera);
+      renderFrame();
       return;
     }
 
@@ -2846,7 +3226,7 @@ runTeamSelect(app, pads).then((selection) => {
         gunTelegraphRemaining = 0; // 端数の負値を残さない（次の予兆の計時が読みにくくなる）
         fireGun();
       }
-      renderer.render(scene, activeCamera);
+      renderFrame();
       return;
     }
 
@@ -2873,7 +3253,7 @@ runTeamSelect(app, pads).then((selection) => {
       // **その回の1球目より必ず前**。3択画面が開いている間は下の処理をすべて止める
       // （投球・けん制・盗塁が裏で進むと、選んでいる最中に試合が動いてしまう）。
       if (syncSkillDraft(ctx)) {
-        renderer.render(scene, activeCamera);
+        renderFrame();
         return;
       }
       // 打席が変わったらCPUのけん制・盗塁の「1打席1回」を仕切り直す（攻守どちらの
@@ -2967,6 +3347,6 @@ runTeamSelect(app, pads).then((selection) => {
       hud.setBrawlHint(brawlHintText());
     }
 
-    renderer.render(scene, activeCamera);
+    renderFrame();
   });
 });

@@ -25,10 +25,17 @@ import {
   type BatterSide,
   type PitchArm,
   type PitchArmSide,
+  ARM_RELEASE_LEAN_RAD,
   ARM_SLOT_RAD,
   NEUTRAL_PITCH_ARM,
 } from '../core/pitch';
+import {
+  SWING_ACTIVE_SEC,
+  SWING_IDEAL_SEC,
+  SWING_STARTUP_SEC,
+} from '../core/batting';
 import playerModelUrl from '../assets/player.glb?url';
+import { addOutline, castShadows, toonify } from '../render/toon';
 
 /**
  * チーム色として塗り替えるマテリアルの名前（Blender 側の材質名と一致させる）。
@@ -294,7 +301,14 @@ let prototypeModel: THREE.Object3D | null = null;
 export async function preloadPlayerModel(): Promise<void> {
   if (prototypeModel) return;
   const gltf = await new GLTFLoader().loadAsync(playerModelUrl);
-  prototypeModel = gltf.scene;
+  const model = gltf.scene;
+  // トゥーン調（ブラッシュアップ：グラフィック）。**原型に一度だけ掛ける**＝複製は
+  // 材質も輪郭の殻もそのまま引き継ぐ（殻は本体とジオメトリを共有するので、関節を
+  // 回せば縁も一緒に回る）。影は本体だけが落とす。
+  toonify(model);
+  addOutline(model);
+  castShadows(model);
+  prototypeModel = model;
 }
 
 interface PlayerVisual {
@@ -305,7 +319,7 @@ interface PlayerVisual {
    */
   facing: THREE.Object3D;
   /** この選手だけの色を塗るマテリアル（複製元と共有しない＝1人塗ると全員変わる、が起きない） */
-  uniform: THREE.MeshStandardMaterial[];
+  uniform: THREE.MeshToonMaterial[];
   /** 関節ノード（姿勢はここを回す） */
   joints: Joints;
   /** 手（取り付け口） */
@@ -320,6 +334,11 @@ interface PlayerVisual {
    * 滑って見えるのを防ぐ）。
    */
   moving: boolean;
+  /**
+   * 投げる腕の側（グラブは反対の手。ブラッシュアップで追加）。捕球・座り込みの姿勢は
+   * **グラブ側の腕で構える**ので、これを見て腕を選ぶ。既定は右投げ（グラブは +X の手）。
+   */
+  throwSide: PitchArmSide;
 }
 
 const visuals = new WeakMap<THREE.Group, PlayerVisual>();
@@ -343,15 +362,17 @@ export function createPlayer(color: number): THREE.Group {
   const model = prototypeModel.clone(true);
   facing.add(model);
 
-  const uniform: THREE.MeshStandardMaterial[] = [];
+  const uniform: THREE.MeshToonMaterial[] = [];
   const found = new Map<string, THREE.Object3D>();
   model.traverse((obj) => {
-    if (obj.name) found.set(obj.name, obj);
+    // **先に見つかった（＝階層の浅い）ノードを関節とする**。材質が複数ある部位は
+    // glTF で「関節ノード＋材質ごとのメッシュ」に分かれるので、同名の子に上書きさせない
+    if (obj.name && !found.has(obj.name)) found.set(obj.name, obj);
     const mesh = obj as THREE.Mesh;
     if (!mesh.isMesh || Array.isArray(mesh.material)) return;
     const material = mesh.material as THREE.Material;
     if (material.name !== UNIFORM_MATERIAL_NAME) return;
-    const own = material.clone() as THREE.MeshStandardMaterial;
+    const own = material.clone() as THREE.MeshToonMaterial;
     mesh.material = own;
     uniform.push(own);
   });
@@ -383,6 +404,7 @@ export function createPlayer(color: number): THREE.Group {
     gait: 0,
     last: new THREE.Vector3(),
     moving: false,
+    throwSide: NEUTRAL_PITCH_ARM.side,
   });
   setPlayerColor(group, color);
   setPlayerPose(group, { kind: 'idle' });
@@ -410,6 +432,27 @@ export function setPlayerFacing(group: THREE.Group, yaw: number): void {
   const visual = visuals.get(group);
   if (!visual) return;
   visual.facing.rotation.y = yaw;
+}
+
+/**
+ * 選手を実寸の何倍で描くか（フェーズLL-59）。**見た目だけの値**で、位置（足元）も
+ * 判定も一切動かさない＝呼び出し側が書いた x,z はそのままの意味を持ち続ける。
+ *
+ * **向きのノード（内側）に掛ける**のは `setPlayerFacing` と同じ理由：外側のGroupの
+ * ローカル軸は呼び出し側のもの（打者のバットのオフセット、スイングのヨー）なので、
+ * そこへ倍率を掛けると打席の座標系ごと伸びてしまう。内側に掛ければ**持ち物
+ * （バット・銃・バイク）も手や腰の子なので一緒に大きくなる**＝「選手だけ大きくて
+ * 乗っている車体は実寸」が構造的に起きない。
+ *
+ * 拡大は**足元から上へ**伸びる（原点が接地面）ので、地面にめり込むことも浮くこともない。
+ *
+ * 使うのはちっちゃいモードだけ（`CHICCHAI_PLAYER_SCALE`）。でっかいモード・乱闘は
+ * 元からカメラが寄っているので実寸のまま＝**呼ばなければ 1.0 倍**。
+ */
+export function setPlayerScale(group: THREE.Group, scale: number): void {
+  const visual = visuals.get(group);
+  if (!visual) return;
+  visual.facing.scale.setScalar(scale);
 }
 
 /**
@@ -516,6 +559,27 @@ function gunHand(visual: PlayerVisual, side: PitchArmSide): THREE.Object3D {
  * そのまま乗る）が、**姿勢（関節）には引きずられない**＝またがっている脚を動かしても
  * 車体は水平のまま。部品の原点はシートの真下なので、位置合わせの数値は要らない。
  */
+/**
+ * グラブ（捕手はミット）を**投げない側の手**に持たせる（ブラッシュアップ：グラフィック）。
+ * バット・銃と同じく手のノードの子なので、捕球の構えで腕を伸ばせばグラブが付いてくる。
+ *
+ * **何度呼んでもよい**（投げる側が変わったときだけ持ち替える）：マウンドの投手は継投で
+ * 右投げ・左投げが入れ替わるので、呼び出し側は毎フレーム「いまの投げる腕」を渡せばよい。
+ * 捕球・座り込みの姿勢はここで覚えた側を見てグラブ側の腕で構える＝見た目だけの値で、
+ * 判定（捕球半径）には一切効かない。
+ */
+export function attachGlove(
+  group: THREE.Group,
+  glove: THREE.Object3D,
+  throwSide: PitchArmSide,
+): void {
+  const visual = visuals.get(group);
+  if (!visual) return;
+  const hand = throwSide >= 0 ? visual.hands.minusX : visual.hands.plusX;
+  if (glove.parent !== hand) hand.add(glove);
+  visual.throwSide = throwSide;
+}
+
 export function attachBike(group: THREE.Group, bike: THREE.Object3D): void {
   const visual = visuals.get(group);
   if (!visual) return;
@@ -596,7 +660,7 @@ export function setPlayerPose(group: THREE.Group, pose: PlayerPose): void {
       applyCatch(visual, pose.reach);
       break;
     case 'crouch':
-      applyCrouch(j);
+      applyCrouch(visual);
       break;
     case 'stance':
       applyStancePose(visual, pose.side);
@@ -719,30 +783,49 @@ function applyCatch(visual: PlayerVisual, reach: number): void {
   const j = visual.joints;
   const r = Math.min(1, Math.max(0, reach));
   const lift = CATCH_ARM_LOW + (CATCH_ARM_HIGH - CATCH_ARM_LOW) * r;
-  // グラブ側（-X）を高く、添える側（+X）はやや低く＝どちらで捕るかが読める
-  j.ArmUpperL.rotation.x = -lift;
-  j.ArmUpperR.rotation.x = -lift * 0.75;
+  // グラブ側（投げない側）を高く、添える側はやや低く＝どちらで捕るかが読める
+  const glove = gloveArms(visual);
+  glove.upper.rotation.x = -lift;
+  glove.bareUpper.rotation.x = -lift * 0.75;
   j.ArmUpperL.rotation.z = -0.25;
   j.ArmUpperR.rotation.z = 0.25;
-  j.ArmLowerL.rotation.x = -0.35;
-  j.ArmLowerR.rotation.x = -0.5;
+  glove.lower.rotation.x = -0.35;
+  glove.bareLower.rotation.x = -0.5;
   j.Torso.rotation.x = -0.12;
   if (visual.moving) applyRunLegs(j, visual.gait * GAIT_RADIANS_PER_METER);
   else flexLegs(j, -0.18, 0.3);
 }
 
-function applyCrouch(j: Joints): void {
+function applyCrouch(visual: PlayerVisual): void {
+  const j = visual.joints;
   flexLegs(j, CROUCH_THIGH, CROUCH_SHIN);
   // 膝を外へ開く（捕手の座り方）
   j.LegUpperL.rotation.z = -0.3;
   j.LegUpperR.rotation.z = 0.3;
   j.Torso.rotation.x = -0.2;
-  // ミットを前へ構え、逆の手は下ろす
-  j.ArmUpperL.rotation.x = -1.35;
-  j.ArmLowerL.rotation.x = -0.55;
-  j.ArmUpperL.rotation.z = -0.2;
-  j.ArmUpperR.rotation.x = -0.4;
-  j.ArmLowerR.rotation.x = -0.7;
+  // ミットを前へ構え（投げない側の腕）、逆の手は下ろす
+  const mitt = gloveArms(visual);
+  mitt.upper.rotation.x = -1.35;
+  mitt.lower.rotation.x = -0.55;
+  mitt.upper.rotation.z = mitt.sign * 0.2;
+  mitt.bareUpper.rotation.x = -0.4;
+  mitt.bareLower.rotation.x = -0.7;
+}
+
+/**
+ * グラブを持つ腕と、素手の腕。**投げる腕の反対がグラブ**（右投げ＝グラブは +X の手）。
+ * sign はグラブ側の腕を外へ開く向き（+X の腕なら +1）。
+ */
+function gloveArms(visual: PlayerVisual) {
+  const j = visual.joints;
+  const plus = visual.throwSide < 0;
+  return {
+    upper: plus ? j.ArmUpperR : j.ArmUpperL,
+    lower: plus ? j.ArmLowerR : j.ArmLowerL,
+    bareUpper: plus ? j.ArmUpperL : j.ArmUpperR,
+    bareLower: plus ? j.ArmLowerL : j.ArmLowerR,
+    sign: plus ? 1 : -1,
+  };
 }
 
 /**
@@ -770,9 +853,28 @@ function applyStancePose(visual: PlayerVisual, side: BatterSide): void {
   aimBat(visual, side, STANCE_BAT_DIR.x, STANCE_BAT_DIR.y, STANCE_BAT_DIR.z);
 }
 
+/**
+ * **バットが伸び切るスイング進行度**（フェーズRR-66）＝理想のタイミングで球が来る瞬間。
+ * `SWING_IDEAL_SEC / (SWING_STARTUP_SEC + SWING_ACTIVE_SEC)`＝判定側の「芯で捉える時刻」を
+ * そのまま読むので、**判定が当たりと言う瞬間と、バットが伸び切る瞬間が同じ1か所から出る**。
+ */
+const SWING_CONTACT_P =
+  SWING_IDEAL_SEC / (SWING_STARTUP_SEC + SWING_ACTIVE_SEC);
+
 /** 構えのバットの向き（立てて捕手側へ倒す）／振り抜きのバットの向き（体の前で水平） */
 const STANCE_BAT_DIR = { x: 0.45, y: 0.87, z: -0.2 };
-const SWING_BAT_DIR = { x: -0.3, y: -0.05, z: 0.95 };
+const SWING_BAT_DIR = { x: 0.68, y: -0.05, z: 0.73 };
+/**
+ * **振り切った後のバットの向き**（前の肩の上へ担ぎ上げる。テストプレイの指摘
+ * 「バットを完全に振り切ったときのバットの位置が中途半端」）。
+ *
+ * それまでは腕もバットも**当たる瞬間（`SWING_CONTACT_P`）で止まったまま**で、
+ * 以後は体のヨーだけが回り続けていた＝**腕を前へ伸ばし切った形のまま体だけ回る**ので、
+ * 振り終わりがフォロースルーに見えず途中で固まったように映っていた。
+ * **当たる瞬間までの姿勢は1mmも動かさない**（RR-66が実機で合わせた「バットが本塁を
+ * 通る時刻＝判定の芯」はそのまま）ので、**判定にも見た目の接触にも影響しない**。
+ */
+const FOLLOW_BAT_DIR = { x: 0.2, y: 0.45, z: -0.87 };
 /** バントのバットの向き（体の前へ水平に出す） */
 const BUNT_BAT_DIR = { x: -0.45, y: 0.05, z: 0.89 };
 
@@ -785,27 +887,40 @@ function applySwing(visual: PlayerVisual, side: BatterSide, t: number): void {
   applyStancePose(visual, side);
   const j = visual.joints;
   const p = Math.min(1, Math.max(0, t));
+  // **腕とバットは「当たる瞬間」に伸び切る**（フェーズRR-66）。体のヨー（振り）は
+  // 呼び出し側が `p` で回し続けるので、ここで前倒しするのは腕の伸びとバットの向きだけ
+  // ＝G-27の技（0.5＝当たる瞬間に伸び切る）と同じ約束を打撃にも通す。
+  //
+  // **これが無いと、判定が当たりと言っている瞬間にバットがまだ立っている**：実測で
+  // 打撃面を通過するフレームのバット先端は本塁（x=0）にすら届いておらず（-0.32m）、
+  // ストライクゾーンの球でさえ「バットが当たっていないのに当たった」ように見えていた。
+  const ext = Math.min(1, p / SWING_CONTACT_P);
+  // **当たった後は振り抜く**（フォロースルー）。`ext` が 1 で止まった先の区間だけを
+  // 0→1 に取り直すので、**当たる瞬間までの姿勢は1つも変わらない**。
+  const follow = Math.max(0, (p - SWING_CONTACT_P) / (1 - SWING_CONTACT_P));
   const sign = side >= 0 ? 1 : -1;
   const back = side >= 0 ? { upper: j.ArmUpperR, lower: j.ArmLowerR } : { upper: j.ArmUpperL, lower: j.ArmLowerL };
   const front = side >= 0 ? { upper: j.ArmUpperL, lower: j.ArmLowerL } : { upper: j.ArmUpperR, lower: j.ArmLowerR };
-  // 肘が伸びる（構えの -1.95/-1.6 から 0 へ）＝バットが体から離れて走る
-  back.lower.rotation.x = -1.95 * (1 - p);
-  front.lower.rotation.x = -1.6 * (1 - p);
-  // 腕が投手方向（体の前）へ出る
-  back.upper.rotation.x = -0.15 - 1.0 * p;
-  front.upper.rotation.x = -0.35 - 0.9 * p;
-  back.upper.rotation.z = sign * (0.35 - 0.15 * p);
-  front.upper.rotation.z = sign * (0.95 - 0.55 * p);
-  // 腰が回るぶん上体もついていく
+  // 肘が伸びる（構えの -1.95/-1.6 から 0 へ）＝バットが体から離れて走る。
+  // 振り抜きでは**もう一度たたまれる**＝バットが体に巻き付いて肩の上へ収まる。
+  back.lower.rotation.x = -1.95 * (1 - ext) - 1.55 * follow;
+  front.lower.rotation.x = -1.6 * (1 - ext) - 1.75 * follow;
+  // 腕が投手方向（体の前）へ出て、振り抜きでは肘がたたまれて手が肩の前へ戻る
+  back.upper.rotation.x = -0.15 - 1.0 * ext + 0.3 * follow;
+  front.upper.rotation.x = -0.35 - 0.9 * ext + 0.2 * follow;
+  back.upper.rotation.z = sign * (0.35 - 0.15 * ext + 0.2 * follow);
+  front.upper.rotation.z = sign * (0.95 - 0.55 * ext + 0.15 * follow);
+  // 腰が回るぶん上体もついていく（こちらは振り抜きまで続くので `p` のまま）。
+  // 振り抜きでは上体が起きる＝前へかぶさったまま終わらない。
   j.Torso.rotation.y = -sign * 0.35 * p;
-  j.Torso.rotation.x = -0.08 - 0.1 * p;
+  j.Torso.rotation.x = -0.08 - 0.1 * p + 0.12 * follow;
   // バットは立てた構えから体の前の水平へ（**体のヨー回転と合わさって振り抜きになる**）
   aimBat(
     visual,
     side,
-    STANCE_BAT_DIR.x + (SWING_BAT_DIR.x - STANCE_BAT_DIR.x) * p,
-    STANCE_BAT_DIR.y + (SWING_BAT_DIR.y - STANCE_BAT_DIR.y) * p,
-    STANCE_BAT_DIR.z + (SWING_BAT_DIR.z - STANCE_BAT_DIR.z) * p,
+    STANCE_BAT_DIR.x + (SWING_BAT_DIR.x - STANCE_BAT_DIR.x) * ext + (FOLLOW_BAT_DIR.x - SWING_BAT_DIR.x) * follow,
+    STANCE_BAT_DIR.y + (SWING_BAT_DIR.y - STANCE_BAT_DIR.y) * ext + (FOLLOW_BAT_DIR.y - SWING_BAT_DIR.y) * follow,
+    STANCE_BAT_DIR.z + (SWING_BAT_DIR.z - STANCE_BAT_DIR.z) * ext + (FOLLOW_BAT_DIR.z - SWING_BAT_DIR.z) * follow,
   );
 }
 
@@ -856,12 +971,18 @@ function throwingLimbs(j: Joints, side: PitchArmSide) {
  * `rotation.z` として入れる**：この傾きの横成分は振り（`rotation.x`）に一切影響されない
  * （Euler XYZ は Z を先に効かせるので、腕は必ず `腕の長さ × sin(傾き)` だけ横へ出る）
  * ＝**判定側のリリースのずれ（`armReleaseOffsetX`）と同じ形で、同じ定数から出る**。
+ *
+ * **上体は投げる側へ傾ける**（フェーズMM-60。`ARM_RELEASE_LEAN_RAD`）＝横手・下手が
+ * 肩ごと下がって**低い位置から出てくる**。腕の角度だけでは高さが変わらない（リリースの
+ * 瞬間は腕が前方水平まで振り切れているので、横へ倒しても手は肩の高さに張り付く）ため。
+ * **球の出どころの高さ（`armReleaseHeight`）はこの同じ傾きから解く**ので、球は必ず手から出る。
  */
 function applyPitch(j: Joints, t: number, arm: PitchArm = NEUTRAL_PITCH_ARM): void {
   const p = Math.min(1, Math.max(0, t));
   const limbs = throwingLimbs(j, arm.side);
   // 腕を横へ倒す（上手＝ほぼ真上／横手＝ほぼ水平／下手＝その中間）
   limbs.armUpper.rotation.z = arm.side * ARM_SLOT_RAD[arm.slot];
+  const lean = ARM_RELEASE_LEAN_RAD[arm.slot];
   if (p <= PITCH_RELEASE_T) {
     const w = p / PITCH_RELEASE_T;
     // 担ぎ上げ（頂点まで）→ 振り出し（頂点からリリースまで）。0..1 で表す
@@ -874,6 +995,10 @@ function applyPitch(j: Joints, t: number, arm: PitchArm = NEUTRAL_PITCH_ARM): vo
     limbs.offLower.rotation.x = -0.8 * lift + 0.3 * whip;
     // 上体は反ってから、振り出しと一緒に起きる
     j.Torso.rotation.x = 0.3 * lift - 0.4 * whip;
+    // 投げる側へ傾ける（フェーズMM-60）。**振り出し（whip）と一緒に倒す**ので、
+    // セットの構えでは傾いておらず、リリースの瞬間にちょうど倒し切っている
+    // ＝球の出どころ（`armReleaseHeight`）が想定している姿勢と同じ形になる。
+    j.Torso.rotation.z = -arm.side * lean * whip;
     // 前脚を上げ、振り出しで踏み出して着地する
     limbs.strideUpper.rotation.x = -1.0 * lift + 0.45 * whip;
     limbs.strideLower.rotation.x = 1.3 * lift - 1.15 * whip;
@@ -888,6 +1013,9 @@ function applyPitch(j: Joints, t: number, arm: PitchArm = NEUTRAL_PITCH_ARM): vo
   limbs.offUpper.rotation.x = lerp(-0.4, 0.5, f);
   limbs.offLower.rotation.x = lerp(-0.5, -0.2, f);
   j.Torso.rotation.x = lerp(-0.1, -0.55, f);
+  // 傾きはリリースの形のまま保つ（フェーズMM-60）＝倒し切った上体が、そのまま
+  // 前へ倒れ込む。ここで0へ戻すとリリースの瞬間だけ体が跳ね起きて見える。
+  j.Torso.rotation.z = -arm.side * lean;
   limbs.strideUpper.rotation.x = lerp(-0.55, -0.5, f);
   limbs.strideLower.rotation.x = lerp(0.15, 0.1, f);
   limbs.strideFoot.rotation.x = 0;

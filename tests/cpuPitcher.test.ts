@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CORNER_MARGIN,
   CPU_GUN_POWER_THRESHOLD,
   CPU_PITCHER_STYLE_GAP,
+  NORMAL_TARGET_X,
   chooseCpuPitchPlan,
   cpuPitcherStyle,
   cpuSteerAccelAt,
@@ -31,7 +33,9 @@ describe('chooseCpuPitchPlan（カウントに応じた投球方針）', () => {
   it('初球（0-0）は速球・ボール0=偶数なので+側（外角）を狙う', () => {
     const plan = chooseCpuPitchPlan(EMPTY_COUNT);
     expect(plan.speed).toBe('fast');
-    expect(plan.targetX).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH * 0.55, 5);
+    // フェーズTT-68：通常の球も「隅の1つ内側」を狙う（決め球＝隅の1つ外側と対称）
+    expect(plan.targetX).toBeCloseTo(NORMAL_TARGET_X, 5);
+    expect(NORMAL_TARGET_X).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH - CORNER_MARGIN, 10);
   });
 
   it('ボール数が奇数なら狙うコースの符号が反転する', () => {

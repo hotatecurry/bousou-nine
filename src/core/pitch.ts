@@ -79,6 +79,23 @@ export function neutralSpeedFor(pitcherSpeed: number = NEUTRAL_RATING): number {
   return SPEED_NEUTRAL + (clamp01(pitcherSpeed) - NEUTRAL_RATING) * SPD_SPAN;
 }
 
+/**
+ * その球が**その投手の基準速からどれだけ遅い／速いか**（0..1）。
+ *
+ * 見た目（弧・残像。`core/camera.ts` の `pitchArcPath` / `dekkaiBallTrail`）が読む重み。
+ * **フェーズPP-63でシーン層からここへ移した**＝それまで `dekkaiScene.ts` の中に式が
+ * 直接書かれていて、計測（`npm run balance:flight`）とテストが同じ定義を読めなかった。
+ * 中心は必ず `neutralSpeedFor`（＝その投手の基準速）から取るので、**速球派のフォークも
+ * 「その投手にとって遅い球」として正しく描かれる**（上のコメントの取り決めのまま）。
+ */
+export function pitchSlowness(vz: number, neutral: number = SPEED_NEUTRAL): number {
+  return clamp01((neutral - vz) / SPEED_SLOW_DELTA);
+}
+
+export function pitchFastness(vz: number, neutral: number = SPEED_NEUTRAL): number {
+  return clamp01((vz - neutral) / SPEED_FAST_DELTA);
+}
+
 /** 変化量0..1 → 横方向加速度 m/s^2 の下限と幅（0.5 で従来の STEER_ACCEL=14） */
 export const STEER_ACCEL_MIN = 9;
 export const STEER_ACCEL_SPAN = 10;
@@ -171,7 +188,7 @@ export function fatiguedBreak(breakAmount: number, fatigue: number): number {
  * （`pitcherRole` を STM から、`cpuPitcherStyle` を SPD/F から導いたのと同じ「既にある
  * ものから決める」）。計測はそのうえで**帰結を4つ固定した**（同8段目）：
  *
- * - 疲労MAXで**見逃し三振を取れる投手が 15/96 → 0/96**（決め球の値打ちが疲労で失われる）。
+ * - 疲労MAXで**見逃し三振を取れる投手が 8/96 → 0/96**（RR-66で無傷の側が 15→8 になった）（決め球の値打ちが疲労で失われる）。
  * - **打席中央で死球がありうるのが 3/96 → 29/96**（ユーザー判断「荒れは死球まで届く」）。
  * - **打席から離れれば 0/96 のまま**＝T-41の不変条件（打者に避ける手が実在する）は不変。
  * - 見逃し続けたときの帰結が無傷から変わるのは 15/96人。
@@ -323,8 +340,16 @@ export function batterFrameX(worldX: number, side: BatterSide = RIGHT_BATTER_SID
 }
 
 /** 打者の立ち位置X範囲（打者ローカル）。ここを通ると死球 */
-export const BATTER_ZONE_MIN_X = 0.9;
-export const BATTER_ZONE_MAX_X = 1.7;
+/**
+ * **フェーズRR-66で 0.9〜1.7 から本塁側へ寄せた**：判定のバットの到達範囲を
+ * **描かれたバットが実際に覆う範囲**へ狭めた（`BAT_REACH_OUTSIDE_X`）結果、
+ * **打者がここまで遠いと外角のストライクに届かなくなる**ため。B-9の不変条件どおり
+ * **死球ゾーンと打者の立ち位置（`BATTER_STAND_X`）は同じ定数から出す**ので、
+ * 見た目の打者もここで一緒に前へ出る（1.3→1.05）。
+ * `CPU_CONTROL_MAX_TARGET`（T-41のCPUの狙いの上限）もここからの導出なので一緒に動く。
+ */
+export const BATTER_ZONE_MIN_X = 0.65;
+export const BATTER_ZONE_MAX_X = 1.45;
 /**
  * 打者が立つX（打者ローカル。打席の中央）。シーン層の打者プレースホルダーの
  * 立ち位置もこの値から求めることで、**見た目の立ち位置と死球ゾーンがずれない**。
@@ -348,7 +373,7 @@ export const BATTER_STAND_X = (BATTER_ZONE_MIN_X + BATTER_ZONE_MAX_X) / 2;
  * **寄り切っても内角のストライクにバットが届く**ぎりぎりの値にしてあるので、
  * 「寄ったら内角は打てない」という詰み方はしない（届くが必ず詰まる）。
  */
-export const BATTER_STANCE_RANGE = 0.2;
+export const BATTER_STANCE_RANGE = 0.16;
 
 /** 立ち位置の左右移動速度 m/s（投球前のプレート移動 `RUBBER_MOVE_SPEED` と同じ手触り） */
 export const BATTER_STANCE_MOVE_SPEED = 1.2;
@@ -463,6 +488,117 @@ export const ARM_RELEASE_REACH = BATTER_STANCE_RANGE / Math.sin(ARM_SLOT_RAD.sid
 /** その腕のリリース位置の横のずれ（ワールドX。右投げなら負＝三塁側） */
 export function armReleaseOffsetX(arm: PitchArm = NEUTRAL_PITCH_ARM): number {
   return arm.side * ARM_RELEASE_REACH * Math.sin(ARM_SLOT_RAD[arm.slot]);
+}
+
+// ---------------------------------------------------------------------------
+// リリースの高さ（フェーズMM-60）
+// ---------------------------------------------------------------------------
+//
+// CC-50 が**スコープ外として明示的に残した1つ**＝それまで `RELEASE_HEIGHT` は 1.5m 固定で、
+// **下手投げ（U）が低い位置から出てくる見た目**にはなっていなかった（横のずれだけで
+// 表していた）。この投球は**高低をゾーン判定に含めない**（説明書p19準拠。`PitchFlight` は
+// x と z しか持たない）ので、**ここから下は判定に一切効かない**＝LL-59（ちっちゃいモードの
+// 縮尺）と同じ「見た目だけの値」。
+//
+// ## 「球の高さだけ腕から導く」では足りない（計測が示した）
+//
+// `applyPitch` はリリースの瞬間に腕を**前方水平**（`rotation.x` = 4.7rad）まで振り切るので、
+// 手の高さに残るのは cos(4.7)≒-0.012 の分だけ＝**横の傾き（スロット）を変えても手は肩の
+// 高さに張り付く**（`npm run balance:release` の1段目：3スロットの差は 0.053m＝実質ゼロ）。
+// そこで球だけ下げると、**下手投げは手からボールが離れる**＝CC-50 が守った
+// 「見た目と判定が同じ値から出る」の逆をやることになる。
+//
+// ## てこは上体の傾き（実際の submarine が低く出せる理由そのもの）
+//
+// 肩の1点で回すだけでは「横へ遠く」と「低く」は両立しない：横へ出す（sinφ）ほど縦に使える
+// 長さ（cosφ）が減るので、**横手ほど手は肩の高さに張り付く**。実際の横手・下手投げは
+// **上体を投げる側へ傾けて肩ごと下げている**ので、そこを軸に採った。**この1つの値から、
+// 描く姿勢（`applyPitch` の `Torso.rotation.z`）と球の出どころの高さの両方が出る**
+// ＝CC-50 が腕の角度1つから「描く腕の傾き」と「リリースの横のずれ」を出したのと同じ形。
+
+/**
+ * リリースの瞬間の上体の傾き（rad。**投げる肩が下がる向き**）。
+ *
+ * **上手は 0＝従来の姿勢そのまま**（`RELEASE_HEIGHT` も 1.5m のまま）。名鑑96人のうち
+ * **85人（89%）が上手**なので、**大多数の投手の見え方は1ドットも動かない**
+ * ＝B-8の「基準値0.5＝従来の定数」、S-40の「基準速の走者はちょうど従来の78m」、
+ * CC-50の「渡さない呼び出しは従来と同じ」と同じ**基準線を動かさない**整理。
+ *
+ * **横手のほうが下手より傾きが小さい**のは、傾けたときに下がる量が「体の中心から手までの
+ * 横の距離」に比例するから（横手は腕が横へ長く出ているぶん、同じ傾きでよく下がる）＝
+ * `ARM_SLOT_RAD` の大小とは逆になる。**実際の野球の見え方（上手＞横手＞下手の順に低い）**
+ * に合わせるため、スロットごとに別々の値を持つ（`ARM_SLOT_RAD` と同じ形の表）。
+ *
+ * 値は `npm run balance:release` が決めた（帯は「どの2つの投げ方も画面で見分けが付く
+ * 0.20m 以上離れる」〜「手が腰（0.87m）より下がると腕が軸足を突き抜ける」）：
+ * 横手 0.25 / 下手 0.55 で **上手1.500m / 横手1.283m / 下手1.051m**＝どの隣り合う2つも
+ * 0.21m 以上離れ、下手でも腰まで 0.18rad の余裕が残る。
+ */
+export const ARM_RELEASE_LEAN_RAD: Record<PitchArmSlot, number> = {
+  over: 0,
+  under: 0.55,
+  side: 0.25,
+};
+
+/**
+ * 上手のリリースの高さ（m）＝**基準線**。
+ *
+ * この 1.5m は CC-50 までの `dekkaiScene.ts` の `RELEASE_HEIGHT` そのままで、**実測すると
+ * 上手の手の高さ（1.501m）とぴったり一致する**（`npm run balance:release` の1段目）＝
+ * もともと「球は上手の手から出ている」ことを表していた値なので、上手を動かさないという
+ * 判断は「球を手から離さない」ことと同じ意味になる。
+ */
+export const RELEASE_HEIGHT = 1.5;
+
+/**
+ * 捕手のミットの高さ（m）＝**球の行き先の高さ**。`RELEASE_HEIGHT` と対になる値なので
+ * 隣に置く（フェーズNN-61で `scenes/dekkaiScene.ts` からここへ移した＝でっかいモードの
+ * ボールの見かけの大きさの基準点（`core/camera.ts` の `DEKKAI_BALL_ANCHOR`）が
+ * この高さを要るようになったため。**値は 1.0 のまま**）。
+ *
+ * **投手の投げ方では動かない**（フェーズMM-60）＝ミットがあるのは捕手のいる場所で、
+ * 実際の野球でも下手投げの相手だからといって低く構えたりはしない。球の出どころのほう
+ * （`armReleaseHeight`）だけが腕で動く。
+ */
+export const CATCH_HEIGHT = 1.0;
+
+// ---- 下の2つはモデルの寸法の写し（`entities/player.ts` / `src/assets/player.glb`）。
+//      `ARM_RELEASE_REACH` が実寸の腕を写しているのと同じ扱いで、姿勢を作り直したら
+//      ここも一緒に直す（`npm run balance:release` が順運動学で解いた値と突き合わせる）。
+/** リリースの瞬間の腰の高さ（`applyPitch` の `HIP_HEIGHT - 0.05`） */
+const RELEASE_HIP_HEIGHT = 0.87;
+/** 体の中心から肩まで（glb の ArmUpper の x） */
+const SHOULDER_HALF_WIDTH = 0.2;
+/** 肩から手まで（上腕0.28＋前腕0.345を、リリースの肘の曲げ -0.2rad で畳んだ実効の長さ） */
+const RELEASE_ARM_REACH = 0.618;
+
+/**
+ * **見た目の**手の横位置（体の中心から。ワールドX）。
+ *
+ * 判定に持ち込む `armReleaseOffsetX` は、これをプレートが吸収できる幅まで縮めたもの
+ * （CC-50。実寸のままだと P-37 の逆算がプレートの外へ出て曲がりが削られる）＝
+ * **こちらが実寸で、あちらが判定用**。高さの落差は「体の中心から手までの横の距離」に
+ * 比例するので、ここでは縮める前の実寸を使う。
+ */
+export function armReleaseHandOffsetX(arm: PitchArm = NEUTRAL_PITCH_ARM): number {
+  return arm.side * (SHOULDER_HALF_WIDTH + RELEASE_ARM_REACH * Math.sin(ARM_SLOT_RAD[arm.slot]));
+}
+
+/**
+ * その腕のリリースの高さ（ワールドY。m）＝**球の出どころ**。
+ *
+ * 上体を腰まわりに θ 傾けると、腰から見て高さ h・横 d にある手は
+ * `h·cosθ − d·sinθ` へ移る＝落差は `h(1−cosθ) + d·sinθ`。**`applyPitch` が実際に書く
+ * 傾きと同じ値から解く**ので、球は必ず手から出る（`npm run balance:release` の5段目で
+ * 順運動学の厳密解と突き合わせ、差は最大 0.011m＝720pで 0.4px＝1ピクセル未満）。
+ *
+ * **上手は傾き0なので `RELEASE_HEIGHT` ちょうど**（従来と完全に同じ）。
+ */
+export function armReleaseHeight(arm: PitchArm = NEUTRAL_PITCH_ARM): number {
+  const lean = ARM_RELEASE_LEAN_RAD[arm.slot];
+  const above = RELEASE_HEIGHT - RELEASE_HIP_HEIGHT;
+  const lateral = Math.abs(armReleaseHandOffsetX(arm));
+  return RELEASE_HEIGHT - (above * (1 - Math.cos(lean)) + lateral * Math.sin(lean));
 }
 
 /**

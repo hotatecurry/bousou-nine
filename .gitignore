@@ -19,3 +19,7 @@ analyze2.py
 .DS_Store
 Thumbs.db
 *.log
+
+# Python バイトコードキャッシュ
+__pycache__/
+*.pyc
