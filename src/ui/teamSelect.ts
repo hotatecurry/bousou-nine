@@ -156,6 +156,37 @@ const CELL_BASE_STYLE = `
   font-size: calc(16px * var(--ui-scale, 1));
 `;
 
+/**
+ * ゲームの題名（モード選択の段にだけ出す）。名前は README と同じ。原作の名前は他社の
+ * 登録商標なので使わない（CLAUDE.md「選手データは仕組み優先・名前は独自」と同じ扱い）。
+ */
+const GAME_TITLE = '暴走ナイン';
+const GAME_TITLE_ROMAN = 'BOUSOU NINE';
+
+/**
+ * 題名の字（格子の4倍＝64px。ドット体の升目が 4px の正方形にそろう）。影は2段＝
+ * 真下の朱色で厚みを、右下の濃紺で落ち影を付ける（ファミコンのタイトルロゴの押し出し）。
+ */
+const LOGO_STYLE = `
+  font-size: calc(64px * var(--ui-scale, 1));
+  line-height: 1.1;
+  letter-spacing: calc(4px * var(--ui-scale, 1));
+  color: #ffd23a;
+  text-shadow:
+    0 calc(4px * var(--ui-scale, 1)) 0 #c2411c,
+    calc(4px * var(--ui-scale, 1)) calc(8px * var(--ui-scale, 1)) 0 #10101c;
+`;
+
+/** 題名の下の読み（ローマ字。字間を空けて細く） */
+const LOGO_SUB_STYLE = `
+  margin-top: calc(10px * var(--ui-scale, 1));
+  margin-bottom: calc(28px * var(--ui-scale, 1));
+  font-size: calc(16px * var(--ui-scale, 1));
+  letter-spacing: 0.45em;
+  color: #9fb4e8;
+  text-align: center;
+`;
+
 /** 段の見出し（格子の2倍＝32px。影を付けて浮かせる） */
 const TITLE_STYLE = `
   font-size: calc(32px * var(--ui-scale, 1));
@@ -483,6 +514,17 @@ export function runTeamSelect(
     const overlay = document.createElement('div');
     overlay.style.cssText = OVERLAY_STYLE;
 
+    // 題名（モード選択の段にだけ出す）
+    const logo = document.createElement('div');
+    logo.style.cssText = 'display: flex; flex-direction: column; align-items: center;';
+    const logoName = document.createElement('div');
+    logoName.style.cssText = LOGO_STYLE;
+    logoName.textContent = GAME_TITLE;
+    const logoSub = document.createElement('div');
+    logoSub.style.cssText = LOGO_SUB_STYLE;
+    logoSub.textContent = GAME_TITLE_ROMAN;
+    logo.append(logoName, logoSub);
+
     const title = document.createElement('div');
     title.style.cssText = TITLE_STYLE;
 
@@ -550,7 +592,7 @@ ${m.note}`;
     const hint = document.createElement('div');
     hint.style.cssText = HINT_STYLE;
 
-    overlay.append(title, modeGrid, practiceGrid, grid, parkGrid, staffGrid, orderList, card, hint);
+    overlay.append(logo, title, modeGrid, practiceGrid, grid, parkGrid, staffGrid, orderList, card, hint);
     root.appendChild(overlay);
 
     function teamName(id: TeamId): string {
@@ -574,6 +616,7 @@ ${m.note}`;
 
     function render(): void {
       const onTeamGrid = step === 'away' || step === 'home';
+      logo.style.display = step === 'mode' ? 'flex' : 'none';
       modeGrid.style.display = step === 'mode' ? 'grid' : 'none';
       practiceGrid.style.display = step === 'practice' ? 'grid' : 'none';
       grid.style.display = onTeamGrid ? 'grid' : 'none';

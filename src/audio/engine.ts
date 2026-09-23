@@ -248,8 +248,3 @@ export function envelope(
   param.exponentialRampToValueAtTime(Math.max(0.0002, peak), t0 + Math.max(0.001, attack));
   param.exponentialRampToValueAtTime(0.0001, t0 + attack + Math.max(0.005, decay));
 }
-
-// DEBUG TEMP: 音量の計測用（確認後に削除）
-if (typeof window !== 'undefined') {
-  (window as unknown as { __ftAudioGraph: () => AudioGraph | null }).__ftAudioGraph = () => graph;
-}

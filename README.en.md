@@ -35,6 +35,7 @@ Requires Node.js 20+ (Vite 7). `npm run build` to build, `npm test` to run the s
 | Start (manager menu) | `Enter` | numpad `Enter` |
 | Select (confirm) | `Shift` | numpad `0` |
 | Extra (gun / dropkick / one-at-bat buff) | `G` | numpad `3` |
+| Music on/off | `M` | `M` (shared) |
 
 **A and B change meaning with the situation** — the multi-purpose button scheme the
 originals used. Bases are named by absolute direction: **up = 2nd, left = 3rd,
@@ -71,6 +72,9 @@ right = 1st, down = home**.
   pitchers, pinch hitters, pinch runners, intentional walks, steals and tag-ups.
   **Every rule is deterministic**, so it can be read and countered rather than guessed at.
 - **1P and 2P play** (two pads share one keyboard).
+- **Look and sound**: toon-shaded 3D (cel shading plus outlines) and a pixel font
+  (DotGothic16). Sound effects, the crowd and the chiptune-style music are all synthesized
+  in the browser — there are no audio files.
 
 ## Design rules
 
@@ -102,9 +106,12 @@ each has exactly one origin, so the screen can't disagree with the simulation.
 src/core/      rules and judgement (pure functions, no randomness)
 src/scenes/    the big view, the small view, and brawls
 src/entities/  players, ball, ballpark, props
+src/render/    toon shading, outlines, lighting and shadows
+src/audio/     sound effects, crowd and music (all synthesized)
 src/ui/        HUD, team select, manager menu, skill draft
 tools/balance/ balance measurement (not shipped with the game)
-tests/         1,618 tests
+tests/         1,691 tests
+assets-src/    Blender sources and the scripts that rebuild the models
 ```
 
 ## Documentation

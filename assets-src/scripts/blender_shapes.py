@@ -119,6 +119,141 @@ def capsule_rings(x, y, z_top, z_bottom, r_top, r_bottom, mid=None, cap_steps=4,
     return rings
 
 
+# ---- 置き方（持ち物で使う：回転体を寝かせる・角を丸めた箱・輪） ----
+
+def transform_bm(bm, matrix):
+    bmesh.ops.transform(bm, matrix=matrix, verts=bm.verts)
+    return bm
+
+
+def lathe_forward(y0, rings, segments=16):
+    """前（-Y）へ伸びる回転体。rings: [(t, rx, rz, cx, cz), ...]。
+
+    t は y0 から前へ進んだ距離（Y = y0 - t）、rx は左右の半幅、rz は上下の半高、
+    (cx, cz) は断面の中心。Z軸の回転体を X軸まわりに +90° 倒して作る
+    （+Z → -Y、断面の Y 半径 → 上下）。
+    """
+    import mathutils
+    bm = lathe([(r[0], r[1], r[2], r[3] if len(r) > 3 else 0.0, r[4] if len(r) > 4 else 0.0) for r in rings], segments=segments)
+    rot = mathutils.Matrix.Rotation(math.pi / 2, 4, "X")
+    return transform_bm(bm, mathutils.Matrix.Translation((0.0, y0, 0.0)) @ rot)
+
+
+def tube(p0, p1, profile, segments=12):
+    """p0 → p1 の軸に沿った回転体。profile: [(s, r), ...]（s=0..1 は軸上の位置、r は半径）。
+    半径が 0 の輪は極（閉じた先端）になる。"""
+    import mathutils
+    a = Vector(p0)
+    b = Vector(p1)
+    d = b - a
+    length = d.length
+    rings = [(s * length, r, r) for (s, r) in profile]
+    bm = lathe(rings, segments=segments)
+    q = Vector((0.0, 0.0, 1.0)).rotation_difference(d.normalized())
+    return transform_bm(bm, mathutils.Matrix.Translation(a) @ q.to_matrix().to_4x4())
+
+
+def rod(p0, p1, r, segments=12, round_ends=True):
+    """太さ一定の棒（端は丸めるか平らにする）。"""
+    import mathutils
+    d = (Vector(p1) - Vector(p0))
+    length = d.length
+    if not round_ends:
+        return tube(p0, p1, [(0.0, 0.0), (0.0, r), (1.0, r), (1.0, 0.0)], segments)
+    cap = min(r, length / 2) / length
+    prof = [(0.0, 0.0)]
+    for k in range(1, 4):
+        a = (math.pi / 2) * k / 3
+        prof.append((cap * (1 - math.cos(a)), r * math.sin(a)))
+    for k in range(3, 0, -1):
+        a = (math.pi / 2) * k / 3
+        prof.append((1 - cap * (1 - math.cos(a)), r * math.sin(a)))
+    prof.append((1.0, 0.0))
+    return tube(p0, p1, prof, segments)
+
+
+def rounded_box(center, size, radius, segments=3, rotation=(0.0, 0.0, 0.0)):
+    """角を丸めた箱（トゥーンの縁が角でぎざぎざにならない）。rotation は XYZ オイラー角。"""
+    import mathutils
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    transform_bm(bm, mathutils.Matrix.Diagonal((size[0], size[1], size[2], 1.0)))
+    r = min(radius, min(size) * 0.49)
+    bmesh.ops.bevel(
+        bm,
+        geom=list(bm.verts) + list(bm.edges),
+        offset=r,
+        offset_type="OFFSET",
+        segments=segments,
+        profile=0.5,
+        affect="EDGES",
+        clamp_overlap=True,
+    )
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    m = mathutils.Matrix.Translation(center) @ mathutils.Euler(rotation, "XYZ").to_matrix().to_4x4()
+    return transform_bm(bm, m)
+
+
+def torus(center, axis, major, minor, seg_major=32, seg_minor=12):
+    """輪（タイヤ・用心金）。axis は輪の軸（'X'/'Y'/'Z'）。"""
+    import mathutils
+    bm = bmesh.new()
+    loops = []
+    for i in range(seg_major):
+        u = 2 * math.pi * i / seg_major
+        ring = []
+        for j in range(seg_minor):
+            v = 2 * math.pi * j / seg_minor
+            rr = major + minor * math.cos(v)
+            ring.append(bm.verts.new((rr * math.cos(u), rr * math.sin(u), minor * math.sin(v))))
+        loops.append(ring)
+    for i in range(seg_major):
+        a = loops[i]
+        b = loops[(i + 1) % seg_major]
+        for j in range(seg_minor):
+            k = (j + 1) % seg_minor
+            bm.faces.new((a[j], b[j], b[k], a[k]))
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    to_axis = {
+        "Z": mathutils.Matrix.Identity(4),
+        "X": mathutils.Matrix.Rotation(math.pi / 2, 4, "Y"),
+        "Y": mathutils.Matrix.Rotation(math.pi / 2, 4, "X"),
+    }[axis]
+    return transform_bm(bm, mathutils.Matrix.Translation(center) @ to_axis)
+
+
+def ellipsoid(center, rx, ry, rz, steps=10, segments=16):
+    return lathe(ellipsoid_rings(center, rx, ry, rz, steps=steps), segments=segments)
+
+
+def arc_band(center, radius, a0, a1, half_width, half_thick, seg_arc=20, seg_cross=12):
+    """X軸まわりの円弧に沿った帯（泥よけ）。断面は楕円（左右 half_width・厚み half_thick）。
+
+    角度は YZ 平面で測る（0 = +Y、90° = 真上）。両端は閉じる。
+    """
+    bm = bmesh.new()
+    cx, cy, cz = center
+    loops = []
+    for i in range(seg_arc + 1):
+        a = math.radians(a0 + (a1 - a0) * i / seg_arc)
+        ny, nz = math.cos(a), math.sin(a)  # 外向き（半径方向）
+        ring = []
+        for j in range(seg_cross):
+            v = 2 * math.pi * j / seg_cross
+            x = half_width * math.cos(v)
+            rr = radius + half_thick * math.sin(v)
+            ring.append(bm.verts.new((cx + x, cy + rr * ny, cz + rr * nz)))
+        loops.append(ring)
+    for a, b in zip(loops, loops[1:]):
+        for j in range(seg_cross):
+            k = (j + 1) % seg_cross
+            bm.faces.new((a[j], a[k], b[k], b[j]))
+    bm.faces.new(loops[0])
+    bm.faces.new(list(reversed(loops[-1])))
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    return bm
+
+
 # ---- オブジェクト ----
 
 def bm_to_object(name, bm, mat, collection=None):

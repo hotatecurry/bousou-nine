@@ -198,6 +198,7 @@ import {
   createRunners,
 } from './scenes/chicchaiScene';
 import {
+  BRAWL_STAGE_Z,
   createBrawlCamera,
   createBrawlController,
   createBrawlFighters,
@@ -240,7 +241,6 @@ setTextureAnisotropy(renderer.capabilities.getMaxAnisotropy());
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-(window as unknown as { __ftScene: THREE.Scene }).__ftScene = scene; // DEBUG TEMP
 scene.background = new THREE.Color(0x101820);
 
 // 光源は太陽＋空の照り返しの2つだけ（トゥーンの階調は太陽の向きで段が決まる）。
@@ -323,7 +323,9 @@ const batter = createPlayer(BATTER_COLOR);
 batter.position.set(batterStandX(), 0, 0.2);
 scene.add(batter);
 
-const catcher = createPlayer(0x33aa55);
+// 捕手は守備側＝投手と同じユニフォーム（ブラッシュアップ：旧来の緑は仮の色で、
+// 本塁の前に3チーム目がいるように見えていた）
+const catcher = createPlayer(PITCHER_COLOR);
 catcher.position.set(0, 0, 2.4);
 // 捕手だけは本塁の後ろから投手（-Z）を向く＝でっかいモードのカメラからは背中が見える
 setPlayerFacing(catcher, Math.PI);
@@ -389,8 +391,8 @@ window.addEventListener('resize', () => {
 
 /** 影を寄せる注視点（毎フレーム書き直す作業用） */
 const shadowFocus = new THREE.Vector3();
-/** 乱闘の舞台の中心（`brawlScene.ts` の STAGE_Z と同じ場所をカメラから導く） */
-const brawlStageFocus = new THREE.Vector3();
+/** 乱闘の舞台の中心（影をここへ寄せる） */
+const brawlStageFocus = new THREE.Vector3(0, 0, BRAWL_STAGE_Z);
 
 /**
  * 1フレームを描く。**描画はすべてここを通す**＝影の範囲（いま映っているモードの
@@ -401,9 +403,6 @@ function renderFrame(): void {
   if (activeCamera === chicchaiCamera) {
     lightRig.update('chicchai', groundFocusOf(chicchaiCamera, shadowFocus));
   } else if (activeCamera === brawlCamera) {
-    brawlCamera.getWorldPosition(brawlStageFocus);
-    brawlStageFocus.z += 6.5;
-    brawlStageFocus.y = 0;
     lightRig.update('brawl', brawlStageFocus);
   } else {
     lightRig.update('dekkai', shadowFocus.set(0, 0, -8));

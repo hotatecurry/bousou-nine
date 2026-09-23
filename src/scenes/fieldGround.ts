@@ -38,6 +38,8 @@ const HOME_CIRCLE_RADIUS = 4.2;
 const MOUND_CIRCLE_RADIUS = 3.1;
 /** マウンドの高さ。**でっかいモードの投手はこの高さに立っている**（main.ts の pitcher.position.y） */
 const MOUND_HEIGHT = 0.4;
+/** マウンドを土の円（y=0.04）の下からわずかに持ち上げる量（裾が円に埋もれて継ぎ目が出ない） */
+const MOUND_LIFT = 0.035;
 /** ウォーニングトラックの幅（外周の壁の内側） */
 const WARNING_TRACK_WIDTH = 4.2;
 /** 白線の幅（実物は10cmだが、ちっちゃいモードの鳥瞰で消えない太さにする） */
@@ -310,17 +312,24 @@ function chalkLineGeometry(fx: number, fz: number, tx: number, tz: number): THRE
   ]);
 }
 
-/** マウンドの盛り上がり（頂上は平ら＝投手が立つ高さ、裾はなめらかに地面へ） */
+/**
+ * マウンドの盛り上がり（頂上は平ら＝投手が立つ高さ、裾はなめらかに地面へ）。
+ *
+ * **輪郭は裾から頂上へ（下から上へ）並べる**。`LatheGeometry` は輪郭の進む向きから
+ * 法線と面の表裏を決めるので、上から下へ並べると**裏返った殻**になる（手前の斜面が
+ * 裏面として消え、奥の斜面の内側が暗く映る＝マウンドの奥に黒い三日月が出ていた）。
+ */
 function moundGeometry(): THREE.BufferGeometry {
-  const h = MOUND_HEIGHT;
+  // 頂上がちょうど MOUND_HEIGHT（投手の立つ高さ）に来るよう、持ち上げるぶんを引いておく
+  const h = MOUND_HEIGHT - MOUND_LIFT;
   const profile = [
-    new THREE.Vector2(0, h),
-    new THREE.Vector2(0.9, h),
-    new THREE.Vector2(1.4, h * 0.93),
-    new THREE.Vector2(1.9, h * 0.72),
-    new THREE.Vector2(2.4, h * 0.38),
-    new THREE.Vector2(2.75, h * 0.12),
     new THREE.Vector2(2.95, 0),
+    new THREE.Vector2(2.75, h * 0.12),
+    new THREE.Vector2(2.4, h * 0.38),
+    new THREE.Vector2(1.9, h * 0.72),
+    new THREE.Vector2(1.4, h * 0.93),
+    new THREE.Vector2(0.9, h),
+    new THREE.Vector2(0, h),
   ];
   return new THREE.LatheGeometry(profile, 48);
 }
@@ -435,14 +444,14 @@ export function createGround(park: Ballpark): THREE.Group {
   setWorldUV(moundGeo, DIRT_TILE);
   const mound = new THREE.Mesh(moundGeo, dirt);
   mound.receiveShadow = true;
-  mound.position.y = 0.035;
+  mound.position.y = MOUND_LIFT;
   group.add(mound);
   // プレート（投手板）
   const rubber = new THREE.Mesh(
     new THREE.BoxGeometry(0.9, 0.05, 0.22),
     createToonMaterial({ color: 0xffffff }),
   );
-  rubber.position.set(0, MOUND_HEIGHT + 0.045, PITCHER_PLATE_Z);
+  rubber.position.set(0, MOUND_HEIGHT + 0.02, PITCHER_PLATE_Z);
   rubber.receiveShadow = true;
   group.add(rubber);
 

@@ -47,8 +47,21 @@ import {
 import { type BrawlAttackStyle, createPlayer, setPlayerColor, setPlayerFacing, setPlayerPose } from '../entities/player';
 import type { DirectionState, VirtualPad } from '../input/keyboard';
 
-/** メインのフィールドから十分離れた位置に専用ステージを置く（同一Scene内、カメラ切替のみ） */
-const STAGE_Z = 320;
+/**
+ * 乱闘の舞台＝**本塁とマウンドの間（フィールドの上）**。カメラは本塁の側に立って外野を
+ * 向く（でっかいモードと同じ向き）ので**画面右が +X**になり、打者（-X）が画面左・
+ * 投手（+X）が画面右に立つ＝HUDの体力ゲージ（打者＝左／投手＝右）とも、コマンドの
+ * 「前」（`BRAWL_FACING`）とも画面の左右が一致する。
+ *
+ * ブラッシュアップで舞台を移した：旧来は z=+320（本塁の裏、球場の外）に置き、カメラが
+ * +Z を向いていたため**画面右が -X**＝打者が画面右・投手が画面左に映り、体力ゲージとも
+ * 十字キーの「前」とも左右が逆になっていた（背景も何もない地面だった）。フィールドの
+ * 上なら背後にマウンド・外野・スタンドが映り、死球のあとその場で始まる見え方にもなる。
+ * でっかいモードの3人とちっちゃいモードの野手は乱闘中は隠れている（main.ts の refresh）。
+ */
+export const BRAWL_STAGE_Z = -9.5;
+/** カメラから舞台の中心までの距離（2人が画面の左右半分ずつに収まる） */
+const CAMERA_DISTANCE = 6.5;
 const FIGHTER_HALF_GAP = 2.2;
 const LUNGE_DISTANCE = 0.9;
 /** 食らったときに押し下がる距離（横視点なので、当たったことが位置でも読める） */
@@ -86,8 +99,8 @@ const MOVE_POSE: Record<MoveId, BrawlAttackStyle> = {
 
 export function createBrawlCamera(aspect: number): THREE.PerspectiveCamera {
   const camera = new THREE.PerspectiveCamera(42, aspect, 0.1, 600);
-  camera.position.set(0, 1.7, STAGE_Z - 6.5);
-  camera.lookAt(0, 1.1, STAGE_Z);
+  camera.position.set(0, 1.7, BRAWL_STAGE_Z + CAMERA_DISTANCE);
+  camera.lookAt(0, 1.1, BRAWL_STAGE_Z);
   return camera;
 }
 
@@ -101,8 +114,8 @@ export interface BrawlFighterMeshes {
 export function createBrawlFighters(): BrawlFighterMeshes {
   const batter = createPlayer(BATTER_COLOR);
   const pitcher = createPlayer(PITCHER_COLOR);
-  batter.position.set(-FIGHTER_HALF_GAP, 0, STAGE_Z);
-  pitcher.position.set(FIGHTER_HALF_GAP, 0, STAGE_Z);
+  batter.position.set(-FIGHTER_HALF_GAP, 0, BRAWL_STAGE_Z);
+  pitcher.position.set(FIGHTER_HALF_GAP, 0, BRAWL_STAGE_Z);
   // 横視点固定カメラ（CLAUDE.md ③）なので、2人は画面の左右で**向かい合う**必要がある。
   setPlayerFacing(batter, Math.PI / 2);
   setPlayerFacing(pitcher, -Math.PI / 2);
