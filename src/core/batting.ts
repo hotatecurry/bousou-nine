@@ -289,7 +289,7 @@ const BOUNCE_STOP_VY = 1.2;
 const ROLL_DECEL = 5.5;
 /** 転がりがこれ以下になったら静止 */
 const REST_SPEED = 0.5;
-const WALL_RESTITUTION = 0.35;
+export const WALL_RESTITUTION = 0.35;
 
 /** 打撃面の通過情報。frac はステップ内の通過タイミング（0..1、サブフレーム精度） */
 export interface PlaneCrossing {

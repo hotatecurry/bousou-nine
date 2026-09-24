@@ -27,7 +27,7 @@
  *   ボールが画面中心より先に出るので、スクロールしている感じが出る。
  */
 import { GRAVITY } from './batting';
-import type { Vec2 } from './fielding';
+import { BASE_AXIS, type Vec2 } from './fielding';
 import {
   CATCH_HEIGHT,
   CATCH_Z,
@@ -95,7 +95,11 @@ export const CHICCHAI_TILT_DEG = 70;
  */
 export const CHICCHAI_PLAYER_SCALE = 2.5;
 
-/** でっかいモードの垂直画角（度） */
+/**
+ * でっかいモードの垂直画角の**下限**（度）。実際の画角は窓の形から `dekkaiFovFor` が決める
+ * （一・三塁の走者が画面に収まる広さ。16:9 では約42.5°）。これより狭くはしない＝
+ * 横に広い窓で寄りすぎない。
+ */
 export const DEKKAI_FOV_DEG = 40;
 
 /**
@@ -206,6 +210,32 @@ export function dekkaiViewDepth(p: { x: number; y: number; z: number }): number 
     (p.y - DEKKAI_CAMERA_POS.y) * DEKKAI_FORWARD.y +
     (p.z - DEKKAI_CAMERA_POS.z) * DEKKAI_FORWARD.z
   );
+}
+
+/**
+ * 一・三塁のベースに立つ走者の体の半分の幅 m（腕を含む）と、画面の縁からの余白（NDC）。
+ * `dekkaiFovFor` がこの2つで「走者が画面の横幅に収まる」ことを決める。
+ */
+export const DEKKAI_RUNNER_HALF_WIDTH = 0.6;
+export const DEKKAI_EDGE_MARGIN = 0.03;
+
+/**
+ * でっかいモードの垂直画角（度）を**窓の形から**決める（テストプレイ「塁が埋まっているのに
+ * でっかいモードでは塁に誰もいない」）。**一・三塁のベースに立つ走者が必ず画面の横幅に
+ * 収まる**最小の画角で、`DEKKAI_FOV_DEG`（40°）より狭くはしない。
+ *
+ * 40°固定のときは、一・三塁のベースが16:9の画面の**ちょうど左右の端**（NDC ±1.00）にあり、
+ * 塁上の走者は半分切れ、16:9より細い窓では画面の外に出ていた。窓の横幅が一・三塁ぶん
+ * 以上あることを優先したので、**16:9 でも絵全体が約6%小さくなり、細い窓ほど小さくなる**
+ * （2026-09-25 ユーザー判断「少し引いて常に入れる」）。**判定には一切効かない**
+ * （カメラはどの純粋関数の引数にもならない）。
+ */
+export function dekkaiFovFor(aspect: number): number {
+  const edge = { x: BASE_AXIS + DEKKAI_RUNNER_HALF_WIDTH, y: 0.9, z: -BASE_AXIS };
+  // 見る先が真正面（ヨー無し）なので、カメラの右はワールドの +X＝横のずれは x そのもの
+  const tanHalfH = (edge.x - DEKKAI_CAMERA_POS.x) / dekkaiViewDepth(edge) / (1 - DEKKAI_EDGE_MARGIN);
+  const needed = (2 * Math.atan(tanHalfH / aspect) * 180) / Math.PI;
+  return Math.max(DEKKAI_FOV_DEG, needed);
 }
 
 /** 上の基準点の奥行き m（＝10.51m。見かけの大きさの分母） */

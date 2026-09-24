@@ -44,6 +44,7 @@ import {
   type BattedBall,
   type BattingProfile,
   SWING_ACTIVE_SEC,
+  SWING_IDEAL_SEC,
   SWING_STARTUP_SEC,
   contactPlaneCrossing,
   createBattedBall,
@@ -78,7 +79,7 @@ import { createProp, gunMuzzleOf } from '../entities/props';
 import {
   DEKKAI_CAMERA_LOOK_AT,
   DEKKAI_CAMERA_POS,
-  DEKKAI_FOV_DEG,
+  dekkaiFovFor,
   dekkaiBallLook,
   pitchArcPath,
 } from '../core/camera';
@@ -94,7 +95,8 @@ import type { VirtualPad } from '../input/keyboard';
 export const DEKKAI_CAMERA_FAR = 500;
 
 export function createDekkaiCamera(aspect: number): THREE.PerspectiveCamera {
-  const camera = new THREE.PerspectiveCamera(DEKKAI_FOV_DEG, aspect, 0.1, DEKKAI_CAMERA_FAR);
+  // 画角は窓の形から（一・三塁の走者が必ず画面に収まる広さ。`dekkaiFovFor`）
+  const camera = new THREE.PerspectiveCamera(dekkaiFovFor(aspect), aspect, 0.1, DEKKAI_CAMERA_FAR);
   // 本塁（捕手）のやや後方・頭上から投手方向（-Z）を見る。**置き場所は core/camera.ts**
   // （フェーズNN-61）＝ボールの見かけの大きさがカメラからの距離で決まるので、
   // テストと `npm run balance:ball` が同じ値を読める場所に置いてある。
@@ -678,11 +680,30 @@ export function createCpuPitcherController(
 
 // ---- 打撃 ----
 
-/** バットを振り抜くまでの時間（接触ウィンドウの終端と一致させる） */
+/**
+ * 接触ウィンドウの終端（ここまでにKを離せばバントに切り替わる＝説明書p14）。
+ * **当たる瞬間までの振りの速さもここから決まる**（進行度 = 経過 ÷ この時間。RR-66で
+ * 実機に合わせた「バット先端が本塁を通る時刻＝判定の芯」はこの速さの上に乗っている）。
+ */
 const SWING_SWEEP_SEC = SWING_STARTUP_SEC + SWING_ACTIVE_SEC;
-/** 振り抜き後、構えに戻るまでの時間 */
-const SWING_RECOVER_SEC = 0.24;
-const SWING_TOTAL_SEC = SWING_SWEEP_SEC + SWING_RECOVER_SEC;
+/** 当たる瞬間の進行度（`player.ts` の `SWING_CONTACT_P` と同じ値＝判定の芯の時刻） */
+const SWING_CONTACT_P = SWING_IDEAL_SEC / SWING_SWEEP_SEC;
+/**
+ * 当たる瞬間から振り切るまでの時間。**打球が飛んでちっちゃいモードへ切り替わるまでの間
+ * （`CONTACT_FOLLOW_SEC`＝0.16秒）に振り切りが終わる**長さ＝打った瞬間の画面でも
+ * フィニッシュまで見える。
+ */
+const SWING_FOLLOW_SEC = 0.16;
+/** 振り切った形（フィニッシュ）で止まっている時間 */
+const SWING_HOLD_SEC = 0.22;
+/** フィニッシュから構えへ戻る時間（**振った道を逆にはたどらない**） */
+const SWING_RECOVER_SEC = 0.3;
+const SWING_TOTAL_SEC = SWING_IDEAL_SEC + SWING_FOLLOW_SEC + SWING_HOLD_SEC + SWING_RECOVER_SEC;
+/**
+ * 当たる瞬間より後に体がさらに回る角度（振り切り）。当たる瞬間までの回転
+ * （`SWING_YAW_RANGE × SWING_CONTACT_P`）と合わせて、**胸が投手を越えるまで回り切る**。
+ */
+const SWING_FOLLOW_YAW = 0.45;
 /**
  * 構えのヨー角と、フルスイングまでの回転量（プレースホルダー人形の簡易モーション）。
  * いずれも**右打者基準**で、左打者は打者ローカルの鏡像＝ヨー角の符号を反転して使う
@@ -995,13 +1016,31 @@ export function createBattingController(opts: {
   }
 
   /**
-   * スイングの進行度（0=構え / 1=振り抜き）。振り切るまでは増え、振り抜いた後は
-   * 構えへ戻るぶん減る。**体のヨー（振り）も腕の姿勢もこの1つの値から起こす**ので、
-   * 「体は振り切っているのに腕は構えのまま」がフレーム単位でも起きない。
+   * スイングの進行度（`p`：0=構え / `SWING_CONTACT_P`=当たる瞬間 / 1=振り切り）と、
+   * フィニッシュから構えへ戻る割合（`recover`）。**体のヨー（振り）も腕の姿勢もこの2つから
+   * 起こす**ので、「体は振り切っているのに腕は構えのまま」がフレーム単位でも起きない。
+   *
+   * **当たる瞬間までは従来とまったく同じ速さ**（判定の芯とバットが本塁を通る時刻は RR-66 の
+   * まま）。それより後は減速しながら振り切り、少し止まってから、**振った道を逆にたどらずに**
+   * 構えへ戻る（テストプレイ「振り切ったバットが中途半端な位置で止まる」＝旧実装は振り抜きの
+   * 形を0.045秒しか見せず、すぐにスイングを逆再生して構えへ戻していた）。
    */
-  function swingProgress(t: number): number {
-    if (t <= SWING_SWEEP_SEC) return t / SWING_SWEEP_SEC;
-    return 1 - Math.min((t - SWING_SWEEP_SEC) / SWING_RECOVER_SEC, 1);
+  function swingProgress(t: number): { p: number; recover: number } {
+    if (t <= SWING_IDEAL_SEC) return { p: t / SWING_SWEEP_SEC, recover: 0 };
+    const u = Math.min(1, (t - SWING_IDEAL_SEC) / SWING_FOLLOW_SEC);
+    const eased = 1 - (1 - u) * (1 - u);
+    const p = SWING_CONTACT_P + (1 - SWING_CONTACT_P) * eased;
+    const back = t - SWING_IDEAL_SEC - SWING_FOLLOW_SEC - SWING_HOLD_SEC;
+    if (back <= 0) return { p, recover: 0 };
+    const rr = Math.min(1, back / SWING_RECOVER_SEC);
+    return { p, recover: rr * rr * (3 - 2 * rr) };
+  }
+
+  /** 体のヨー（構えからどれだけ回したか）。当たる瞬間までは従来の速さ、その後は振り切り */
+  function swingYaw(p: number, recover: number): number {
+    const toContact = SWING_YAW_RANGE * Math.min(p, SWING_CONTACT_P);
+    const follow = Math.max(0, (p - SWING_CONTACT_P) / (1 - SWING_CONTACT_P));
+    return (toContact + SWING_FOLLOW_YAW * follow) * (1 - recover);
   }
 
   /**
@@ -1019,15 +1058,18 @@ export function createBattingController(opts: {
       setPlayerPose(batter, { kind: 'bunt', side: stanceSide });
       return;
     }
-    const p = swingProgress(swingT);
-    batter.rotation.y = stanceSide * (STANCE_YAW - SWING_YAW_RANGE * p);
-    setPlayerPose(batter, { kind: 'swing', side: stanceSide, t: p });
+    const { p, recover } = swingProgress(swingT);
+    batter.rotation.y = stanceSide * (STANCE_YAW - swingYaw(p, recover));
+    setPlayerPose(batter, { kind: 'swing', side: stanceSide, t: p, recover });
   }
   syncBatterPose();
 
   return {
     trySwing() {
-      if (swingT !== null || swung) return false;
+      if (swung) return false;
+      // 前のスイングがフィニッシュ（止まっている形・構えへ戻る途中）にあれば、振り直せる
+      // （振り切りを最後まで見せるようにしたので、次の球のほうが先に来ても振れなくならない）
+      if (swingT !== null && (bunting || swingT < SWING_IDEAL_SEC + SWING_FOLLOW_SEC)) return false;
       swingT = 0;
       swung = true;
       contacted = false;
@@ -1122,6 +1164,9 @@ export function createBattingController(opts: {
       // 立ち位置は打者ごとに仕切り直す（フェーズO-36）。前の打者の踏み込みが
       // 次の打者に残ると、打席に入った瞬間の死球ゾーンが本人の構えと食い違う。
       stance = 0;
+      // 前の打者のフィニッシュ（振り切った形）を次の打者へ持ち越さない＝構えで歩いて入る
+      swingT = null;
+      bunting = false;
       entranceSec = durationSec;
       entranceT = 0;
       syncBatterPosition();
@@ -1138,7 +1183,10 @@ export function createBattingController(opts: {
     endPitch() {
       // 1球の決着（判定確定）でこの球の打撃動作を終える。バントでバットを出したまま
       // 球を見送った場合に、次の球へバント姿勢を持ち越さないために必要。
-      swingT = null;
+      // **フルスイングは振り切りとフィニッシュを最後まで見せる**（テストプレイ「振り切った
+      // バットが中途半端な位置で止まる」＝空振りの球がミットに届いて判定が確定した瞬間、
+      // ここで振り抜きの途中から構えへ飛んで戻っていた）。時間が来れば `update` が畳む。
+      if (bunting) swingT = null;
       bunting = false;
       contacted = false;
       syncBatterPose();

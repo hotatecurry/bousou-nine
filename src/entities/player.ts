@@ -131,8 +131,11 @@ export type PlayerPose =
    * （打者の仕切り直し＝打席へ歩いて入る間。フェーズE-23）。
    */
   | { kind: 'stance'; side: BatterSide; walking?: boolean }
-  /** スイング。t=0（構え）〜1（振り抜き） */
-  | { kind: 'swing'; side: BatterSide; t: number }
+  /**
+   * スイング。t=0（構え）〜`SWING_CONTACT_P`（当たる瞬間）〜1（振り切ったフィニッシュ）。
+   * `recover`（0..1）はフィニッシュから構えへ戻る割合＝**振った道を逆にたどらずに戻る**。
+   */
+  | { kind: 'swing'; side: BatterSide; t: number; recover?: number }
   /** バント（バットを出して止める） */
   | { kind: 'bunt'; side: BatterSide }
   /**
@@ -681,7 +684,7 @@ export function setPlayerPose(group: THREE.Group, pose: PlayerPose): void {
       if (pose.walking) applyRunLegs(j, visual.gait * GAIT_RADIANS_PER_METER, WALK_STRIDE_SCALE);
       break;
     case 'swing':
-      applySwing(visual, pose.side, pose.t);
+      applySwing(visual, pose.side, pose.t, pose.recover ?? 0);
       break;
     case 'bunt':
       applyBunt(visual, pose.side);
@@ -889,7 +892,16 @@ const SWING_BAT_DIR = { x: 0.68, y: -0.05, z: 0.73 };
  * **当たる瞬間までの姿勢は1mmも動かさない**（RR-66が実機で合わせた「バットが本塁を
  * 通る時刻＝判定の芯」はそのまま）ので、**判定にも見た目の接触にも影響しない**。
  */
-const FOLLOW_BAT_DIR = { x: 0.2, y: 0.45, z: -0.87 };
+const FOLLOW_BAT_DIR = { x: 0.8, y: -0.4, z: -0.45 };
+/** 振り切りで肘がたたまれる量（後ろの腕・前の腕）／腕が振り上がる量（同）／上体のねじり切り */
+const FINISH_BACK_ELBOW = 1.4;
+const FINISH_FRONT_ELBOW = 1.9;
+const FINISH_BACK_RAISE = 0.85;
+const FINISH_FRONT_RAISE = 0.65;
+/** 振り切りで腕が前の肩の側へ寄る量（握る後ろの腕／添える前の腕＝前の手は握る手のそばへ） */
+const FINISH_ARM_CROSS = 0.9;
+const FINISH_FRONT_CROSS = 0.2;
+const FINISH_TORSO_TWIST = 0.2;
 /** バントのバットの向き（体の前へ水平に出す） */
 const BUNT_BAT_DIR = { x: -0.45, y: 0.05, z: 0.89 };
 
@@ -898,10 +910,13 @@ const BUNT_BAT_DIR = { x: -0.45, y: 0.05, z: 0.89 };
  * 描くのは「腕がたたまれた構えから伸び切るまで」だけ＝両方が合わさって振り抜きになる。
  * t は0（構え）〜1（振り抜き）。
  */
-function applySwing(visual: PlayerVisual, side: BatterSide, t: number): void {
+function applySwing(visual: PlayerVisual, side: BatterSide, t: number, recover: number): void {
   applyStancePose(visual, side);
   const j = visual.joints;
   const p = Math.min(1, Math.max(0, t));
+  // 構えへ戻る割合（フィニッシュの形から構えの形へ補間する。0=フィニッシュのまま）
+  const r = Math.min(1, Math.max(0, recover));
+  const mix = (swing: number, stance: number): number => swing + (stance - swing) * r;
   // **腕とバットは「当たる瞬間」に伸び切る**（フェーズRR-66）。体のヨー（振り）は
   // 呼び出し側が `p` で回し続けるので、ここで前倒しするのは腕の伸びとバットの向きだけ
   // ＝G-27の技（0.5＝当たる瞬間に伸び切る）と同じ約束を打撃にも通す。
@@ -917,26 +932,26 @@ function applySwing(visual: PlayerVisual, side: BatterSide, t: number): void {
   const back = side >= 0 ? { upper: j.ArmUpperR, lower: j.ArmLowerR } : { upper: j.ArmUpperL, lower: j.ArmLowerL };
   const front = side >= 0 ? { upper: j.ArmUpperL, lower: j.ArmLowerL } : { upper: j.ArmUpperR, lower: j.ArmLowerR };
   // 肘が伸びる（構えの -1.95/-1.6 から 0 へ）＝バットが体から離れて走る。
-  // 振り抜きでは**もう一度たたまれる**＝バットが体に巻き付いて肩の上へ収まる。
-  back.lower.rotation.x = -1.95 * (1 - ext) - 1.55 * follow;
-  front.lower.rotation.x = -1.6 * (1 - ext) - 1.75 * follow;
-  // 腕が投手方向（体の前）へ出て、振り抜きでは肘がたたまれて手が肩の前へ戻る
-  back.upper.rotation.x = -0.15 - 1.0 * ext + 0.3 * follow;
-  front.upper.rotation.x = -0.35 - 0.9 * ext + 0.2 * follow;
-  back.upper.rotation.z = sign * (0.35 - 0.15 * ext + 0.2 * follow);
-  front.upper.rotation.z = sign * (0.95 - 0.55 * ext + 0.15 * follow);
-  // 腰が回るぶん上体もついていく（こちらは振り抜きまで続くので `p` のまま）。
-  // 振り抜きでは上体が起きる＝前へかぶさったまま終わらない。
-  j.Torso.rotation.y = -sign * 0.35 * p;
-  j.Torso.rotation.x = -0.08 - 0.1 * p + 0.12 * follow;
-  // バットは立てた構えから体の前の水平へ（**体のヨー回転と合わさって振り抜きになる**）
-  aimBat(
-    visual,
-    side,
-    STANCE_BAT_DIR.x + (SWING_BAT_DIR.x - STANCE_BAT_DIR.x) * ext + (FOLLOW_BAT_DIR.x - SWING_BAT_DIR.x) * follow,
-    STANCE_BAT_DIR.y + (SWING_BAT_DIR.y - STANCE_BAT_DIR.y) * ext + (FOLLOW_BAT_DIR.y - SWING_BAT_DIR.y) * follow,
-    STANCE_BAT_DIR.z + (SWING_BAT_DIR.z - STANCE_BAT_DIR.z) * ext + (FOLLOW_BAT_DIR.z - SWING_BAT_DIR.z) * follow,
-  );
+  // 振り切りでは**もう一度たたまれる**＝バットが前の肩の上から背中へ巻き付く。
+  back.lower.rotation.x = mix(-1.95 * (1 - ext) - FINISH_BACK_ELBOW * follow, -1.95);
+  front.lower.rotation.x = mix(-1.6 * (1 - ext) - FINISH_FRONT_ELBOW * follow, -1.6);
+  // 腕が投手方向（体の前）へ出て、振り切りでは**頭の高さまで振り上がる**（両手が前の肩の上）
+  back.upper.rotation.x = mix(-0.15 - 1.0 * ext - FINISH_BACK_RAISE * follow, -0.15);
+  front.upper.rotation.x = mix(-0.35 - 0.9 * ext - FINISH_FRONT_RAISE * follow, -0.35);
+  // 振り切りでは両腕が前の肩の側へ寄る（**握る後ろの腕は胸を横切り**、手が前の肩の上に来る
+  // ＝バットが肩の上を越えて背中側へ抜ける。手が胸の前に残るとバットが体の中を通る）
+  back.upper.rotation.z = sign * mix(0.35 - 0.15 * ext - FINISH_ARM_CROSS * follow, 0.35);
+  front.upper.rotation.z = sign * mix(0.95 - 0.55 * ext - FINISH_FRONT_CROSS * follow, 0.95);
+  // 腰が回るぶん上体もついていく。振り切りでは**胸が投手を越えるまでねじり切り**、
+  // 上体が起きる＝前へかぶさったまま終わらない
+  j.Torso.rotation.y = mix(-sign * (0.35 * Math.min(p, SWING_CONTACT_P) / SWING_CONTACT_P + FINISH_TORSO_TWIST * follow), 0);
+  j.Torso.rotation.x = mix(-0.08 - 0.1 * Math.min(1, p / SWING_CONTACT_P) + 0.22 * follow, -0.08);
+  // バットは立てた構えから体の前の水平へ（**体のヨー回転と合わさって振り抜きになる**）、
+  // 振り切りでは前の肩の上を越えて背中側へ
+  const bx = STANCE_BAT_DIR.x + (SWING_BAT_DIR.x - STANCE_BAT_DIR.x) * ext + (FOLLOW_BAT_DIR.x - SWING_BAT_DIR.x) * follow;
+  const by = STANCE_BAT_DIR.y + (SWING_BAT_DIR.y - STANCE_BAT_DIR.y) * ext + (FOLLOW_BAT_DIR.y - SWING_BAT_DIR.y) * follow;
+  const bz = STANCE_BAT_DIR.z + (SWING_BAT_DIR.z - STANCE_BAT_DIR.z) * ext + (FOLLOW_BAT_DIR.z - SWING_BAT_DIR.z) * follow;
+  aimBat(visual, side, mix(bx, STANCE_BAT_DIR.x), mix(by, STANCE_BAT_DIR.y), mix(bz, STANCE_BAT_DIR.z));
 }
 
 /** バント：バットを前へ出して止める（振り抜かないので進行度を持たない） */

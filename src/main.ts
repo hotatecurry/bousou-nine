@@ -106,7 +106,7 @@ import {
   readingText,
   type SightPoint,
 } from './core/skillSight';
-import { CATCH_RADIUS } from './core/fielding';
+import { BASE_POSITIONS, CATCH_RADIUS } from './core/fielding';
 import { runSkillDraft } from './ui/skillDraft';
 import { matchEnd, runEnd, runNextSelect } from './ui/runScreen';
 import {
@@ -138,6 +138,7 @@ import {
   BALL_RADIUS,
   CHICCHAI_PLAYER_SCALE,
   dekkaiBallScale,
+  dekkaiFovFor,
   edgeMarker,
 } from './core/camera';
 import {
@@ -249,6 +250,7 @@ import {
 import {
   attachGlove,
   createPlayer,
+  movePlayerTo,
   preloadPlayerModel,
   setPlayerColor,
   setPlayerFacing,
@@ -377,6 +379,21 @@ setPlayerFacing(catcher, Math.PI);
 setPlayerPose(catcher, { kind: 'crouch' });
 scene.add(catcher);
 
+// でっかいモードの塁上の走者（テストプレイ「塁が埋まっているのに、でっかいモードでは塁に
+// 誰もいない」）。攻撃側＝打者と同じユニフォーム。**置き場所は判定と同じリード**から起こす
+// （`syncDekkaiRunners`）。一・三塁は画面の端ぎりぎり（16:9 で投手のいる奥行きの横幅の
+// ちょうど外）なので、リードを取ると画面の内側へ入ってくる。
+const DEKKAI_RUNNER_BASES = ['first', 'second', 'third'] as const;
+const dekkaiRunners = {
+  first: createPlayer(BATTER_COLOR),
+  second: createPlayer(BATTER_COLOR),
+  third: createPlayer(BATTER_COLOR),
+};
+for (const base of DEKKAI_RUNNER_BASES) {
+  dekkaiRunners[base].visible = false;
+  scene.add(dekkaiRunners[base]);
+}
+
 // グラブとミット（ブラッシュアップ：グラフィック）。**投げない側の手**に持たせる。
 // 捕手は右投げの既定のまま動かない。投手は継投で左右が入れ替わるので、状態が変わる
 // たびに持ち替える（`refresh`）。
@@ -433,6 +450,9 @@ window.addEventListener('resize', () => {
     cam.aspect = aspect();
     cam.updateProjectionMatrix();
   }
+  // でっかいモードの画角は窓の形で変わる（一・三塁の走者が画面に収まる広さ）
+  dekkaiCamera.fov = dekkaiFovFor(aspect());
+  dekkaiCamera.updateProjectionMatrix();
 });
 
 /** 影を寄せる注視点（毎フレーム書き直す作業用） */
@@ -817,6 +837,71 @@ function syncSkillLooks(): void {
   dressPlayer(catcher, liveSkillsIn(fld, fld.positions.C));
   for (const f of fielders) dressPlayer(f.group, liveSkillsIn(fld, fld.positions[f.id as FieldingPosition]));
   for (const r of fieldPlay.runnersOnField()) dressPlayer(r.mesh, liveSkillsIn(bat, r.id));
+  for (const base of DEKKAI_RUNNER_BASES) {
+    const id = ctx.baseRunners[base];
+    if (id !== null) dressPlayer(dekkaiRunners[base], liveSkillsIn(bat, id));
+  }
+}
+
+/** 次の塁（リードを取る向き） */
+const DEKKAI_RUNNER_NEXT = { first: 'second', second: 'third', third: 'home' } as const;
+/**
+ * リードの出入りの速さ m/s。投球動作（0.35秒）と飛行のあいだに標準のリード（3.5m）へ
+ * 出られる速さ＝**球が本塁に着くころにはリードを取り終えている**。
+ */
+const DEKKAI_RUNNER_SHUFFLE_SPEED = 6;
+/** いま各塁に描いている走者（入れ替わったら塁の上へ置き直す） */
+const dekkaiRunnerIds: Record<'first' | 'second' | 'third', string | null> = {
+  first: null,
+  second: null,
+  third: null,
+};
+
+/**
+ * でっかいモードの塁上の走者（テストプレイ「塁が埋まっているのに、でっかいモードでは
+ * 塁に誰もいない」）。**見た目だけ**で、判定には一切触らない。
+ *
+ * - **投手が構えているあいだは塁の上**（けん制から持ち越したリード＝L-32があればそこ）。
+ *   人間の走者は自分で押さない限り塁を離れない（II-56）ので、ここで勝手に離して見せない。
+ * - **投球動作に入ったらリードへ出る**＝盗塁・打球が走り出す位置（`stealLeadOf`＝
+ *   ちっちゃいモードの `pitchLeads` と同じ出どころ）。投球が終われば塁へ戻る。
+ * - 体は本塁を向いたまま横へ出る（リードの構え）。
+ */
+function syncDekkaiRunners(dt: number): void {
+  const mode = currentMode();
+  const show = mode !== 'chicchai' && mode !== 'brawl';
+  const ctx = gameActor.getSnapshot().context;
+  const carried = resolveCarriedLeads(ctx.baseRunners, carriedLeads);
+  const live = pitching.isPitchLive();
+  for (const base of DEKKAI_RUNNER_BASES) {
+    const g = dekkaiRunners[base];
+    const id = ctx.baseRunners[base];
+    if (!show || id === null) {
+      g.visible = false;
+      dekkaiRunnerIds[base] = null;
+      continue;
+    }
+    const lead = carried[base] ?? (live ? stealLeadOf(id) : 0);
+    const from = BASE_POSITIONS[base];
+    const to = BASE_POSITIONS[DEKKAI_RUNNER_NEXT[base]];
+    const len = Math.hypot(to.x - from.x, to.z - from.z);
+    const tx = from.x + ((to.x - from.x) / len) * lead;
+    const tz = from.z + ((to.z - from.z) / len) * lead;
+    if (dekkaiRunnerIds[base] !== id || !g.visible) {
+      movePlayerTo(g, tx, 0, tz, { snap: true });
+    } else {
+      const dx = tx - g.position.x;
+      const dz = tz - g.position.z;
+      const dist = Math.hypot(dx, dz);
+      const step = Math.min(dist, DEKKAI_RUNNER_SHUFFLE_SPEED * dt);
+      const k = dist > 0 ? step / dist : 0;
+      movePlayerTo(g, g.position.x + dx * k, 0, g.position.z + dz * k, { turn: false });
+    }
+    // 本塁を向く（モデルの正面は +Z＝向きのヨーは atan2(dx, dz)）
+    setPlayerFacing(g, Math.atan2(-g.position.x, -g.position.z));
+    g.visible = true;
+    dekkaiRunnerIds[base] = id;
+  }
 }
 
 /** 走る足の尾と、走り出した瞬間の閃き（ちっちゃいモード。走力・盗塁の札） */
@@ -3893,6 +3978,7 @@ runTeamSelect(app, pads).then((selection) => {
       hud.setBrawlHint(brawlHintText());
     }
 
+    syncDekkaiRunners(dt);
     // スキルの見た目（フェーズYY-73）。**乱闘の間は乱闘の効果だけ**（場の効果は消す）
     syncSkillLooks();
     syncRunnerSkillFx();

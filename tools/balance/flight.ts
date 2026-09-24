@@ -24,7 +24,7 @@ import {
   DEKKAI_BALL_ANCHOR_DISTANCE,
   DEKKAI_BALL_SCALE,
   DEKKAI_CAMERA_POS,
-  DEKKAI_FOV_DEG,
+  dekkaiFovFor,
   DEKKAI_TRAIL_FRAME_SEC,
   dekkaiBallLook,
   dekkaiBallScale,
@@ -110,8 +110,13 @@ function arcHeight(z: number, vz: number, neutral: number): number {
 }
 
 /** 奥行き d にある長さ1mが画面で何pxか */
+const fovAtHeight = (screenH: number): number => {
+  // 画角は窓の形で変わる（一・三塁の走者が画面に収まる広さ＝`dekkaiFovFor`）
+  const win = WINDOWS.find((w) => w.h === screenH);
+  return dekkaiFovFor(win ? win.w / win.h : 16 / 9);
+};
 const ppmAt = (d: number, screenH: number): number =>
-  screenH / (2 * d * Math.tan((DEKKAI_FOV_DEG / 2) * DEG));
+  screenH / (2 * d * Math.tan((fovAtHeight(screenH) / 2) * DEG));
 
 /** 画面の縦方向の位置（NDC。+1=上端 / -1=下端）＝画面から出るかを見る */
 const forward = (() => {
@@ -133,7 +138,7 @@ function ndcY(p: { x: number; y: number; z: number }): number {
   const dz = p.z - DEKKAI_CAMERA_POS.z;
   const along = dx * up.x + dy * up.y + dz * up.z;
   const depth = dekkaiViewDepth(p);
-  return along / (depth * Math.tan((DEKKAI_FOV_DEG / 2) * DEG));
+  return along / (depth * Math.tan((dekkaiFovFor(16 / 9) / 2) * DEG));
 }
 
 console.log('\n=== 1. 旧実装は何をしていたか（直線から q² で引く） ===');

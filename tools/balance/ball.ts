@@ -30,6 +30,7 @@ import {
   DEKKAI_BALL_ANCHOR_DISTANCE,
   DEKKAI_BALL_SCALE,
   DEKKAI_FOV_DEG,
+  dekkaiFovFor,
   dekkaiBallScale,
   dekkaiViewDepth,
 } from '../../src/core/camera';
@@ -82,7 +83,15 @@ const REAL_PLATE_WIDTH = 0.4318;
 const dist = (p: { x: number; y: number; z: number }): number => dekkaiViewDepth(p);
 
 /** 奥行き d にある長さ 1m が画面で何pxになるか（垂直画角から） */
-const ppmAt = (d: number, screenH: number, fovDeg = DEKKAI_FOV_DEG): number =>
+/**
+ * その高さの窓の画角（でっかいモード）。**窓の形で画角が変わる**（一・三塁の走者が画面に
+ * 収まる広さ＝`dekkaiFovFor`）ので、上の窓の一覧から横幅を引く（無ければ16:9）。
+ */
+const fovAtHeight = (screenH: number): number => {
+  const win = WINDOWS.find((w) => w.h === screenH);
+  return dekkaiFovFor(win ? win.w / win.h : 16 / 9);
+};
+const ppmAt = (d: number, screenH: number, fovDeg = fovAtHeight(screenH)): number =>
   screenH / (2 * d * Math.tan((fovDeg / 2) * DEG));
 
 /** ちっちゃいモードは寄り具合そのものが px/m を決める（カメラ距離によらない） */
@@ -259,7 +268,7 @@ console.log(`   球/選手の比は ${((2 * drawn * chicchaiPpm(1280)) / playerP
 console.log('\n=== 7. 触らないもの ===');
 console.log('   判定：ストライク/ボール・捕球半径・送球・盗塁の窓は球の描画サイズを引数に取らない');
 console.log('         （`npm run balance` は完全に不変）。');
-console.log(`   カメラ：でっかい ${DEKKAI_FOV_DEG}°・ちっちゃい ${CHICCHAI_FOV_DEG}°／半幅 ${CHICCHAI_VIEW_HALF_WIDTH}m／見下ろし ${CHICCHAI_TILT_DEG}° はすべて据え置き。`);
+console.log(`   カメラ：でっかい ${dekkaiFovFor(16 / 9).toFixed(1)}°（16:9。下限${DEKKAI_FOV_DEG}°・窓の形で変わる）・ちっちゃい ${CHICCHAI_FOV_DEG}°／半幅 ${CHICCHAI_VIEW_HALF_WIDTH}m／見下ろし ${CHICCHAI_TILT_DEG}° はすべて据え置き。`);
 console.log(`   MM-60：リリースの高さ（上手 ${m(armReleaseHeight({ side: 1, slot: 'over' }))}／横手 ${m(armReleaseHeight({ side: 1, slot: 'side' }))}／下手 ${m(armReleaseHeight({ side: 1, slot: 'under' }))}）と`);
 console.log(`         上体の傾き（横手 ${ARM_RELEASE_LEAN_RAD.side} / 下手 ${ARM_RELEASE_LEAN_RAD.under} rad）は1つも動かない。`);
 console.log('');

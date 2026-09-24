@@ -14,6 +14,7 @@ import {
   standBoundary,
   standFrontDistance,
   standOuterRadius,
+  standSurfaceHeight,
   wallBoundary,
 } from '../src/core/stands';
 import { BALLPARKS, FENCE_ANGLE_LIMIT_DEG, fenceAt } from '../src/core/ballpark';
@@ -252,5 +253,34 @@ describe('スタンドは描かれた地面の内側に収まる', () => {
     for (const park of BALLPARKS) {
       expect(standOuterRadius(park, 18) + 5).toBeLessThan(GROUND_RADIUS);
     }
+  });
+});
+
+describe('standSurfaceHeight（観客席に落ちた球が止まる面。見た目だけ）', () => {
+  const park = BALLPARKS.find((p) => p.id === 'tokorozawa')!;
+  const rows = 14;
+
+  it('フェンスの内側と通路は地面', () => {
+    for (const deg of [-40, 0, 40, -80, 80, 180]) {
+      const p = pointAt(deg, outerWallDistance(park, deg) - 1);
+      expect(standSurfaceHeight(park, rows, p.x, p.z)).toBe(0);
+      const gap = pointAt(deg, outerWallDistance(park, deg) + STAND_GAP / 2);
+      expect(standSurfaceHeight(park, rows, gap.x, gap.z)).toBe(0);
+    }
+  });
+
+  it('スタンドはその段の上面（段ごとに1段ぶん上がる）＝外野もファウル地域も', () => {
+    for (const deg of [0, 30, -70, 120]) {
+      const front = standFrontDistance(park, deg);
+      for (const row of [0, 5, rows - 1]) {
+        const p = pointAt(deg, front + (row + 0.5) * STAND_TREAD);
+        expect(standSurfaceHeight(park, rows, p.x, p.z)).toBeCloseTo((row + 1) * STAND_RISE, 6);
+      }
+    }
+  });
+
+  it('最上段より後ろ（スタンドの外）は地面', () => {
+    const p = pointAt(0, standFrontDistance(park, 0) + (rows + 2) * STAND_TREAD);
+    expect(standSurfaceHeight(park, rows, p.x, p.z)).toBe(0);
   });
 });

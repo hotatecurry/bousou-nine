@@ -57,7 +57,15 @@
  */
 import * as THREE from 'three';
 import { type Ballpark, DEFAULT_BALLPARK, fallbackHit } from '../core/ballpark';
-import { type BattedBall, isFairPosition, stepBattedBall } from '../core/batting';
+import { type BattedBall, WALL_RESTITUTION, isFairPosition, stepBattedBall } from '../core/batting';
+import {
+  FOUL_BARRIER_HEIGHT,
+  normalizeDeg,
+  outerWallDistance,
+  standSurfaceHeight,
+} from '../core/stands';
+import { FENCE_ANGLE_LIMIT_DEG } from '../core/ballpark';
+import { STAND_STYLE } from './field';
 import {
   type BaseKey,
   type CarriedLeads,
@@ -1231,6 +1239,12 @@ export function createFieldPlayController(opts: {
   /** 決着した瞬間にボールが誰の手にも無かったか（＝ファウル・安打の球は転がり続ける） */
   let ballFreeAtFinish = false;
   /**
+   * 余韻の間に転がる球が**観客席に落ちて止まったか**（見た目だけ）。打球の物理は地面を
+   * y=0 の平面としか知らないので、止めないとスタンドの下へ潜って跳ね続ける
+   * （テストプレイ「ホームランの球が客席をすり抜けてバウンドしていく」）。
+   */
+  let ballInStands = false;
+  /**
    * 余韻の間に**ボールを投手へ返す**山なりの送球（見た目だけ。フェーズWW-71）。
    * アウトが決まった後に野手の手の中で止まったままだと、その間の画面が静止画になる。
    */
@@ -1857,8 +1871,51 @@ export function createFieldPlayController(opts: {
   }
 
   function syncBall(b: BattedBall): void {
-    ball.position.set(b.x, b.y + BALL_RADIUS, b.z);
-    shadow.position.set(b.x, 0.05, b.z);
+    // 観客席の上では、その段の上面より下へ描かない（物理は地面しか知らない＝見た目だけ）
+    const floor = surfaceAt(b.x, b.z);
+    ball.position.set(b.x, Math.max(b.y, floor) + BALL_RADIUS, b.z);
+    shadow.position.set(b.x, floor + 0.05, b.z);
+  }
+
+  /** その地点で落ちた球が止まる面の高さ（観客席の段・通路・グラウンド。見た目だけ） */
+  function surfaceAt(x: number, z: number): number {
+    const park = ballpark();
+    return standSurfaceHeight(park, STAND_STYLE[park.id].rows, x, z);
+  }
+
+  /**
+   * 余韻の間の球の転がり（見た目だけ）。**打球の物理そのもの**（`stepBattedBall`）で進め、
+   * 物理が知らない2つだけを足す：**観客席に落ちたらそこで止まる**／**ファウル地域の柵
+   * （高さ2.4m）に低く当たったら跳ね返る**。どちらも決着の後にしか起きない
+   * （判定は `finish` までに済んでいる）。
+   */
+  function stepAftermathBall(b: BattedBall, d: number): BattedBall {
+    const prevR = Math.hypot(b.x, b.z);
+    const next = stepBattedBall(b, d, ballpark());
+    const floor = surfaceAt(next.x, next.z);
+    if (floor > 0 && next.y <= floor) {
+      next.y = floor;
+      ballInStands = true;
+      return next;
+    }
+    const deg = normalizeDeg((Math.atan2(next.x, -next.z) * 180) / Math.PI);
+    if (Math.abs(deg) > FENCE_ANGLE_LIMIT_DEG && next.y < FOUL_BARRIER_HEIGHT) {
+      const wall = outerWallDistance(ballpark(), deg);
+      const r = Math.hypot(next.x, next.z);
+      if (r >= wall && prevR < wall) {
+        const nx = next.x / r;
+        const nz = next.z / r;
+        const outward = next.vx * nx + next.vz * nz;
+        if (outward > 0) {
+          next.vx -= (1 + WALL_RESTITUTION) * outward * nx;
+          next.vz -= (1 + WALL_RESTITUTION) * outward * nz;
+        }
+        const inside = (wall - 0.01) / r;
+        next.x *= inside;
+        next.z *= inside;
+      }
+    }
+    return next;
   }
 
   function runnerMeshFor(from: ForcedRunner['from']): THREE.Group {
@@ -2093,6 +2150,7 @@ export function createFieldPlayController(opts: {
     phase = null;
     aftermathT = 0;
     ballFreeAtFinish = false;
+    ballInStands = false;
     lastGroupDir = { x: 0, z: 0 };
     returnToss = null;
     returnTossDone = false;
@@ -2128,6 +2186,7 @@ export function createFieldPlayController(opts: {
     // 捕られた球・送球が着いた球は野手の手の中のまま（`phase` を書き換える前に見る）
     ballFreeAtFinish =
       holderId === null && throwState === null && ballState !== null && phase === 'flying';
+    ballInStands = false;
     outcome = result;
     phase = 'resolved';
     // 帰結確定後、でっかいモードへカット復帰するまでの見せ時間（フェーズE-23）。
@@ -2163,8 +2222,8 @@ export function createFieldPlayController(opts: {
     // ボール：誰の手にも無ければ転がり続ける（フェンスで跳ね返るのも同じ物理）。
     // 野手の手の中にあれば、少し置いてから**投手へ山なりに返す**（アウトの後の球回し）
     if (ballFreeAtFinish && ballState) {
-      if (!ballState.resting) {
-        ballState = stepBattedBall(ballState, d, ballpark());
+      if (!ballState.resting && !ballInStands) {
+        ballState = stepAftermathBall(ballState, d);
         syncBall(ballState);
       }
     } else if (returnToss) {
@@ -3578,6 +3637,14 @@ export function createFieldPlayController(opts: {
       // （3アウト目・走者なし・CPU攻撃側が仕掛けない）はその場で畳む。
       onDefenseResult?.('out');
       if (!openTagUp(catcher)) {
+        // **球は捕った野手の手の中へ**（テストプレイ「捕られたはずのボールが、捕った選手を
+        // すり抜けてバウンドしていく」）。持ち主を書かずに畳むと、余韻（`updateAftermath`）が
+        // 「誰の手にも無い球」として飛行を続けさせていた。持ち主が決まっていれば、余韻では
+        // 手の中に収まり、少し置いてから投手へ返される（アウトの後の球回し）
+        holderId = catcher;
+        const p = fielderPos[catcher];
+        ball.position.set(p.x, THROW_BALL_HEIGHT, p.z);
+        shadow.visible = false;
         // 走者は誰も進めないので、開始時の顔ぶれがそのまま塁に残る
         finish({ kind: 'result', outsAdded: 1, runs: 0, baseRunners: originalRunners });
       }

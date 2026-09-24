@@ -42,6 +42,7 @@ import {
   armReleaseOffsetX,
 } from '../../src/core/pitch';
 import { TEAMS, pitcherRowPitching } from '../../src/core/teams';
+import { dekkaiFovFor } from '../../src/core/camera';
 
 const row = (cells: readonly string[], w = 14): string => cells.map((c) => c.padStart(w)).join('');
 const m = (v: number): string => `${v.toFixed(3)}m`;
@@ -137,9 +138,10 @@ const SLOT_LABEL: Record<PitchArmSlot, string> = {
 };
 const armOf = (slot: PitchArmSlot, side: PitchArmSide = RIGHT_ARM_SIDE): PitchArm => ({ side, slot });
 
-// ---- でっかいモードのカメラ（`scenes/dekkaiScene.ts`。(0,4.5,CATCH_Z+8) から見る画角40°） ----
+// ---- でっかいモードのカメラ（`scenes/dekkaiScene.ts`。(0,4.5,CATCH_Z+8) から見る） ----
+// 画角は窓の形で変わる（`dekkaiFovFor`）。ここで測る窓（1080/720/540）はどれも16:9
 const CAM = { y: 4.5, z: CATCH_Z + 8 };
-const DEKKAI_FOV_DEG = 40;
+const DEKKAI_FOV_DEG = dekkaiFovFor(16 / 9);
 /** リリース位置（z = RELEASE_Z）での 1m あたりのピクセル数（縦） */
 function pixelsPerMeter(screenH: number): number {
   const d = Math.hypot(CAM.z - RELEASE_Z, CAM.y - CURRENT_RELEASE_HEIGHT);
@@ -216,7 +218,7 @@ for (const slot of SLOTS) {
 console.log('   → 上限は**下手 0.72rad／横手 0.55rad**あたり。ここまで傾ける必要はない（下記4）。');
 
 console.log('\n=== 4. 下限＝でっかいモードの画面で差が読めるか ===');
-console.log(`   カメラは (0,${CAM.y},${CAM.z.toFixed(1)}) から投手（z=${PITCHER_PLATE_Z}）を見る画角${DEKKAI_FOV_DEG}°。`);
+console.log(`   カメラは (0,${CAM.y},${CAM.z.toFixed(1)}) から投手（z=${PITCHER_PLATE_Z}）を見る画角${DEKKAI_FOV_DEG.toFixed(1)}°（16:9）。`);
 console.log(`   リリース位置（z=${RELEASE_Z.toFixed(2)}）までの距離は ${m(Math.hypot(CAM.z - RELEASE_Z, CAM.y - CURRENT_RELEASE_HEIGHT))}。`);
 console.log(`${'高さの差'.padEnd(12)}${row(['1080p', '720p', '540p', '読めるか'], 14)}`);
 for (const drop of [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5] as const) {

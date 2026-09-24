@@ -80,6 +80,29 @@ export function standFrontDistance(park: Ballpark, deg: number): number {
   return outerWallDistance(park, deg) + STAND_GAP;
 }
 
+/** ファウル地域の柵の高さ m（`assets-src/stadium.blend` の Barrier と一致させる） */
+export const FOUL_BARRIER_HEIGHT = 2.4;
+
+/**
+ * その地点で**落ちてきた球が止まる面の高さ** m（見た目だけ。テストプレイ「ホームランの球が
+ * 客席をすり抜けてバウンドしていく」）。壁の内側と通路は地面（0）、スタンドは**その段の上面**、
+ * 最上段より後ろ（スタンドの外）は地面。
+ *
+ * **打球の判定には一切使わない**（判定は従来どおり `stepBattedBall` の地面と `fenceAt` だけ）。
+ * 打球の物理は地面を y=0 の平面としか知らないので、フェンスを越えた球はそのまま観客席の
+ * 下へ潜り、下の地面で跳ねていた。描くときにこの面より下へ行かせないために使う。
+ *
+ * @param rows その球場のスタンドの段数（見た目の表＝`scenes/field.ts` の `STAND_STYLE`）
+ */
+export function standSurfaceHeight(park: Ballpark, rows: number, x: number, z: number): number {
+  const deg = Math.atan2(x, -z) / DEG;
+  const front = standFrontDistance(park, deg);
+  const r = Math.hypot(x, z);
+  if (r < front) return 0;
+  const row = Math.floor((r - front) / STAND_TREAD);
+  return row < rows ? (row + 1) * STAND_RISE : 0;
+}
+
 /** 外周の頂点（位置と、そこでの外向き単位法線） */
 export interface RingVertex {
   x: number;

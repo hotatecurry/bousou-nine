@@ -12,7 +12,9 @@ import {
   DEKKAI_BALL_SCALE,
   DEKKAI_CAMERA_LOOK_AT,
   DEKKAI_CAMERA_POS,
+  DEKKAI_EDGE_MARGIN,
   DEKKAI_FOV_DEG,
+  DEKKAI_RUNNER_HALF_WIDTH,
   DEKKAI_TRAIL_FRAME_SEC,
   FOCUS_LIMIT,
   cameraDistance,
@@ -20,6 +22,7 @@ import {
   clampFocus,
   dekkaiBallLook,
   dekkaiBallScale,
+  dekkaiFovFor,
   dekkaiScreenMotionAxis,
   dekkaiViewDepth,
   edgeMarker,
@@ -27,7 +30,7 @@ import {
   pitchArcPath,
 } from '../src/core/camera';
 import { BALLPARKS, deepestFence } from '../src/core/ballpark';
-import { CATCH_RADIUS } from '../src/core/fielding';
+import { BASE_AXIS, CATCH_RADIUS } from '../src/core/fielding';
 import {
   CATCH_HEIGHT,
   CATCH_Z,
@@ -107,9 +110,9 @@ describe('CHICCHAI_PLAYER_SCALE（選手を実寸の何倍で描くか。フェ�
 });
 
 describe('ボールの見かけの大きさ（フェーズNN-61。`npm run balance:ball` で測った帯）', () => {
-  /** 奥行き d にある 1m が画面で何pxになるか（でっかいモードの垂直画角から） */
-  const dekkaiPpm = (d: number, screenH = 720) =>
-    screenH / (2 * d * Math.tan((DEKKAI_FOV_DEG / 2) * DEG));
+  /** 奥行き d にある 1m が画面で何pxになるか（でっかいモードの垂直画角＝窓の形から） */
+  const dekkaiPpm = (d: number, screenH = 720, aspect = 16 / 9) =>
+    screenH / (2 * d * Math.tan((dekkaiFovFor(aspect) / 2) * DEG));
   /** 遠近投影で大きさを決めるのは視線方向の奥行き（直線距離ではない） */
   const depth = (p: { x: number; y: number; z: number }) => dekkaiViewDepth(p);
   /** 上手投げの球の出どころ（MM-60）と本塁・ミット */
@@ -157,9 +160,12 @@ describe('ボールの見かけの大きさ（フェーズNN-61。`npm run balan
     );
     const stepPx = step * dekkaiPpm(depth(releasePoint));
     expect(stepPx / apparentDiameter(releasePoint)).toBeGreaterThan(0.5);
-    // MM-60 自身の読み取り条件（いちばん低い解像度で5px以上離れる）は球の大きさに
-    // 依らない＝こちらは球をいくら大きくしても壊れない
-    expect(step * dekkaiPpm(depth(releasePoint), 600)).toBeGreaterThan(5);
+    // MM-60 自身の読み取り条件（5px以上離れる）は球の大きさに依らない＝こちらは球を
+    // いくら大きくしても壊れない。**16:9 の窓では 960x540 まで成り立つ**。
+    // ZZ-74 で一・三塁の走者が必ず入るよう画角を窓の形から決めるようにしたので、
+    // 4:3（800x600）では 6.5px→4.5px に下がった（ユーザー判断で受け入れた代償）。
+    expect(step * dekkaiPpm(depth(releasePoint), 540)).toBeGreaterThan(5);
+    expect(step * dekkaiPpm(depth(releasePoint), 600, 4 / 3)).toBeGreaterThan(4);
   });
 
   it('基準点はミットより遠い（ミット基準にすると上の不変条件が破れる）', () => {
@@ -179,7 +185,7 @@ describe('ボールの見かけの大きさ（フェーズNN-61。`npm run balan
     expect(ballPx).toBeLessThan(playerPx);
   });
 
-  it('カメラは1つも動かしていない（映る範囲・画角・置き場所）', () => {
+  it('カメラの置き場所は動かしていない（画角の下限も40°のまま。実際の画角は窓の形から＝ZZ-74）', () => {
     expect(DEKKAI_FOV_DEG).toBe(40);
     expect(DEKKAI_CAMERA_POS).toEqual({ x: 0, y: 4.5, z: CATCH_Z + 8 });
     expect(DEKKAI_CAMERA_LOOK_AT).toEqual({ x: 0, y: 1.5, z: PITCHER_PLATE_Z });
@@ -188,7 +194,7 @@ describe('ボールの見かけの大きさ（フェーズNN-61。`npm run balan
 
 describe('投球の見え方：弧と残像（フェーズPP-63。`npm run balance:flight` で測った帯）', () => {
   const dekkaiPpm = (d: number, screenH = 720) =>
-    screenH / (2 * d * Math.tan((DEKKAI_FOV_DEG / 2) * DEG));
+    screenH / (2 * d * Math.tan((dekkaiFovFor(16 / 9) / 2) * DEG));
   const span = CATCH_Z - RELEASE_Z;
   const over = armReleaseHeight(NEUTRAL_PITCH_ARM);
   /** 基準の投手（SPD0.5）の緩急3段階 */
@@ -520,5 +526,32 @@ describe('edgeMarker（画面外の走者を指す印）', () => {
 
   it('真後ろの一点は向きが決まらないので印を出さない', () => {
     expect(edgeMarker({ x: 0, y: 0, z: 2 }, margin)).toBeNull();
+  });
+});
+
+describe('でっかいモードの画角は窓の形から（フェーズZZ-74。一・三塁の走者が必ず入る）', () => {
+  /** 一・三塁のベースに立つ走者の外側の端の、画面の横の位置（NDC。±1 が画面の端） */
+  const runnerEdgeNdc = (aspect: number): number => {
+    const edge = { x: BASE_AXIS + DEKKAI_RUNNER_HALF_WIDTH, y: 0.9, z: -BASE_AXIS };
+    const tanHalfV = Math.tan((dekkaiFovFor(aspect) / 2) * DEG);
+    return edge.x / dekkaiViewDepth(edge) / (tanHalfV * aspect);
+  };
+
+  it('どの窓の形でも、一・三塁の走者は画面の横幅に収まる', () => {
+    for (const aspect of [21 / 9, 16 / 9, 16 / 10, 1.44, 4 / 3, 5 / 4]) {
+      expect(runnerEdgeNdc(aspect)).toBeLessThanOrEqual(1 - DEKKAI_EDGE_MARGIN + 1e-9);
+    }
+  });
+
+  it('40°より狭くはしない（横に広い窓で寄りすぎない）／16:9 では約6%引くだけ', () => {
+    expect(dekkaiFovFor(21 / 9)).toBe(DEKKAI_FOV_DEG);
+    const tan16 = Math.tan((dekkaiFovFor(16 / 9) / 2) * DEG);
+    const tan40 = Math.tan((DEKKAI_FOV_DEG / 2) * DEG);
+    expect(tan40 / tan16).toBeGreaterThan(0.9);
+    expect(tan40 / tan16).toBeLessThan(0.96);
+  });
+
+  it('細い窓ほど広く映す（横幅が一・三塁ぶん以上あることを優先する）', () => {
+    expect(dekkaiFovFor(4 / 3)).toBeGreaterThan(dekkaiFovFor(16 / 9));
   });
 });
