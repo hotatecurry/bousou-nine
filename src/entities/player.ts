@@ -883,8 +883,10 @@ const SWING_CONTACT_P =
 const STANCE_BAT_DIR = { x: 0.45, y: 0.87, z: -0.2 };
 const SWING_BAT_DIR = { x: 0.68, y: -0.05, z: 0.73 };
 /**
- * **振り切った後のバットの向き**（前の肩の上へ担ぎ上げる。テストプレイの指摘
- * 「バットを完全に振り切ったときのバットの位置が中途半端」）。
+ * **振り切った後のバットの向き**（前の肩から**背中を斜めに横切って**反対の腰の上へ。
+ * テストプレイの指摘「バットを完全に振り切ったときのバットの位置が中途半端」）。
+ * 真後ろ（−Z）へ向けると、捕手の後ろにあるでっかいモードのカメラへまっすぐ向いて
+ * 頭に隠れる＝**横切る向き**でないと画面で読めない（フェーズZZ-74）。
  *
  * それまでは腕もバットも**当たる瞬間（`SWING_CONTACT_P`）で止まったまま**で、
  * 以後は体のヨーだけが回り続けていた＝**腕を前へ伸ばし切った形のまま体だけ回る**ので、
@@ -892,16 +894,27 @@ const SWING_BAT_DIR = { x: 0.68, y: -0.05, z: 0.73 };
  * **当たる瞬間までの姿勢は1mmも動かさない**（RR-66が実機で合わせた「バットが本塁を
  * 通る時刻＝判定の芯」はそのまま）ので、**判定にも見た目の接触にも影響しない**。
  */
-const FOLLOW_BAT_DIR = { x: 0.8, y: -0.4, z: -0.45 };
-/** 振り切りで肘がたたまれる量（後ろの腕・前の腕）／腕が振り上がる量（同）／上体のねじり切り */
-const FINISH_BACK_ELBOW = 1.4;
-const FINISH_FRONT_ELBOW = 1.9;
-const FINISH_BACK_RAISE = 0.85;
-const FINISH_FRONT_RAISE = 0.65;
-/** 振り切りで腕が前の肩の側へ寄る量（握る後ろの腕／添える前の腕＝前の手は握る手のそばへ） */
-const FINISH_ARM_CROSS = 0.9;
-const FINISH_FRONT_CROSS = 0.2;
-const FINISH_TORSO_TWIST = 0.2;
+const FOLLOW_BAT_DIR = { x: 0.62, y: -0.3, z: -0.72 };
+/**
+ * フィニッシュの腕（フェーズZZ-74。テストプレイ「振り切った後のバットの位置が明らかにおかしい」）。
+ * **両手が前の肩の横・耳の高さ**に来る角度を、実機の人形で手の位置を測って探した
+ * （握る手 (−0.33, 1.61, −0.08)・添える手 (−0.21, 1.56, −0.01)＝右打者・本塁から見て。
+ * 頭の中心は (0, 1.54)）。それ以前は**握る手が頭の真上（1.82m）の中央**に来ていて、
+ * バットが頭の上から横へ突き出し、頭を貫いて見えた。
+ */
+const FINISH = {
+  /** 振り切りで肘がたたまれる量（握る後ろの腕／添える前の腕） */
+  backElbow: 1.0,
+  frontElbow: 2.6,
+  /** 振り切りで腕が振り上がる量（負＝当たる瞬間より少し下ろす） */
+  backRaise: -0.34,
+  frontRaise: -0.26,
+  /** 振り切りで腕が前の肩の側へ寄る量 */
+  backCross: 1.76,
+  frontCross: 1.16,
+  /** 上体のねじり切り */
+  torsoTwist: 0.2,
+} as const;
 /** バントのバットの向き（体の前へ水平に出す） */
 const BUNT_BAT_DIR = { x: -0.45, y: 0.05, z: 0.89 };
 
@@ -933,18 +946,19 @@ function applySwing(visual: PlayerVisual, side: BatterSide, t: number, recover: 
   const front = side >= 0 ? { upper: j.ArmUpperL, lower: j.ArmLowerL } : { upper: j.ArmUpperR, lower: j.ArmLowerR };
   // 肘が伸びる（構えの -1.95/-1.6 から 0 へ）＝バットが体から離れて走る。
   // 振り切りでは**もう一度たたまれる**＝バットが前の肩の上から背中へ巻き付く。
-  back.lower.rotation.x = mix(-1.95 * (1 - ext) - FINISH_BACK_ELBOW * follow, -1.95);
-  front.lower.rotation.x = mix(-1.6 * (1 - ext) - FINISH_FRONT_ELBOW * follow, -1.6);
-  // 腕が投手方向（体の前）へ出て、振り切りでは**頭の高さまで振り上がる**（両手が前の肩の上）
-  back.upper.rotation.x = mix(-0.15 - 1.0 * ext - FINISH_BACK_RAISE * follow, -0.15);
-  front.upper.rotation.x = mix(-0.35 - 0.9 * ext - FINISH_FRONT_RAISE * follow, -0.35);
-  // 振り切りでは両腕が前の肩の側へ寄る（**握る後ろの腕は胸を横切り**、手が前の肩の上に来る
-  // ＝バットが肩の上を越えて背中側へ抜ける。手が胸の前に残るとバットが体の中を通る）
-  back.upper.rotation.z = sign * mix(0.35 - 0.15 * ext - FINISH_ARM_CROSS * follow, 0.35);
-  front.upper.rotation.z = sign * mix(0.95 - 0.55 * ext - FINISH_FRONT_CROSS * follow, 0.95);
+  back.lower.rotation.x = mix(-1.95 * (1 - ext) - FINISH.backElbow * follow, -1.95);
+  front.lower.rotation.x = mix(-1.6 * (1 - ext) - FINISH.frontElbow * follow, -1.6);
+  // 腕が投手方向（体の前）へ出て、振り切りでは**両手が前の肩の横・耳の高さ**へ戻ってくる
+  back.upper.rotation.x = mix(-0.15 - 1.0 * ext - FINISH.backRaise * follow, -0.15);
+  front.upper.rotation.x = mix(-0.35 - 0.9 * ext - FINISH.frontRaise * follow, -0.35);
+  // 振り切りでは両腕が前の肩の側へ寄る（**握る後ろの腕は胸を横切り**、手が前の肩の横に来る
+  // ＝バットが肩の上を越えて背中側へ抜ける。手が胸の前に残るとバットが体の中を通り、
+  // 頭の真上に来るとバットが頭を貫いて見える＝どちらも実機で踏んだ）
+  back.upper.rotation.z = sign * mix(0.35 - 0.15 * ext - FINISH.backCross * follow, 0.35);
+  front.upper.rotation.z = sign * mix(0.95 - 0.55 * ext - FINISH.frontCross * follow, 0.95);
   // 腰が回るぶん上体もついていく。振り切りでは**胸が投手を越えるまでねじり切り**、
   // 上体が起きる＝前へかぶさったまま終わらない
-  j.Torso.rotation.y = mix(-sign * (0.35 * Math.min(p, SWING_CONTACT_P) / SWING_CONTACT_P + FINISH_TORSO_TWIST * follow), 0);
+  j.Torso.rotation.y = mix(-sign * (0.35 * Math.min(p, SWING_CONTACT_P) / SWING_CONTACT_P + FINISH.torsoTwist * follow), 0);
   j.Torso.rotation.x = mix(-0.08 - 0.1 * Math.min(1, p / SWING_CONTACT_P) + 0.22 * follow, -0.08);
   // バットは立てた構えから体の前の水平へ（**体のヨー回転と合わさって振り抜きになる**）、
   // 振り切りでは前の肩の上を越えて背中側へ
