@@ -550,6 +550,11 @@ export interface CpuPitcherController {
    * 狙いをリセットする。呼び忘れると次の ready フェーズで前の球の狙いを使い回してしまう。
    */
   reset(): void;
+  /**
+   * 決めた狙いと球の形を読むだけ（フェーズYY-73。読みの札＝`テレパシー`・`未来視`・`心眼` が
+   * 画面に出す）。まだ決めていなければ null。**ここから何かを変えることはできない**。
+   */
+  peek(): { plan: CpuPitchPlan; shape: CpuPitchShape } | null;
 }
 
 /**
@@ -663,6 +668,10 @@ export function createCpuPitcherController(
       plan = null;
       shape = null;
       pickoffTimer = 0;
+    },
+
+    peek() {
+      return plan && shape ? { plan, shape } : null;
     },
   };
 }

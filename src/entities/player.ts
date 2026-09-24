@@ -488,23 +488,41 @@ export function movePlayerTo(
  * 付いてくる＝姿勢を動かせば必ず追従する（バット・銃と同じ「手のノードの子」の考え方）。
  * 部位の名前は乱闘の姿勢（`fighterPoses.ts`）と同じ：左右はモデルの左右（+X＝R）。
  */
-export type BodyMount = 'handR' | 'handL' | 'footR' | 'footL' | 'head';
+export type BodyMount =
+  | 'handR'
+  | 'handL'
+  | 'footR'
+  | 'footL'
+  | 'head'
+  | 'torso'
+  | 'pelvis'
+  | 'armUpperR'
+  | 'armUpperL';
 
 export function attachToBody(group: THREE.Group, obj: THREE.Object3D, mount: BodyMount): void {
   const visual = visuals.get(group);
   if (!visual) return;
   const j = visual.joints;
-  const target =
-    mount === 'handR'
-      ? visual.hands.plusX
-      : mount === 'handL'
-        ? visual.hands.minusX
-        : mount === 'footR'
-          ? j.FootR
-          : mount === 'footL'
-            ? j.FootL
-            : j.Head;
-  target.add(obj);
+  const target: Record<BodyMount, THREE.Object3D> = {
+    handR: visual.hands.plusX,
+    handL: visual.hands.minusX,
+    footR: j.FootR,
+    footL: j.FootL,
+    head: j.Head,
+    torso: j.Torso,
+    pelvis: j.Pelvis,
+    armUpperR: j.ArmUpperR,
+    armUpperL: j.ArmUpperL,
+  };
+  target[mount].add(obj);
+}
+
+/**
+ * 選手の足元（向きのノード）に物を付ける。**姿勢には引きずられず、向きと拡大だけに付いてくる**
+ * （バイクと同じ付き方＝スケボー・ホバーの円盤・守備範囲の輪のような「地面側」の物）。
+ */
+export function attachToFacing(group: THREE.Group, obj: THREE.Object3D): void {
+  visuals.get(group)?.facing.add(obj);
 }
 
 export function attachBat(group: THREE.Group, bat: THREE.Object3D, side: BatterSide): void {

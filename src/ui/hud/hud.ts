@@ -241,6 +241,13 @@ export interface Hud {
   /** 超必殺の暗転（画面全体が一瞬暗くなる） */
   brawlSuperFlash(): void;
   /**
+   * 読みの札（フェーズYY-73。`テレパシー` 等）が透かした相手の配球（`読み: 速球・内角`）。
+   * null で消す。でっかいモードの上端の真ん中（スコアボードと状況パネルの間）に出す。
+   */
+  setReading(text: string | null): void;
+  /** 時間停止（フェーズYY-73）の間だけ画面を青く沈める */
+  slowTint(on: boolean): void;
+  /**
    * 乱闘中に出す操作説明と技表（フェーズG-27）。null で消す。
    * **HUDが自分では組めない**（誰がどの必殺技を持っているか＝スキル、その人が押す
    * 向き＝画面左右で前が逆、2Pのキー名の読み替え）ので、main.ts が組んで渡す。
@@ -277,7 +284,7 @@ export interface Hud {
    * 方向だけを画面端に残す（既存の「意思決定材料は隠さない」方針）。
    * 空配列で全部消える。毎フレーム呼ばれる前提で、要素は使い回す。
    */
-  showRunnerMarkers(markers: EdgeMarker[]): void;
+  showRunnerMarkers(markers: ReadonlyArray<EdgeMarker & { color?: string }>): void;
   /**
    * デバッグモードの状態表示（フェーズPP-64。`src/debug/practice.ts`）。null で消える。
    *
@@ -456,7 +463,7 @@ export function runnerSpeedLine(game: GameContext): string {
  * `inning`（フェーズD-19）はラッキー7の判定に要る。**省略すると絶好調選手のぶんだけ**が
  * 反映される（`effectiveBatting` と同じ既定。イニングを知らない呼び出しでも止まらない）。
  */
-export function batterCardText(roster: TeamRoster, inning?: number): string {
+export function batterCardText(roster: TeamRoster, inning?: number, trailing = false): string {
   const batter = currentBatter(roster);
   const position = currentBatterPosition(roster);
   // 代打が入ったばかりの打順（投手の打席への代打）は守備位置を持たない＝打順だけ出す
@@ -466,7 +473,8 @@ export function batterCardText(roster: TeamRoster, inning?: number): string {
   // 判断材料として使える」（⑥）がスキルを入れた後も保たれる。
   // **好調（フェーズD-19）も同じ経路**なので、ゼッコーチョーの打者はカードの AV/HR が
   // 上がった状態で出る（数字が「今日この打者は来ている」を語る）。
-  const stats = effectiveBatting(roster, currentBatterId(roster), inning);
+  // **`火事場の力`（YY-73）は負けているときだけ**＝カードの数字も同じ条件で動く
+  const stats = effectiveBatting(roster, currentBatterId(roster), inning, trailing);
   return [
     `打者 ${slot}`,
     // **走力は AV/HR と同じ行に併記する**（フェーズFF-53。ユーザー判断）＝行を増やさない
@@ -722,6 +730,28 @@ export function createHud(root: HTMLElement): Hud {
     return panel;
   });
 
+  // ---- 読みの札の表示（フェーズYY-73。update() の管理外の独立チャンネル） ----
+  const readingPanel = createPixelLabel('', { scale: 2, color: '#e0b0ff', align: 'center' });
+  applyPanelChrome(readingPanel.el);
+  Object.assign(readingPanel.el.style, {
+    position: 'fixed',
+    // デバッグの行（上端の真ん中）とぶつからない高さ
+    top: '104px',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    display: 'none',
+  });
+  root.appendChild(readingPanel.el);
+  // 時間停止の間の青い沈み（画面の縁を暗く・全体を少し青く）
+  const slowTintEl = document.createElement('div');
+  slowTintEl.style.cssText = `
+    position: fixed; inset: 0; pointer-events: none; opacity: 0;
+    transition: opacity 120ms linear;
+    background: radial-gradient(ellipse at center, rgba(60,110,220,0.16) 35%, rgba(10,25,90,0.72) 100%);
+  `;
+  root.appendChild(slowTintEl);
+  let slowTintOn = false;
+
   // ---- デバッグモードの状態表示（フェーズPP-64。update() の管理外の独立チャンネル） ----
   const debugPanel = createPixelLabel('', { scale: 1, color: '#7ee081', align: 'center' });
   applyPanelChrome(debugPanel.el);
@@ -779,8 +809,10 @@ export function createHud(root: HTMLElement): Hud {
       brawlHintPanels[i].el.style.display = show ? 'block' : 'none';
     });
     // 乱闘の画面は上端を体力ゲージが、真ん中を2人が使うので、デバッグの行は右下へ
-    // （1P の乱闘では右下＝相手の技表の場所が空いている）
-    Object.assign(debugPanel.el.style, inBrawl
+    // （1P の乱闘では右下＝相手の技表の場所が空いている）。ちっちゃいモードも同じ
+    // （上端の真ん中はカメラが追うボールの先＝落下点や外野手が隠れる。フェーズYY-73で気づいた）
+    const debugLow = inBrawl || lastModeState === 'chicchai';
+    Object.assign(debugPanel.el.style, debugLow
       ? { top: 'auto', bottom: '8px', left: 'auto', right: '8px', transform: 'none' }
       : { top: '8px', bottom: 'auto', left: '50%', right: 'auto', transform: 'translateX(-50%)' });
   }
@@ -920,10 +952,12 @@ export function createHud(root: HTMLElement): Hud {
     return el;
   }
 
-  function renderMarkers(markers: EdgeMarker[]): void {
+  function renderMarkers(markers: ReadonlyArray<EdgeMarker & { color?: string }>): void {
     for (let i = 0; i < markers.length; i++) {
       const el = markerPool[i] ?? createMarker();
       const m = markers[i];
+      // 走者は赤。色を渡されたもの（鷹の落下点＝YY-73）はその色
+      el.style.borderLeftColor = m.color ?? '#cc3333';
       el.style.left = `${m.x * 100}%`;
       el.style.top = `${m.y * 100}%`;
       el.style.transform = `translate(-50%, -50%) rotate(${m.angle}rad)`;
@@ -1051,7 +1085,11 @@ export function createHud(root: HTMLElement): Hud {
         // 打者は攻撃側／投手は守備側のロスターから引く（＝カードは常に「今の対戦」を出す。
         // 人間がどちらを操作しているかによらず同じものを見せる既存方針どおり）。
         setCards(
-          batterCardText(game.rosters[battingTeam(game.half)], game.inning),
+          batterCardText(
+            game.rosters[battingTeam(game.half)],
+            game.inning,
+            game.score[battingTeam(game.half)] < game.score[fieldingTeam(game.half)],
+          ),
           pitcherCardText(game.rosters[fieldingTeam(game.half)]),
         );
       } else if (modeState === 'chicchai') {
@@ -1102,6 +1140,21 @@ export function createHud(root: HTMLElement): Hud {
 
     brawlSuperFlash() {
       flashOverlay('#000010', 0.6, 650);
+    },
+
+    setReading(text) {
+      if (text === null) {
+        readingPanel.el.style.display = 'none';
+        return;
+      }
+      readingPanel.setText(text);
+      readingPanel.el.style.display = 'block';
+    },
+
+    slowTint(on) {
+      if (on === slowTintOn) return;
+      slowTintOn = on;
+      slowTintEl.style.opacity = on ? '1' : '0';
     },
 
     setDebugLine(text) {

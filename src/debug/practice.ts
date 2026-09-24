@@ -40,6 +40,7 @@ import {
 } from '../core/brawl';
 import type { BrawlDummy } from '../core/brawlAi';
 import type { TeamSide } from '../core/rules';
+import { ALL_SKILL_IDS, LINEAGE_NAME, SKILLS, type SkillId } from '../core/skills';
 
 /** デバッグモードの種類（モード選択の DEBUG の下に並ぶ順） */
 export type PracticeMode = 'pitch' | 'bat' | 'field' | 'brawl';
@@ -210,7 +211,52 @@ export function knockLabel(setup: KnockSetup): string {
  * デバッグモードそのものが使えない）。キーは**ゲームのキーマップの外**（数字キー）から
  * 取るので、本番の操作は1つも奪わない。
  */
+// ---------------------------------------------------------------------------
+// スキルを1枚ずつ試す（フェーズYY-73。投球・打撃・守備のモード）
+// ---------------------------------------------------------------------------
+//
+// テストプレイ「スキルを1つ1つ丁寧に作り込みたい」。抽選で引かなくても**全札を順に
+// 付け替えて**見た目・音・効き方を確かめられる（数字キー 0＝次／9＝前）。付く相手は
+// そのモードで人間が操作する側の選手全員（投球＝守備側／打撃＝攻撃側／守備＝両方）。
+
+/** 付け替えの順（札の宣言順＝系統ごとに並ぶ） */
+export const PRACTICE_SKILLS: readonly SkillId[] = ALL_SKILL_IDS;
+
+/** そのモードで札を付ける側 */
+export function practiceSkillSides(mode: PracticeMode): TeamSide[] {
+  if (mode === 'pitch') return ['home'];
+  if (mode === 'bat') return ['away'];
+  if (mode === 'field') return ['home', 'away'];
+  return [];
+}
+
+/** 札の番号を1つ進める（-1＝札なし。端で折り返す） */
+export function cyclePracticeSkill(index: number, step: 1 | -1): number {
+  const n = PRACTICE_SKILLS.length;
+  const next = index + step;
+  if (next < -1) return n - 1;
+  if (next >= n) return -1;
+  return next;
+}
+
+/** デバッグ行の札の1行 */
+export function practiceSkillLine(index: number): string {
+  if (index < 0) return '0/9:スキルを付ける（いまは無し）';
+  const def = SKILLS[PRACTICE_SKILLS[index]];
+  return `0/9:スキル ${def.name}（★${def.rarity} ${LINEAGE_NAME[def.lineage]}）${def.text}`;
+}
+
 export function practiceHudLines(
+  mode: PracticeMode,
+  state: { swing: boolean; knock: KnockSetup; brawl?: BrawlPracticeSetup; skill?: number },
+): string {
+  if (mode !== 'brawl') {
+    return `${practiceHudLinesBase(mode, state)}\n${practiceSkillLine(state.skill ?? -1)}`;
+  }
+  return practiceHudLinesBase(mode, state);
+}
+
+function practiceHudLinesBase(
   mode: PracticeMode,
   state: { swing: boolean; knock: KnockSetup; brawl?: BrawlPracticeSetup },
 ): string {
@@ -241,4 +287,6 @@ export const PRACTICE_KEYS = {
   brawlDummy: 'Digit1',
   brawlSuper: 'Digit2',
   brawlFoe: 'Digit3',
+  skillNext: 'Digit0',
+  skillPrev: 'Digit9',
 } as const;

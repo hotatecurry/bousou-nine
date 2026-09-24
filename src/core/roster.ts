@@ -44,6 +44,7 @@ import {
   type SkillId,
   GUN_SHOTS_PER_PITCHER,
   MAX_SKILLS_PER_PLAYER,
+  SKILLS,
   brawlLoadoutFor,
   canGrant,
   chargeTotalOf,
@@ -653,6 +654,11 @@ export interface TeamRoster {
   hot: readonly PlayerId[];
   /** 乱闘敗北等で永久退場した選手のID一覧（表示・履歴用） */
   ejected: PlayerId[];
+  /**
+   * **この試合で一度だけ効く札を使ったか**（フェーズYY-73。`予備タンク`・`不死鳥` の給油）。
+   * 試合ごとに仕切り直す（新しい試合のロスターは空から始まる）。省略＝まだ何も使っていない。
+   */
+  skillProcs?: Record<PlayerId, readonly SkillId[]>;
 }
 
 const LINEUP_SIZE = 9;
@@ -1322,11 +1328,20 @@ export function effectiveBatting(
   roster: TeamRoster,
   playerId: PlayerId,
   inning?: number,
+  /**
+   * 自分のチームが負けているか（フェーズYY-73。`火事場の力` の条件）。省略＝負けていない
+   * ＝条件付きの札は乗らない（采配の比較・名鑑の表のように場面の無い読み出しは素の値）。
+   */
+  trailing = false,
 ): BatterStats {
   const base = roster.players[playerId].batting;
   // **使い切った消費型の効果は止まる**（F-26-8）＝`テツゲタ` の射程も枠も一緒に返る。
   // **切っていない一時効果も乗らない**（M-33）＝どちらも `effectiveSkillsOf` の絞り込み1つ。
-  const mod = combinedModifier(effectiveSkillsOf(roster, playerId));
+  // **条件付きの札は条件が揃ったときだけ乗る**（YY-73）。
+  const skills = effectiveSkillsOf(roster, playerId).filter(
+    (id) => SKILLS[id]?.when !== 'trailing' || trailing,
+  );
+  const mod = combinedModifier(skills);
   const hot = isHot(roster, playerId, inning) ? HOT_MODIFIER : {};
   return {
     bats: base.bats,
@@ -1453,13 +1468,45 @@ export function pitcherStuffOf(roster: TeamRoster, playerId: PlayerId): PitcherS
  * 投球数だけを増やす。けん制球・銃はここを通らない（実際の野球でも投球数に数えない）。
  */
 export function recordPitch(roster: TeamRoster): TeamRoster {
-  return {
+  const next: TeamRoster = {
     ...roster,
     pitchCounts: {
       ...roster.pitchCounts,
       [roster.pitcher]: pitchCountOf(roster, roster.pitcher) + 1,
     },
   };
+  return applyRefill(next, roster.pitcher);
+}
+
+/**
+ * **一度だけの給油**（フェーズYY-73。`予備タンク`・`不死鳥`）。残りスタミナが球威の落ちる
+ * 境目（`STAMINA_FRESH_THRESHOLD`）を切った瞬間に、札の球数ぶん投球数を巻き戻す
+ * （0 より下へは戻さない＝満タンを超えない）。**1試合に1札1回**。
+ *
+ * 給油したかどうかは `skillProcs` に残る＝main.ts はそこを見て炎と音を出す
+ * （判定側は「いつ給油したか」を知らせない。投球数の真実は相変わらず `pitchCounts` だけ）。
+ */
+export function applyRefill(roster: TeamRoster, playerId: PlayerId): TeamRoster {
+  if (remainingStaminaOf(roster, playerId) >= STAMINA_FRESH_THRESHOLD) return roster;
+  const used = roster.skillProcs?.[playerId] ?? [];
+  const skill = effectiveSkillsOf(roster, playerId).find(
+    (id) => (SKILLS[id]?.refill ?? 0) > 0 && !used.includes(id),
+  );
+  if (!skill) return roster;
+  const pitches = SKILLS[skill].refill ?? 0;
+  return {
+    ...roster,
+    pitchCounts: {
+      ...roster.pitchCounts,
+      [playerId]: Math.max(0, pitchCountOf(roster, playerId) - pitches),
+    },
+    skillProcs: { ...(roster.skillProcs ?? {}), [playerId]: [...used, skill] },
+  };
+}
+
+/** その選手がこの試合で使った一度きりの札（給油など） */
+export function skillProcsOf(roster: TeamRoster, playerId: PlayerId): readonly SkillId[] {
+  return roster.skillProcs?.[playerId] ?? [];
 }
 
 // ---- 銃の残弾（フェーズF-26-2。CLAUDE.md ③＋⑧） ----

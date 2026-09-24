@@ -158,6 +158,12 @@ export type GameEvent =
    */
   | { type: 'DEBUG_RESET_COUNT' }
   /**
+   * **デバッグモード専用**（フェーズYY-73）＝その側の選手全員の札を**この1枚に差し替える**
+   * （null で外す）。スキルを抽選で引かずに1枚ずつ試すための道具で、本番の経路からは
+   * 一度も送られない。使った回数（`skillUses`）も空へ戻す＝消費型は満タンから試せる。
+   */
+  | { type: 'DEBUG_SET_SKILL'; side: TeamSide; skillId: SkillId | null }
+  /**
    * 敬遠（フェーズQ-38）。**投げずに打者を一塁へ歩かせる**（実際の野球の申告敬遠）。
    * `side` は宣言した側＝守備側で、攻撃側から飛んできても何も起きない
    * （`reduceIntentionalWalk`）。投球そのものが無いので `PITCH_THROWN` は伴わない
@@ -958,6 +964,21 @@ export const gameMachine = setup({
         // デバッグモード専用（フェーズPP-64）。カウント以外は1つも書き換えない。
         DEBUG_RESET_COUNT: {
           actions: assign(() => ({ count: { balls: 0, strikes: 0 } })),
+        },
+        DEBUG_SET_SKILL: {
+          actions: assign(({ context, event }) => {
+            const roster = context.rosters[event.side];
+            const skills: Record<string, readonly SkillId[]> = {};
+            if (event.skillId !== null) {
+              for (const id of Object.keys(roster.players)) skills[id] = [event.skillId];
+            }
+            return {
+              rosters: {
+                ...context.rosters,
+                [event.side]: { ...roster, skills, skillUses: {}, activeEffects: {}, skillProcs: {} },
+              },
+            };
+          }),
         },
         // 敬遠（フェーズQ-38）。押し出しで点が入りうる（＝9回裏ならサヨナラもある）ので、
         // 四球とまったく同じく withProgress を通す。

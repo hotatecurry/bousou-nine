@@ -56,6 +56,8 @@ import {
   fatiguedControl,
   fatiguedSpeed,
   plateCrossingX,
+  armReleaseHeight,
+  neutralSpeedFor,
 } from './core/pitch';
 import {
   type FieldingPosition,
@@ -88,7 +90,23 @@ import {
   pitcherRole,
   remainingStaminaOf,
   skillHoldersOf,
+  liveSkillsOf,
+  skillProcsOf,
+  effectiveSkillsOf,
 } from './core/roster';
+import { dressPlayer } from './entities/skillLooks';
+import { createSkillFx } from './scenes/skillFx';
+import { SKILL_SOUND } from './audio/skillSounds';
+import { SKILLS, type SkillMoment, sightOf, skillsAtMoment } from './core/skills';
+import {
+  SLOW_TIME_SCALE,
+  inSlowZone,
+  plateCrossing,
+  predictCpuPitchPath,
+  readingText,
+  type SightPoint,
+} from './core/skillSight';
+import { CATCH_RADIUS } from './core/fielding';
 import { runSkillDraft } from './ui/skillDraft';
 import { matchEnd, runEnd, runNextSelect } from './ui/runScreen';
 import {
@@ -115,7 +133,13 @@ import {
   withNextGame,
 } from './core/run';
 import { isLuckyInning } from './core/condition';
-import { type EdgeMarker, BALL_RADIUS, dekkaiBallScale, edgeMarker } from './core/camera';
+import {
+  type EdgeMarker,
+  BALL_RADIUS,
+  CHICCHAI_PLAYER_SCALE,
+  dekkaiBallScale,
+  edgeMarker,
+} from './core/camera';
 import {
   type AtBatMarker,
   type InterludeKind,
@@ -186,7 +210,10 @@ import {
   PRACTICE_KEYS,
   PRACTICE_SUPERS,
   cycleKnock,
+  cyclePracticeSkill,
   knockLaunch,
+  PRACTICE_SKILLS,
+  practiceSkillSides,
   practiceBrawlLoadout,
   practiceFoeLoadout,
   practiceHudLines,
@@ -363,6 +390,9 @@ scene.add(ball);
 // 守備の9野手（常時シーンに配置。ちっちゃいモードの鳥瞰でのみ実質的に見える）
 const fielders = createFielders();
 for (const f of fielders) scene.add(f.group);
+// スキルが効いた瞬間の見た目（フェーズYY-73）
+const skillFx = createSkillFx();
+scene.add(skillFx.root);
 
 // 走者（打者走者＋一二三塁走者）。フィールドプレー中のみ表示される
 const runners = createRunners();
@@ -651,13 +681,20 @@ let practiceSwing = false;
 let practiceKnock: KnockSetup = INITIAL_KNOCK;
 /** `brawl` モードの設定（相手の動き・超必殺・相手の必殺技） */
 let practiceBrawl: BrawlPracticeSetup = INITIAL_BRAWL_PRACTICE;
+/** 投球・打撃・守備のモードで試している札の番号（-1＝札なし。フェーズYY-73） */
+let practiceSkill = -1;
 
 /** デバッグ行を書き直す（設定を触ったときと試合開始時だけ呼ぶ） */
 function syncPracticeHud(): void {
   hud.setDebugLine(
     practice === null
       ? null
-      : practiceHudLines(practice, { swing: practiceSwing, knock: practiceKnock, brawl: practiceBrawl }),
+      : practiceHudLines(practice, {
+          swing: practiceSwing,
+          knock: practiceKnock,
+          brawl: practiceBrawl,
+          skill: practiceSkill,
+        }),
   );
 }
 
@@ -726,8 +763,184 @@ function currentBattingProfile(): BattingProfile {
   // 打球初速にもHUDの表示本塁打数にも同じ経路で効く。
   // **イニングを渡すのは好調（フェーズD-19）のため**：ゼッコーチョーもラッキー7も
   // AV/HR への補正なので、渡しさえすれば打球への効き方はスキルとまったく同じ経路を通る。
-  const batting = effectiveBatting(roster, currentBatterId(roster), ctx.inning);
+  // **負けているか**は `火事場の力`（フェーズYY-73）の条件
+  const batting = effectiveBatting(roster, currentBatterId(roster), ctx.inning, battingTrailing());
   return { power: batting.power, average: batting.average };
+}
+
+/** 攻撃側がいま負けているか（`火事場の力` の条件。フェーズYY-73） */
+function battingTrailing(): boolean {
+  const ctx = gameActor.getSnapshot().context;
+  const side = battingTeam(ctx.half);
+  const other = side === 'away' ? 'home' : 'away';
+  return ctx.score[side] < ctx.score[other];
+}
+
+// ---- スキルの見た目と音（フェーズYY-73） ----
+//
+// **誰が何を持っているかが体に出る**（`dressPlayer`＝毎フレーム呼んでも、札の並びが同じなら
+// 何もしない）＋**効いた瞬間に閃いて鳴る**（`skillMoment`）＋**読みの札が見せるもの**
+// （`syncSkillSight`）。どれも判定には触らない。
+
+/** その選手のいま生きている札（使い切った消費型は外れる＝見た目も消える） */
+function liveSkillsIn(roster: GameContext['rosters']['away'], id: string | undefined): readonly SkillId[] {
+  return id !== undefined && roster.players[id] ? liveSkillsOf(roster, id) : [];
+}
+
+/** 一番レアな札の音を鳴らす（同時に効く札が複数でも、音は1つにまとめる） */
+function playSkillSound(skills: readonly SkillId[], strength: number): void {
+  const loudest = [...skills].sort((a, b) => (SKILLS[b]?.rarity ?? 0) - (SKILLS[a]?.rarity ?? 0))[0];
+  if (loudest) sfx.skill(SKILL_SOUND[loudest], strength);
+}
+
+/** その瞬間に効く札があれば、その場所で閃いて鳴る */
+function skillMoment(
+  skills: readonly SkillId[],
+  moment: SkillMoment,
+  at: THREE.Vector3,
+  strength: number,
+  soundStrength = strength,
+): void {
+  const hits = skillsAtMoment(skills, moment);
+  if (hits.length === 0) return;
+  skillFx.burst(at, hits, strength);
+  playSkillSound(hits, soundStrength);
+}
+
+/** 全員に札の見た目を着せる（毎フレーム。変わった選手だけ着替える） */
+function syncSkillLooks(): void {
+  const ctx = gameActor.getSnapshot().context;
+  const bat = ctx.rosters[battingTeam(ctx.half)];
+  const fld = ctx.rosters[fieldingTeam(ctx.half)];
+  dressPlayer(pitcher, liveSkillsIn(fld, fld.pitcher));
+  dressPlayer(batter, liveSkillsIn(bat, currentBatterId(bat)));
+  dressPlayer(catcher, liveSkillsIn(fld, fld.positions.C));
+  for (const f of fielders) dressPlayer(f.group, liveSkillsIn(fld, fld.positions[f.id as FieldingPosition]));
+  for (const r of fieldPlay.runnersOnField()) dressPlayer(r.mesh, liveSkillsIn(bat, r.id));
+}
+
+/** 走る足の尾と、走り出した瞬間の閃き（ちっちゃいモード。走力・盗塁の札） */
+const runnersStarted = new Set<string>();
+let trailFrame = 0;
+function syncRunnerSkillFx(): void {
+  if (currentMode() !== 'chicchai' || !fieldPlay.isActive()) {
+    runnersStarted.clear();
+    return;
+  }
+  const ctx = gameActor.getSnapshot().context;
+  const bat = ctx.rosters[battingTeam(ctx.half)];
+  trailFrame += 1;
+  for (const r of fieldPlay.runnersOnField()) {
+    if (!r.running) continue;
+    const skills = liveSkillsIn(bat, r.id);
+    const runSkills = skillsAtMoment(skills, 'run');
+    if (!runnersStarted.has(r.id)) {
+      runnersStarted.add(r.id);
+      const at = r.mesh.position.clone().setY(2.5);
+      skillMoment(skills, 'lead', at, 0.6);
+      if (runSkills.length > 0) playSkillSound(runSkills, 0.45);
+    }
+    if (runSkills.length > 0 && trailFrame % 2 === 0) {
+      skillFx.trail(r.mesh.position.clone().setY(0.4), runSkills[0], CHICCHAI_PLAYER_SCALE);
+    }
+  }
+}
+
+/**
+ * 鷹の読みで出している落下点（無ければ null）。**画面の外にある間は画面端の矢印で方向を出す**
+ * （`syncChicchaiCamera`。カメラはボールを追うので、深いフライの落下点は落ちる直前まで画面の
+ * 上へはみ出す＝実機で確かめた。走者の矢印と同じ仕組みで、色だけ違う）。
+ */
+let hawkLanding: { x: number; z: number } | null = null;
+
+/** 守備範囲の輪と落下点の印（ちっちゃいモード。捕球範囲の札・鷹の読み） */
+function syncFieldSkillFx(): void {
+  if (currentMode() !== 'chicchai' || !fieldPlay.ballInFlight()) {
+    skillFx.reachRings(null);
+    skillFx.landing(null);
+    hawkLanding = null;
+    return;
+  }
+  const ctx = gameActor.getSnapshot().context;
+  const fld = ctx.rosters[fieldingTeam(ctx.half)];
+  const rings: Array<{ x: number; z: number; radius: number; skill: SkillId }> = [];
+  let hawkEye = false;
+  for (const f of fielders) {
+    const skills = liveSkillsIn(fld, fld.positions[f.id as FieldingPosition]);
+    if (sightOf(skills).landing) hawkEye = true;
+    const catchSkills = skillsAtMoment(skills, 'catch');
+    if (catchSkills.length === 0) continue;
+    rings.push({
+      x: f.group.position.x,
+      z: f.group.position.z,
+      radius: CATCH_RADIUS + catchRadiusBonusOf(f.id as FieldingPosition),
+      skill: catchSkills[0],
+    });
+  }
+  skillFx.reachRings(rings.length > 0 ? rings : null);
+  hawkLanding = hawkEye ? fieldPlay.landingPoint() : null;
+  skillFx.landing(hawkLanding);
+}
+
+/**
+ * 読みの札（でっかいモード。`テレパシー`・`未来視`・`心眼`）。**CPU投手が決めた狙いと球の形を
+ * そのまま読む**＝見える場所へ必ず来る。人間が投げる球は投げる前に形が無いので読めない。
+ */
+let sightPlanKey: unknown = null;
+let sightPath: SightPoint[] | null = null;
+function syncSkillSight(): void {
+  const clear = (): void => {
+    hud.setReading(null);
+    skillFx.crossing(null);
+    skillFx.path(null);
+    sightPlanKey = null;
+    sightPath = null;
+  };
+  if (currentMode() !== 'dekkai' || isPitchingHuman()) return clear();
+  const ctx = gameActor.getSnapshot().context;
+  const bat = ctx.rosters[battingTeam(ctx.half)];
+  const sight = sightOf(effectiveSkillsForSight(bat, currentBatterId(bat)));
+  const peek = cpuPitcher.peek();
+  if (!peek || Object.keys(sight).length === 0) return clear();
+  if (peek.plan !== sightPlanKey) {
+    sightPlanKey = peek.plan;
+    const fld = ctx.rosters[fieldingTeam(ctx.half)];
+    const stats = effectivePitching(fld, fld.pitcher);
+    sightPath = predictCpuPitchPath(
+      peek.shape,
+      armReleaseHeight(currentPitchArm()),
+      neutralSpeedFor(stats?.speed),
+    );
+  }
+  hud.setReading(readingText(peek.plan, sight, currentBatterSide()));
+  skillFx.crossing(sight.crossing && sightPath ? plateCrossing(sightPath) : null);
+  skillFx.path(sight.path ? sightPath : null);
+}
+
+/** 読みに使う札（**切ってある一時効果も含む**＝`絶対予知` は切った打席だけ見える） */
+function effectiveSkillsForSight(roster: GameContext['rosters']['away'], id: string): readonly SkillId[] {
+  return roster.players[id] ? effectiveSkillsOf(roster, id) : [];
+}
+
+/**
+ * 時間停止（`時間停止`・`絶対予知`）。**人間が打つとき、球が本塁の手前にある間だけ**
+ * 時間が遅くなる（ゲームの時計ごと遅くする＝判定も同じだけ遅い＝判定の中身は変わらない）。
+ */
+let slowActive = false;
+function skillTimeScale(): number {
+  const was = slowActive;
+  slowActive = false;
+  if (currentMode() !== 'dekkai' || !isBattingHuman() || !pitching.isPitchLive()) return 1;
+  const ctx = gameActor.getSnapshot().context;
+  const bat = ctx.rosters[battingTeam(ctx.half)];
+  if (!sightOf(effectiveSkillsForSight(bat, currentBatterId(bat))).slow) return 1;
+  if (!inSlowZone(ball.position.z)) return 1;
+  slowActive = true;
+  if (!was) {
+    sfx.skill('tick', 0.7);
+    hud.slowTint(true);
+  }
+  return SLOW_TIME_SCALE;
 }
 
 /**
@@ -986,6 +1199,8 @@ function activateBattingEffect(): void {
   if (activatableEffect(ctx.rosters[side], playerId, 'batting') === null) return;
   gameActor.send({ type: 'EFFECT_ACTIVATED', side, playerId, role: 'batting' });
   sfx.skillActivate();
+  // 切った瞬間に体が閃いて鳴る（フェーズYY-73）
+  skillMoment(liveSkillsIn(ctx.rosters[side], playerId), 'atBat', batter.position.clone().setY(1.3), 1);
 }
 
 /**
@@ -1012,6 +1227,8 @@ function onCatchEffect(id: FieldingPosition): void {
   if (playerId === undefined) return;
   gameActor.send({ type: 'EFFECT_ACTIVATED', side, playerId, role: 'fielding' });
   sfx.skillActivate();
+  const f = fielders.find((e) => e.id === id);
+  if (f) skillMoment(liveSkillsIn(ctx.rosters[side], playerId), 'atBat', f.group.position.clone().setY(3), 1);
 }
 
 /** ちっちゃいモードの守備側のGで一時効果を切る */
@@ -1232,8 +1449,20 @@ function startBrawl(): void {
   sfx.brawlStart();
   modeActor.send({ type: 'BRAWL_START' });
   brawl.enter(brawlLoadouts(), brawlNames());
+  dressBrawlFighters();
 }
 
+
+/** 乱闘の2人にも札の見た目を着せる（フェーズYY-73） */
+function dressBrawlFighters(): void {
+  const ctx = gameActor.getSnapshot().context;
+  const bat = ctx.rosters[battingTeam(ctx.half)];
+  const fld = ctx.rosters[fieldingTeam(ctx.half)];
+  const batterId =
+    pendingHbpRestore === null ? currentBatterId(bat) : bat.lineup[pendingHbpRestore.battingLineupIndex];
+  dressPlayer(brawlFighters.batter, liveSkillsIn(bat, batterId));
+  dressPlayer(brawlFighters.pitcher, liveSkillsIn(fld, fld.pitcher));
+}
 
 /** 乱闘を見送って一塁へ歩く */
 function declineBrawl(): void {
@@ -1461,7 +1690,24 @@ const pitching = createPitchingController({
   // 打たれた球（判定を経ずに打球のプレーへ移る）が抜け落ちる。
   onRelease: () => {
     sfx.pitchRelease();
+    const before = gameActor.getSnapshot().context;
+    const fldSide = fieldingTeam(before.half);
+    const pitcherId = before.rosters[fldSide].pitcher;
+    const procsBefore = skillProcsOf(before.rosters[fldSide], pitcherId).length;
     gameActor.send({ type: 'PITCH_THROWN' });
+    // スキル（フェーズYY-73）：投げた瞬間に球速・変化・制球の札が閃く（毎球なので控えめ）
+    const after = gameActor.getSnapshot().context.rosters[fldSide];
+    const skills = liveSkillsIn(after, pitcherId);
+    const hand = new THREE.Vector3(pitcher.position.x, 1.7, pitcher.position.z + 0.5);
+    skillMoment(skills, 'pitch', hand, 0.5, 0.2);
+    // 一度だけの給油（予備タンク・不死鳥）＝疲れかけた瞬間に大きく閃いて鳴る
+    const procs = skillProcsOf(after, pitcherId);
+    if (procs.length > procsBefore) {
+      const fired = procs.slice(procsBefore);
+      skillFx.burst(pitcher.position.clone().setY(1.1), fired, 1);
+      skillFx.burst(pitcher.position.clone().setY(2.0), fired, 1);
+      playSkillSound(fired, 1);
+    }
   },
   onJudged: (call) => {
     // 判定確定＝この球は終わり。次の球のためにCPU投手の狙いをリセットする
@@ -1619,7 +1865,22 @@ const fieldPlay = createFieldPlayController({
   // 出す（既存の「意思決定材料は隠さない」方針。状況が変われば消える）。
   onPlayPrompt: (prompt) => hud.showPlayPrompt(promptLines(prompt)),
   // 野手の捕球（グラブ）と送球（風切り）の音（ブラッシュアップ：効果音）
-  onFieldSound: (kind) => (kind === 'catch' ? sfx.catchBall() : sfx.throwBall()),
+  onFieldSound: (kind, fielder) => {
+    if (kind === 'catch') sfx.catchBall();
+    else sfx.throwBall();
+    // スキル（フェーズYY-73）：捕った瞬間に捕球範囲の札が閃く
+    if (kind !== 'catch' || fielder === null) return;
+    const c = gameActor.getSnapshot().context;
+    const fld = c.rosters[fieldingTeam(c.half)];
+    const f = fielders.find((e) => e.id === fielder);
+    if (!f) return;
+    skillMoment(
+      liveSkillsIn(fld, fld.positions[fielder as FieldingPosition]),
+      'catch',
+      f.group.position.clone().setY(2.5),
+      0.7,
+    );
+  },
   onSettled: (outcome) => {
     const wasSteal = stealActive;
     stealActive = false;
@@ -1780,6 +2041,19 @@ const batting = createBattingController({
     cpuPitcher.reset();
     const exitSpeed = Math.hypot(batted.vx, batted.vy, batted.vz);
     sfx.hit(exitSpeed); // 打球音の芯は最初の0.1秒に集めてある（sfx.ts参照）
+    // スキル（フェーズYY-73）：打った瞬間に打率・長打力の札が閃く（強い当たりほど大きく）
+    {
+      const c = gameActor.getSnapshot().context;
+      const roster = c.rosters[battingTeam(c.half)];
+      const strength = Math.max(0.35, Math.min(1, (exitSpeed - 25) / 20));
+      skillMoment(
+        liveSkillsIn(roster, currentBatterId(roster)),
+        'contact',
+        new THREE.Vector3(batted.x, batted.y, batted.z),
+        strength,
+        0.4 + 0.5 * strength,
+      );
+    }
     // 接触点から球を飛ばし始める。カット（BATTED_BALL）は `CONTACT_FOLLOW_SEC` の後に送る。
     // この間もまだでっかいモードのカメラなので、**拡大率も投球中と同じ距離補正で書く**
     // （フェーズNN-61。素の1.0倍に戻すと、接触の瞬間だけ球が実寸＝本塁の見かけより
@@ -2344,6 +2618,7 @@ function tryCpuBattingEffect(ctx: GameContext): void {
   if (!shouldCpuActivateBattingEffect(ctx.bases)) return;
   gameActor.send({ type: 'EFFECT_ACTIVATED', side, playerId, role: 'batting' });
   sfx.skillActivate();
+  skillMoment(liveSkillsIn(roster, playerId), 'atBat', batter.position.clone().setY(1.3), 1);
 }
 
 // ---- 盗塁（説明書p13「投球中も走塁操作が可能」） ----
@@ -2534,6 +2809,8 @@ function promptLines(prompt: PlayPrompt): PlayPromptLine[] {
 
 /** 走者を指す印の投影に使う高さ（足元ではなく体のあたりを指す）。 */
 const RUNNER_MARKER_HEIGHT = 0.6;
+/** 鷹の落下点の矢印の色（落下点の印と同じ金色＝`skillFx` の landingMark） */
+const HAWK_MARKER_COLOR = '#ffe066';
 /** 画面外マーカーを画面端からどれだけ内側に置くか（画面の3%内側） */
 const EDGE_MARKER_MARGIN = 0.06;
 /** 投影の作業用ベクトル（毎フレーム確保しないよう使い回す） */
@@ -2589,6 +2866,14 @@ window.addEventListener('keydown', (e) => {
     syncPracticeHud();
     return;
   }
+  // スキルを1枚ずつ試す（フェーズYY-73）：0＝次・9＝前
+  if (e.code === PRACTICE_KEYS.skillNext || e.code === PRACTICE_KEYS.skillPrev) {
+    practiceSkill = cyclePracticeSkill(practiceSkill, e.code === PRACTICE_KEYS.skillNext ? 1 : -1);
+    const skillId = practiceSkill < 0 ? null : PRACTICE_SKILLS[practiceSkill];
+    for (const side of practiceSkillSides(practice)) gameActor.send({ type: 'DEBUG_SET_SKILL', side, skillId });
+    syncPracticeHud();
+    return;
+  }
   if (practice === 'pitch' && e.code === PRACTICE_KEYS.toggleSwing) {
     practiceSwing = !practiceSwing;
     syncPracticeHud();
@@ -2612,11 +2897,16 @@ function syncChicchaiCamera(dt: number): void {
     hud.showRunnerMarkers([]);
     return;
   }
-  const markers: EdgeMarker[] = [];
+  const markers: Array<EdgeMarker & { color?: string }> = [];
   for (const p of fieldPlay.markedRunners()) {
     projected.set(p.x, RUNNER_MARKER_HEIGHT, p.z).project(chicchaiCamera);
     const marker = edgeMarker(projected, EDGE_MARKER_MARGIN);
     if (marker) markers.push(marker);
+  }
+  if (hawkLanding) {
+    projected.set(hawkLanding.x, 0.1, hawkLanding.z).project(chicchaiCamera);
+    const marker = edgeMarker(projected, EDGE_MARKER_MARGIN);
+    if (marker) markers.push({ ...marker, color: HAWK_MARKER_COLOR });
   }
   hud.showRunnerMarkers(markers);
 }
@@ -2909,6 +3199,7 @@ function startMatch(selection: MatchSelection): void {
   practiceSwing = false;
   practiceKnock = INITIAL_KNOCK;
   practiceBrawl = INITIAL_BRAWL_PRACTICE;
+  practiceSkill = -1;
   // **null なら消える**ので、デバッグモードの後に通常のプレイを始めても行が残らない
   // （デバッグの状態はここ1か所でしか切り替わらない）。
   syncPracticeHud();
@@ -3389,7 +3680,11 @@ runTeamSelect(app, pads).then((selection) => {
   startMatch(selection);
   const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
-    const dt = clock.getDelta();
+    const rawDt = clock.getDelta();
+    // 時間停止（フェーズYY-73）：人間の打席で、球が本塁の手前にある間だけゲームの時計が遅い
+    const timeScale = gameStarted ? skillTimeScale() : 1;
+    if (timeScale === 1) hud.slowTint(false);
+    const dt = rawDt * timeScale;
 
     // 采配メニュー・抽選画面・ランの画面の表示中は全アクター静止（Start=ポーズの文言どおり）。
     // メニュー自体の入力はrunManagerMenuが登録したpad.onPressハンドラで完結する。
@@ -3597,6 +3892,13 @@ runTeamSelect(app, pads).then((selection) => {
       // ときに黙って既定の文言に戻る＝実機で実際に踏んだ。導出しておけば必ず今の装備と一致する。
       hud.setBrawlHint(brawlHintText());
     }
+
+    // スキルの見た目（フェーズYY-73）。**乱闘の間は乱闘の効果だけ**（場の効果は消す）
+    syncSkillLooks();
+    syncRunnerSkillFx();
+    syncFieldSkillFx();
+    syncSkillSight();
+    skillFx.update(rawDt);
 
     renderFrame();
   });

@@ -906,6 +906,18 @@ export interface FieldPlayController {
   catchEffectReady(): FielderId | null;
   isActive(): boolean;
   /**
+   * いまフィールドにいる走者（フェーズYY-73。スキルの見た目を着せる・走る足に効果を出す）。
+   * `running` は塁間を走っている最中か。
+   */
+  runnersOnField(): Array<{ mesh: THREE.Group; id: RunnerId; running: boolean }>;
+  /** 打球がまだ飛んでいる（捕られても転がり終えてもいない）か＝守備範囲の輪を出す間 */
+  ballInFlight(): boolean;
+  /**
+   * 打球が最初に落ちる場所（フェーズYY-73。`鷹` の読み）。まだ一度も地面に着いていない
+   * 飛球の間だけ返す。**守備の判定と同じ `predictLanding`**（影のシミュレーション）。
+   */
+  landingPoint(): Vec2 | null;
+  /**
    * 追従カメラ（フェーズE-24）が見るべき地点。プレー中でなければ null を返す
    * （＝次のプレーの最初のフレームでカメラが瞬時に合わせ直す）。
    */
@@ -968,7 +980,8 @@ export function createFieldPlayController(opts: {
    * 送球中 → 野手が持った」に変わったら 'catch'、「→ 送球中」に変わったら 'throw' を報せる。
    * 判定には一切触らない（局面の切り替わりを見ているだけ）。
    */
-  onFieldSound?: (kind: 'catch' | 'throw') => void;
+  /** 捕球・送球の音。**捕った（投げた）野手も渡す**（フェーズYY-73：その野手の札が光って鳴る） */
+  onFieldSound?: (kind: 'catch' | 'throw', fielder: FielderId | null) => void;
   /**
    * 走者ID→その走者の走る速さ m/s（走力＝RUNの反映。フェーズB-8）。
    * ロスターを知っているのは main.ts なので、能力値の解決はそちらに任せてここは
@@ -3774,12 +3787,12 @@ export function createFieldPlayController(opts: {
       if (phase === null) return;
       // 捕球・送球の音（局面の切り替わりを1フレーム遅れで拾う＝判定の流れには割り込まない）
       if (phase !== soundPhase) {
-        if (phase === 'throwing') onFieldSound?.('throw');
+        if (phase === 'throwing') onFieldSound?.('throw', holderId);
         else if (
           phase === 'possessed' &&
           (soundPhase === 'flying' || soundPhase === 'loose' || soundPhase === 'throwing')
         ) {
-          onFieldSound?.('catch');
+          onFieldSound?.('catch', holderId);
         }
         soundPhase = phase;
       }
@@ -4394,6 +4407,19 @@ export function createFieldPlayController(opts: {
     catchEffectReady: () => (isDefenseHuman() ? catchEffectCandidate() : null),
 
     isActive: () => phase !== null,
+
+    runnersOnField() {
+      return runnerVisuals
+        .filter((v) => v.mesh.visible && !v.out)
+        .map((v) => ({ mesh: v.mesh, id: v.id, running: v.forced !== null && !v.arrived }));
+    },
+
+    ballInFlight: () => phase === 'flying' || phase === 'loose',
+
+    landingPoint() {
+      if (phase !== 'flying' || !ballState || ballState.landing !== null) return null;
+      return predictLanding(ballState);
+    },
 
     cameraFocus() {
       if (phase === null) return null;

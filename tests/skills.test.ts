@@ -205,7 +205,7 @@ describe('SKILLS: 名鑑の約束', () => {
   it('効果を持たないスキルは動詞系（常設・消費型）とチャージ強化だけ', () => {
     for (const id of ALL_SKILL_IDS) {
       const def = SKILLS[id];
-      const hasEffect = Boolean(def.modifier || def.play || def.brawl || def.chargeBonus);
+      const hasEffect = Boolean(def.modifier || def.play || def.brawl || def.chargeBonus || def.refill);
       const isVerb = VERB_SKILL_IDS.includes(id) || CONSUMABLE_VERB[id] !== undefined;
       expect(hasEffect || isVerb, id).toBe(true);
     }

@@ -29,6 +29,7 @@ import {
   recordPitch,
   remainingStaminaOf,
   skillHoldersOf,
+  skillProcsOf,
   skillsOf,
   substituteBatterAt,
   substitutePitcherAt,
@@ -452,5 +453,48 @@ describe('effectivePlay: プレー定数への補正', () => {
     expect(ok).toBe(true);
     expect(after.positions[outgoingPosition]).toBe(incoming);
     expect(effectivePlay(after, after.positions[outgoingPosition]).catchRadius).toBeGreaterThan(0);
+  });
+});
+
+describe('一度だけの給油（YY-73。予備タンク・不死鳥）', () => {
+  const pitchUntilTired = (r: ReturnType<typeof createTeamRoster>, n: number) => {
+    let out = r;
+    for (let i = 0; i < n; i += 1) out = recordPitch(out);
+    return out;
+  };
+
+  it('球威が落ちかけた瞬間に札の球数ぶん戻り、1試合に1回だけ', () => {
+    const roster = createTeamRoster(TEST_TEAM);
+    const id = roster.pitcher;
+    const { roster: tank } = grantSkill(roster, id, 'yobitanku');
+    // 札なしなら投げた数そのまま／札ありは半分を切った瞬間に20球ぶん戻る
+    const plain = pitchUntilTired(roster, 120);
+    const refilled = pitchUntilTired(tank, 120);
+    expect(pitchCountOf(plain, id)).toBe(120);
+    expect(pitchCountOf(refilled, id)).toBe(100);
+    expect(skillProcsOf(refilled, id)).toEqual(['yobitanku']);
+    // 足した総量は旧実装（限界球数+20球）と同じ＝残量ゲージが0になるまでの球数が20球延びる
+    expect(remainingStaminaOf(refilled, id)).toBeGreaterThan(remainingStaminaOf(plain, id));
+  });
+
+  it('不死鳥は50球ぶん蘇る（満タンは超えない）', () => {
+    const roster = createTeamRoster(TEST_TEAM);
+    const id = roster.pitcher;
+    const { roster: bird } = grantSkill(roster, id, 'fushicho');
+    let r = bird;
+    let revivedAt = -1;
+    for (let i = 1; i <= 200; i += 1) {
+      const before = skillProcsOf(r, id).length;
+      r = recordPitch(r);
+      if (revivedAt < 0 && skillProcsOf(r, id).length > before) revivedAt = i;
+    }
+    expect(revivedAt).toBeGreaterThan(0);
+    expect(pitchCountOf(r, id)).toBe(200 - Math.min(50, revivedAt));
+  });
+
+  it('札を持たない投手は何も起きない（skillProcs は空のまま）', () => {
+    const roster = createTeamRoster(TEST_TEAM);
+    const r = pitchUntilTired(roster, 150);
+    expect(skillProcsOf(r, roster.pitcher)).toEqual([]);
   });
 });

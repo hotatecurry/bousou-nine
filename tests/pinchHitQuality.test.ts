@@ -98,9 +98,9 @@ describe('采配メニューの代打（describeBatterEntry）', () => {
     expect(new Set(positions).size).toBe(1);
   });
 
-  it('スキルの補正が数字に出る（`火事場の力`＝力+0.35／打率-0.15）', () => {
+  it('スキルの補正が数字に出る（`筋肉`＝力+0.15）', () => {
     const id = roster.bench[0];
-    const skilled = grantSkill(roster, id, 'kajibanochikara').roster;
+    const skilled = grantSkill(roster, id, 'kinniku').roster;
     const before = effectiveBatting(roster, id);
     const after = effectiveBatting(skilled, id);
     expect(after.power).toBeGreaterThan(before.power);
@@ -108,7 +108,18 @@ describe('采配メニューの代打（describeBatterEntry）', () => {
       String(displayHomeRuns(after.power)).padStart(2),
     );
     // 札の名前も同じ行に並ぶ（何がこの数字を動かしているのかが読める）
-    expect(describeBatterEntry(skilled, id)).toContain('火事場の力');
+    expect(describeBatterEntry(skilled, id)).toContain('筋肉');
+  });
+
+  it('`火事場の力`（YY-73）は負けているときだけ力が乗る', () => {
+    const id = roster.bench[0];
+    const skilled = grantSkill(roster, id, 'kajibanochikara').roster;
+    const base = effectiveBatting(roster, id);
+    expect(effectiveBatting(skilled, id).power).toBeCloseTo(base.power);
+    // 上限（1.0）で頭打ちになる選手もいるので、足した量は上限込みで比べる
+    expect(effectiveBatting(skilled, id, undefined, true).power).toBeCloseTo(Math.min(1, base.power + 0.45));
+    // 代償（打率）は外した
+    expect(effectiveBatting(skilled, id, undefined, true).average).toBeCloseTo(base.average);
   });
 
   it('好調は数字と理由が同じ行に並ぶ（D-19。ラッキー7なら全員）', () => {

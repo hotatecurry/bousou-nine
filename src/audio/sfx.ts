@@ -23,6 +23,7 @@
  */
 import { type AudioGraph, audio, envelope, whiteNoiseBuffer } from './engine';
 import { crowd } from './crowd';
+import type { SkillSoundKind } from './skillSounds';
 
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
@@ -523,6 +524,152 @@ export const sfx = {
     if (!g) return;
     tone(g, { freq: 196, dur: 0.6, gain: 0.3, type: 'square' });
     tone(g, { freq: 208, dur: 0.6, gain: 0.2, type: 'square' });
+  },
+
+  // ---- スキル（フェーズYY-73）：札ごとの音。`skillSounds.ts` の表から引く ----
+
+  /**
+   * スキルが効いた瞬間の音。`strength`（0..1）は小さいほど控えめ＝**毎球鳴る投球の札は小さく、
+   * 一度きりの給油や打った瞬間の長打の札は大きく**（音の階層は既存どおり：決着＞命中＞動き）。
+   */
+  skill(kind: SkillSoundKind, strength = 0.6, pan = 0): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    const v = 0.25 + 0.75 * clamp01(strength);
+    switch (kind) {
+      case 'shout':
+        // 気合の「ハッ」（母音の山を持つ短いノイズ）
+        noise(g, { at: t, dur: 0.12, gain: 0.45 * v, type: 'bandpass', freq: 850, q: 3, pan });
+        noise(g, { at: t, dur: 0.1, gain: 0.25 * v, type: 'bandpass', freq: 1500, q: 4, pan });
+        tone(g, { at: t, freq: 220, freqEnd: 170, dur: 0.12, gain: 0.2 * v, type: 'sawtooth', pan });
+        break;
+      case 'clang':
+        for (const [f, d] of [[620, 0.5], [1450, 0.35], [2380, 0.2]] as const) {
+          tone(g, { at: t, freq: f, dur: d, gain: 0.14 * v, type: 'triangle', send: 0.3, pan });
+        }
+        noise(g, { at: t, dur: 0.02, gain: 0.4 * v, type: 'highpass', freq: 3000, pan });
+        break;
+      case 'thud':
+        tone(g, { at: t, freq: 110, freqEnd: 45, dur: 0.18, gain: 0.55 * v, pan });
+        noise(g, { at: t, dur: 0.08, gain: 0.3 * v, type: 'lowpass', freq: 700, pan });
+        break;
+      case 'whir':
+        tone(g, { at: t, freq: 300, freqEnd: 900, dur: 0.3, gain: 0.12 * v, type: 'sawtooth', attack: 0.04, pan });
+        noise(g, { at: t, dur: 0.3, gain: 0.12 * v, type: 'bandpass', freq: 2500, q: 2, pan });
+        break;
+      case 'gear':
+        for (let i = 0; i < 6; i++) {
+          noise(g, { at: t + i * 0.04, dur: 0.012, gain: 0.3 * v, type: 'highpass', freq: 2800, pan });
+        }
+        tone(g, { at: t, freq: 180, dur: 0.25, gain: 0.1 * v, type: 'square', pan });
+        break;
+      case 'jet':
+        noise(g, { at: t, dur: 0.45, gain: 0.45 * v, type: 'bandpass', freq: 900, freqEnd: 3000, q: 0.7, attack: 0.02, send: 0.2, pan });
+        tone(g, { at: t, freq: 90, freqEnd: 160, dur: 0.4, gain: 0.2 * v, type: 'sawtooth', pan });
+        break;
+      case 'boing':
+        tone(g, { at: t, freq: 180, freqEnd: 520, dur: 0.22, gain: 0.3 * v, type: 'sine', pan });
+        tone(g, { at: t + 0.1, freq: 520, freqEnd: 260, dur: 0.2, gain: 0.18 * v, type: 'sine', pan });
+        break;
+      case 'engine':
+        tone(g, { at: t, freq: 55, freqEnd: 95, dur: 0.5, gain: 0.35 * v, type: 'sawtooth', attack: 0.03, pan });
+        noise(g, { at: t, dur: 0.5, gain: 0.18 * v, type: 'lowpass', freq: 400, pan });
+        break;
+      case 'hiss':
+        noise(g, { at: t, dur: 0.6, gain: 0.35 * v, type: 'highpass', freq: 4000, attack: 0.02, pan });
+        tone(g, { at: t, freq: 880, freqEnd: 1320, dur: 0.15, gain: 0.08 * v, type: 'square', pan });
+        break;
+      case 'beep':
+        tone(g, { at: t, freq: 1760, dur: 0.06, gain: 0.12 * v, type: 'square', pan });
+        tone(g, { at: t + 0.08, freq: 2350, dur: 0.06, gain: 0.12 * v, type: 'square', pan });
+        break;
+      case 'chime':
+        [1319, 1760, 2637, 3520].forEach((f, i) =>
+          tone(g, { at: t + i * 0.035, freq: f, dur: 0.5, gain: 0.08 * v, type: 'sine', send: 0.5, pan }),
+        );
+        break;
+      case 'warp':
+        tone(g, { at: t, freq: 200, freqEnd: 1600, dur: 0.35, gain: 0.16 * v, type: 'sine', attack: 0.08, send: 0.4, pan });
+        tone(g, { at: t, freq: 210, freqEnd: 1650, dur: 0.35, gain: 0.12 * v, type: 'triangle', attack: 0.08, send: 0.4, pan });
+        break;
+      case 'tick':
+        for (let i = 0; i < 4; i++) {
+          noise(g, { at: t + i * 0.18, dur: 0.015, gain: 0.35 * v, type: 'bandpass', freq: 3200, q: 6, pan });
+        }
+        tone(g, { at: t, freq: 110, freqEnd: 55, dur: 0.8, gain: 0.12 * v, type: 'sine', send: 0.5, pan });
+        break;
+      case 'whisper':
+        noise(g, { at: t, dur: 0.5, gain: 0.2 * v, type: 'bandpass', freq: 1800, freqEnd: 900, q: 5, attack: 0.1, send: 0.5, pan });
+        break;
+      case 'om':
+        for (const [f, gg] of [[110, 0.2], [220, 0.1], [330, 0.05]] as const) {
+          tone(g, { at: t, freq: f, dur: 0.9, gain: gg * v, type: 'sine', attack: 0.1, send: 0.4, pan });
+        }
+        break;
+      case 'bark':
+        for (let i = 0; i < 2; i++) {
+          const at = t + i * 0.16;
+          tone(g, { at, freq: 520, freqEnd: 330, dur: 0.09, gain: 0.25 * v, type: 'sawtooth', pan });
+          noise(g, { at, dur: 0.09, gain: 0.25 * v, type: 'bandpass', freq: 1100, q: 2, pan });
+        }
+        break;
+      case 'meow':
+        tone(g, { at: t, freq: 600, freqEnd: 900, dur: 0.14, gain: 0.18 * v, type: 'triangle', pan });
+        tone(g, { at: t + 0.14, freq: 900, freqEnd: 500, dur: 0.22, gain: 0.18 * v, type: 'triangle', pan });
+        break;
+      case 'roar':
+        tone(g, { at: t, freq: 95, freqEnd: 70, dur: 0.6, gain: 0.35 * v, type: 'sawtooth', attack: 0.05, pan });
+        noise(g, { at: t, dur: 0.6, gain: 0.35 * v, type: 'bandpass', freq: 500, q: 1.5, attack: 0.05, send: 0.2, pan });
+        crowd.react('ooh', 0.3 * v);
+        break;
+      case 'screech':
+        tone(g, { at: t, freq: 2600, freqEnd: 1900, dur: 0.35, gain: 0.12 * v, type: 'sawtooth', send: 0.3, pan });
+        tone(g, { at: t, freq: 2650, freqEnd: 1950, dur: 0.35, gain: 0.08 * v, type: 'square', send: 0.3, pan });
+        break;
+      case 'neigh':
+        for (let i = 0; i < 5; i++) {
+          tone(g, { at: t + i * 0.06, freq: 900 - i * 80, freqEnd: 700 - i * 80, dur: 0.06, gain: 0.14 * v, type: 'sawtooth', pan });
+        }
+        break;
+      case 'grunt':
+        tone(g, { at: t, freq: 140, freqEnd: 90, dur: 0.18, gain: 0.3 * v, type: 'sawtooth', pan });
+        noise(g, { at: t, dur: 0.15, gain: 0.2 * v, type: 'bandpass', freq: 400, q: 2, pan });
+        break;
+      case 'hop':
+        tone(g, { at: t, freq: 600, freqEnd: 1400, dur: 0.1, gain: 0.18 * v, type: 'sine', pan });
+        tone(g, { at: t + 0.13, freq: 700, freqEnd: 1600, dur: 0.1, gain: 0.15 * v, type: 'sine', pan });
+        break;
+      case 'chatter':
+        for (let i = 0; i < 4; i++) {
+          tone(g, { at: t + i * 0.07, freq: i % 2 ? 900 : 1300, dur: 0.05, gain: 0.14 * v, type: 'square', pan });
+        }
+        break;
+      case 'howl':
+        tone(g, { at: t, freq: 400, freqEnd: 800, dur: 0.3, gain: 0.14 * v, type: 'sine', attack: 0.08, send: 0.5, pan });
+        tone(g, { at: t + 0.3, freq: 800, freqEnd: 500, dur: 0.5, gain: 0.14 * v, type: 'sine', send: 0.5, pan });
+        break;
+      case 'drum':
+        tone(g, { at: t, freq: 90, freqEnd: 60, dur: 0.35, gain: 0.55 * v, send: 0.25, pan });
+        noise(g, { at: t, dur: 0.04, gain: 0.3 * v, type: 'lowpass', freq: 1200, pan });
+        break;
+      case 'flame':
+        noise(g, { at: t, dur: 0.55, gain: 0.4 * v, type: 'lowpass', freq: 1400, freqEnd: 500, attack: 0.03, send: 0.25, pan });
+        noise(g, { at: t, dur: 0.4, gain: 0.15 * v, type: 'highpass', freq: 3500, pan });
+        break;
+      case 'phoenix':
+        noise(g, { at: t, dur: 0.8, gain: 0.45 * v, type: 'lowpass', freq: 1800, freqEnd: 600, attack: 0.05, send: 0.35, pan });
+        [880, 1109, 1319, 1760].forEach((f, i) =>
+          tone(g, { at: t + 0.1 + i * 0.07, freq: f, dur: 0.5, gain: 0.1 * v, type: 'triangle', send: 0.4, pan }),
+        );
+        crowd.react('roar', 0.4 * v);
+        break;
+      case 'fanfare':
+        [523, 659, 784, 1047].forEach((f, i) =>
+          tone(g, { at: t + i * 0.08, freq: f, dur: 0.18, gain: 0.12 * v, type: 'square', pan }),
+        );
+        break;
+    }
   },
 
   /** 試合終了（場内が沸く。勝敗のジングルは BGM の側） */

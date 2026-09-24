@@ -464,6 +464,44 @@ export interface SkillDef {
    * 毎打席切るのが最適解になり、「いつ切るか」という判断そのものが消えるため。
    */
   duration?: 'atBat';
+  /**
+   * **一度だけの給油**（フェーズYY-73。`予備タンク`・`不死鳥`）。投手の残りスタミナが
+   * **球威が落ちる境目（半分）を切った瞬間に、この球数ぶんだけ投球数を巻き戻す**
+   * （満タンは超えない）。**1試合に1回**（`TeamRoster.skillProcs`）。
+   *
+   * 旧実装は同じ球数を**限界球数へ上乗せ**していた（`stamina` の補正）＝足した総量は同じで、
+   * 違いは**それが画面に出る瞬間があるか**だけ：上乗せは「いつの間にか長持ちする」、
+   * 給油は「疲れかけた瞬間に炎とともに戻る」＝**名前どおりのことが目に見えて起きる**。
+   */
+  refill?: number;
+  /**
+   * **効く場面の条件**（フェーズYY-73）。`'trailing'`＝**自分のチームが負けているときだけ**
+   * `modifier` が乗る（`火事場の力`）。条件が要る札はこの1つだけ。
+   */
+  when?: 'trailing';
+  /**
+   * **読みの札が見せるもの**（フェーズYY-73）。人間が打席に立つ（守る）ときにだけ画面に出る
+   * 情報で、**判定には触らない**（数字の補正 `modifier` はそのまま＝CPUにも同じだけ効く）。
+   * 名前どおりのことが画面で起きる＝`テレパシー` は相手の配球が文字で透け、`未来視` は球が
+   * 通る場所が先に光り、`心眼` は球の軌道が線で見え、`時間停止` は本塁の手前で時間が遅くなる。
+   */
+  sight?: SkillSight;
+}
+
+/** 読みの札が見せるもの（重ねれば合わさる＝`sightOf`） */
+export interface SkillSight {
+  /** 球種（速球・普通・フォーク）が投げる前に分かる */
+  speed?: boolean;
+  /** コース（内角・真ん中・外角）が投げる前に分かる */
+  course?: boolean;
+  /** 本塁を通る点が投げる前に光る */
+  crossing?: boolean;
+  /** 投げた球の軌道が線で見える */
+  path?: boolean;
+  /** 本塁の手前で時間が遅くなる（人間の打者だけ） */
+  slow?: boolean;
+  /** 守備：打球の落ちる場所に印が出る */
+  landing?: boolean;
 }
 
 /**
@@ -709,8 +747,10 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 限界球数 +20球。コンジョウの `タフネス`（+25球）と近いが、**系統が違う**ので
     // 同じ試合に両方が出るのは3系統のうち2つを引いたときだけ＝どちらか片方しか
     // 出ない試合のほうが多い（絞り込みがあるぶん、系統をまたいだ重複は許容できる）。
-    text: 'スタミナ+20球',
-    modifier: { stamina: 0.2 },
+    // YY-73：限界球数への上乗せ（+20球）を**一度だけの給油**に変えた（足す総量は同じ）。
+    // 球威が落ちかけた瞬間にタンクから20球ぶん戻る＝名前どおりのことが目に見えて起きる。
+    text: '疲れかけたら20球ぶん給油',
+    refill: 20,
   },
   bane: {
     id: 'bane',
@@ -834,6 +874,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   yochi: {
     id: 'yochi',
     name: '予知',
+    sight: { speed: true },
     lineage: 'psychic',
     rarity: 1,
     target: 'any',
@@ -864,6 +905,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   reikan: {
     id: 'reikan',
     name: '霊感',
+    sight: { course: true },
     lineage: 'psychic',
     rarity: 1,
     target: 'any',
@@ -885,10 +927,11 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   terepashi: {
     id: 'terepashi',
     name: 'テレパシー',
+    sight: { speed: true, course: true },
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
-    text: '配球が透けて見える',
+    text: '相手の配球が文字で透ける',
     modifier: { average: 0.25 },
   },
   saikopawa: {
@@ -904,21 +947,23 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   jikanteishi: {
     id: 'jikanteishi',
     name: '時間停止',
+    sight: { slow: true },
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
-    text: '球が止まって見える',
+    text: '本塁の手前で時間が遅くなる',
     modifier: { average: 0.15, power: 0.15 },
   },
   miraishi: {
     id: 'miraishi',
     name: '未来視',
+    sight: { crossing: true },
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
     // チョウノウリョクで唯一の**長打力に全振り**した札。「読み」の系統に力の軸を1本入れて
     // おかないと、この系統を引いた試合は打球が飛ばない試合になってしまう。
-    text: '読んだ球を仕留める',
+    text: '球が通る場所が先に光る',
     modifier: { power: 0.25 },
   },
   sainendou: {
@@ -965,6 +1010,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   zettaiyochi: {
     id: 'zettaiyochi',
     name: '絶対予知',
+    sight: { speed: true, course: true, crossing: true, path: true, slow: true },
     lineage: 'psychic',
     rarity: 2,
     target: 'any',
@@ -981,17 +1027,19 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   shingan: {
     id: 'shingan',
     name: '心眼',
+    sight: { path: true },
     lineage: 'psychic',
     rarity: 3,
     target: 'any',
     // AV +0.35＝HUDの表示打率も一緒に +.053 動く（`displayAverage`）。
     // 表示がレーティングからの導出だから起きることで、⑥の整理がそのまま効いている。
-    text: 'すべての球が見える',
+    text: '目隠しで球の軌道が見える',
     modifier: { average: 0.35 },
   },
   yomikiru: {
     id: 'yomikiru',
     name: '読み切る',
+    sight: { speed: true, crossing: true },
     lineage: 'psychic',
     rarity: 3,
     target: 'any',
@@ -1030,9 +1078,10 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'animal',
     rarity: 1,
     target: 'any',
-    text: 'すばしっこく喧嘩に強い',
+    // YY-73：乱闘では**サマーソルト**（↓溜め↑＋K。宙返りの蹴り上げ）＝猿の身のこなし
+    text: 'すばしっこい 乱闘でサマーソルト',
     modifier: { run: 0.1 },
-    brawl: { hp: 15 },
+    brawl: { hp: 15, special: 'somersault' },
   },
   neko: {
     id: 'neko',
@@ -1061,10 +1110,11 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   taka: {
     id: 'taka',
     name: '鷹',
+    sight: { landing: true },
     lineage: 'animal',
     rarity: 2,
     target: 'any',
-    text: '球に届く範囲が大きい',
+    text: '落ちる場所が見え 範囲も大',
     play: { catchRadius: 1.2 },
   },
   uma: {
@@ -1083,9 +1133,10 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'animal',
     rarity: 2,
     target: 'any',
-    text: '力が強く喧嘩に強い',
+    // YY-73：乱闘では**スクリュー**（一回転＋P。抱え込んで回して落とす）＝熊の抱擁
+    text: '力が強い 乱闘でスクリュー',
     modifier: { power: 0.25 },
-    brawl: { hp: 20 },
+    brawl: { hp: 20, special: 'screw' },
   },
   washi: {
     id: 'washi',
@@ -1140,6 +1191,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   hayabusa: {
     id: 'hayabusa',
     name: '隼',
+    sight: { landing: true },
     lineage: 'animal',
     rarity: 3,
     target: 'any',
@@ -1221,11 +1273,12 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'guts',
     rarity: 2,
     target: 'any',
-    // ★2のトレードオフ札。長打力は名鑑の4番級まで跳ね上がるが、芯を外したときに
-    // 打球が死ぬ＝**当たれば大きいが当たらない打者**になる。表示（打率・本塁打数）も
-    // 同じレーティングからの導出なので、カードの数字がそのまま性格を語る。
-    text: '力 大幅+ 打率-',
-    modifier: { power: 0.35, average: -0.15 },
+    // YY-73：**負けているときだけ**の札にした（火事場の馬鹿力）。そのかわり代償
+    // （打率-0.15）を外して長打力を上げた＝**劣勢の打席でだけ4番以上の力**が出る。
+    // 表示（打率・本塁打数）も同じ条件で動くので、カードの数字がそのまま「いま効いている」を語る。
+    text: '負けているときだけ力が爆発',
+    modifier: { power: 0.45 },
+    when: 'trailing',
   },
   tetsuwan: {
     id: 'tetsuwan',
@@ -1279,9 +1332,10 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'guts',
     rarity: 3,
     target: 'pitcher',
-    // 限界球数 +50球。先発型（0.85＝110球）に乗せると完投どころか延長まで持つ。
-    text: 'スタミナ+50球',
-    modifier: { stamina: 0.5 },
+    // YY-73：限界球数への上乗せ（+50球）を**一度だけの蘇り**に変えた（足す総量は同じ・
+    // 満タンは超えない）。疲れかけた瞬間に炎に包まれて50球ぶん戻る＝不死鳥。
+    text: '疲れかけたら一度だけ蘇る',
+    refill: 50,
   },
   daiesu: {
     id: 'daiesu',
@@ -1441,6 +1495,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   zenchizenno: {
     id: 'zenchizenno',
     name: '全知全能',
+    sight: { speed: true, course: true, crossing: true, path: true },
     lineage: 'psychic',
     rarity: DUO_RARITY,
     target: 'any',
@@ -1480,6 +1535,7 @@ export const SKILLS: Record<SkillId, SkillDef> = {
   yaseinokan: {
     id: 'yaseinokan',
     name: '野生の勘',
+    sight: { landing: true },
     lineage: 'animal',
     rarity: DUO_RARITY,
     target: 'any',
@@ -1900,4 +1956,69 @@ export function cpuChooseSkill(
     }
   }
   return best === null ? null : { skillId: best.skillId, holderId: best.holderId };
+}
+
+// ---- いつ効くか（フェーズYY-73。見た目と音を出す瞬間） ----
+
+/**
+ * その札が**効いている瞬間**。効果の中身（`modifier`・`play`・`brawl`・`refill`・動詞）から
+ * 導出する＝**別に表を持たない**ので、札の効果を書き換えれば効く瞬間も一緒に動く。
+ * 見た目と音（`main.ts`）はこの瞬間に出す＝「数字が足されているだけ」の札が無くなる。
+ */
+export type SkillMoment =
+  /** 投げた瞬間（球速・変化・制球・スタミナ） */
+  | 'pitch'
+  /** 打った瞬間（打率・長打力） */
+  | 'contact'
+  /** 走っている間（走力） */
+  | 'run'
+  /** 塁を離れる瞬間（盗塁のスタート） */
+  | 'lead'
+  /** 捕った瞬間（捕球範囲） */
+  | 'catch'
+  /** 一度だけの給油 */
+  | 'refill'
+  /** 乱闘 */
+  | 'brawl'
+  /** 操作が増える札（銃・バイク・蹴り） */
+  | 'verb'
+  /** 切った瞬間（一時効果） */
+  | 'atBat';
+
+export function skillMomentsOf(id: SkillId): SkillMoment[] {
+  const def = SKILLS[id];
+  if (!def) return [];
+  const out: SkillMoment[] = [];
+  const m = def.modifier ?? {};
+  if (m.speed || m.breakLeft || m.breakRight || m.control || m.stamina) out.push('pitch');
+  if (m.average || m.power) out.push('contact');
+  if (m.run) out.push('run');
+  if (def.play?.stealLead) out.push('lead');
+  if (def.play?.catchRadius) out.push('catch');
+  if (def.play?.dropkickRange || def.play?.gunShots) out.push('verb');
+  if (def.refill) out.push('refill');
+  if (def.brawl) out.push('brawl');
+  if (VERB_SKILL_IDS.includes(id) || CONSUMABLE_VERB[id] !== undefined) {
+    if (!out.includes('verb')) out.push('verb');
+  }
+  if (def.duration === 'atBat') out.push('atBat');
+  return out;
+}
+
+/** その選手が持つ札のうち、その瞬間に効くもの（見た目と音を出す相手） */
+export function skillsAtMoment(skills: readonly SkillId[], moment: SkillMoment): SkillId[] {
+  return skills.filter((id) => skillMomentsOf(id).includes(moment));
+}
+
+/** 持っている札の読み（重ねれば合わさる） */
+export function sightOf(skills: readonly SkillId[]): SkillSight {
+  const out: SkillSight = {};
+  for (const id of skills) {
+    const sight = SKILLS[id]?.sight;
+    if (!sight) continue;
+    for (const key of Object.keys(sight) as (keyof SkillSight)[]) {
+      if (sight[key]) out[key] = true;
+    }
+  }
+  return out;
 }
