@@ -35,6 +35,7 @@ import {
   SWING_STARTUP_SEC,
 } from '../core/batting';
 import playerModelUrl from '../assets/player.glb?url';
+import { type FighterPose, type PoseKit, applyFighterPose } from './fighterPoses';
 import { addOutline, castShadows, toonify } from '../render/toon';
 
 /**
@@ -188,40 +189,11 @@ export type PlayerPose =
    * **伸び切ったまま起き上がるまで低い**＝跳んだ代償（起き上がりの隙）が姿勢で見える。
    */
   | { kind: 'dive'; t: number }
-  // ---- ここから乱闘v2（フェーズG-27） ----
   /**
-   * 乱闘の構え（`guard` の間は腕を前でクロスして腰を落とす）。**ガードしているかは
-   * 姿勢で分かる**＝相手はガードを崩す手（投げ）を選ぶ判断がここからできる。
+   * 乱闘v3（フェーズXX-72）の姿勢。ストIIの立ち・しゃがみ・ジャンプ・技・やられを
+   * `entities/fighterPoses.ts` がまとめて持つ（技の数が多いので別のファイルに分けた）。
    */
-  | { kind: 'fight'; guard: boolean }
-  /**
-   * 乱闘の技。t=0（出始め）〜**0.5（当たる瞬間＝伸び切り）**〜1（戻り切り）。
-   * 0.5 に当たりが来るのは、呼び出し側が「起こり（startup）の進行度を前半・硬直
-   * （recovery）の進行度を後半」に割り付けて渡すから＝**当たったフレームで必ず
-   * 伸び切っている**（E-25-(c)で投球のリリースと腕の振りを揃えたのと同じ）。
-   */
-  | { kind: 'brawlAttack'; style: BrawlAttackStyle; t: number }
-  /**
-   * 技を食らってのけぞる。t=0（食らった瞬間）〜1（立ち直る）＝**のけぞり時間
-   * （`hitstunSec`）の進行度そのもの**なので、動けるようになるフレームと姿勢が戻る
-   * フレームが一致する（投げられたときだけは `fallen` を使う＝倒される）。
-   */
-  | { kind: 'brawlHurt'; t: number };
-
-/**
- * 乱闘の技の見た目（フェーズG-27）。**`core/brawl.ts` の技IDは持ち込まない**：
- * ここが知るのは「どんな動きか」だけで、どの技がどの動きかは呼び出し側（brawlScene）が
- * 決める＝E-25-(c)以来の「`player.ts` が `core` から読むのは打席の左右の型だけ」を保つ。
- */
-export type BrawlAttackStyle =
-  /** 突き（ジャブ・パンチ）：腕をまっすぐ前へ */
-  | 'straight'
-  /** 昇り（ショウリュウケン）：跳び上がりながら拳を突き上げる */
-  | 'upper'
-  /** 大振り（ブキモチコミ・バットリュウケン）：体ごと回して薙ぐ */
-  | 'swing'
-  /** 掴み（投げ）：両腕を前へ伸ばして掴みかかる */
-  | 'grab';
+  | { kind: 'fighter'; pose: FighterPose };
 
 /** 投球アニメのうちリリースの瞬間（0..1 のどこか）。呼び出し側が時間を割り付けるのに使う */
 export const PITCH_RELEASE_T = 0.45;
@@ -511,6 +483,30 @@ export function movePlayerTo(
  * バットは**手のノードの子**になるので、構え・スイング・バントの腕のポーズに
  * 必ず追従する＝「腕は下ろしたままバットだけ宙に浮く」が構造的に起きない。
  */
+/**
+ * 体の一部に物を付ける（乱闘v3。フェーズXX-72）。**拳の炎・足の風・武器**がその部位に
+ * 付いてくる＝姿勢を動かせば必ず追従する（バット・銃と同じ「手のノードの子」の考え方）。
+ * 部位の名前は乱闘の姿勢（`fighterPoses.ts`）と同じ：左右はモデルの左右（+X＝R）。
+ */
+export type BodyMount = 'handR' | 'handL' | 'footR' | 'footL' | 'head';
+
+export function attachToBody(group: THREE.Group, obj: THREE.Object3D, mount: BodyMount): void {
+  const visual = visuals.get(group);
+  if (!visual) return;
+  const j = visual.joints;
+  const target =
+    mount === 'handR'
+      ? visual.hands.plusX
+      : mount === 'handL'
+        ? visual.hands.minusX
+        : mount === 'footR'
+          ? j.FootR
+          : mount === 'footL'
+            ? j.FootL
+            : j.Head;
+  target.add(obj);
+}
+
 export function attachBat(group: THREE.Group, bat: THREE.Object3D, side: BatterSide): void {
   const visual = visuals.get(group);
   if (!visual) return;
@@ -696,17 +692,18 @@ export function setPlayerPose(group: THREE.Group, pose: PlayerPose): void {
     case 'dive':
       applyDive(j, pose.t);
       break;
-    case 'fight':
-      applyFightStance(j, pose.guard);
-      break;
-    case 'brawlAttack':
-      applyBrawlAttack(j, pose.style, pose.t);
-      break;
-    case 'brawlHurt':
-      applyBrawlHurt(j, pose.t);
+    case 'fighter':
+      applyFighterPose(j, pose.pose, POSE_KIT);
       break;
   }
 }
+
+/** 乱闘の姿勢へ貸す道具（モデルの寸法を知っている計算。`fighterPoses.ts` は寸法を書き写さない） */
+const POSE_KIT: PoseKit = {
+  flexLegs: (j, thigh, shin) => flexLegs(j as Joints, thigh, shin),
+  groundedHipY: (thigh, shin) => groundedHipY(thigh, shin),
+  hipHeight: HIP_HEIGHT,
+};
 
 /** 0..1 に丸める（進行度を受け取る姿勢が共通で使う） */
 function clamp01(t: number): number {
@@ -1258,130 +1255,6 @@ function applyDive(j: Joints, t: number): void {
   j.LegLowerL.rotation.x = 0.45 * p;
   j.LegLowerR.rotation.x = 0.3 * p;
   j.Torso.rotation.x = -0.1 * p;
-}
-
-// ---- 乱闘v2の姿勢（フェーズG-27。横視点固定カメラで見せる＝CLAUDE.md ③） ----
-//
-// 乱闘は**2.5D横視点**（`scenes/brawlScene.ts`）なので、E-25-(c)/(e) の他の姿勢と違い
-// 「真上から読めるか」ではなく**横から見たシルエット**で決めてある。相手はモデルの +Z 側
-// （＝画面の内側）にいるので、技はすべて +Z へ伸ばす。
-
-/** 構え：拳を上げて半身。ガード中は腕を体の前でクロスして腰を落とす */
-const FIGHT_THIGH = -0.3;
-const FIGHT_SHIN = 0.55;
-const GUARD_THIGH = -0.5;
-const GUARD_SHIN = 0.9;
-const FIGHT_TORSO_OPEN = -0.22;
-
-function applyFightStance(j: Joints, guard: boolean): void {
-  flexLegs(j, guard ? GUARD_THIGH : FIGHT_THIGH, guard ? GUARD_SHIN : FIGHT_SHIN);
-  // 前足を相手側へ、後ろ足を開く（横から見て「構えている」と分かる足幅）
-  j.LegUpperL.rotation.z = -0.22;
-  j.LegUpperR.rotation.z = 0.22;
-  j.Torso.rotation.y = FIGHT_TORSO_OPEN;
-  if (guard) {
-    // 両腕を前へ出し、肘を深く曲げて内側で合わせる＝ガードしていることが姿勢で読める
-    j.ArmUpperL.rotation.x = -1.25;
-    j.ArmUpperR.rotation.x = -1.35;
-    j.ArmLowerL.rotation.x = -1.55;
-    j.ArmLowerR.rotation.x = -1.6;
-    j.ArmUpperL.rotation.z = 0.3;
-    j.ArmUpperR.rotation.z = -0.3;
-    j.Torso.rotation.x = -0.12;
-    return;
-  }
-  // 両拳を顔の高さへ（ボクシングのガードポジション）
-  j.ArmUpperL.rotation.x = -0.75;
-  j.ArmUpperR.rotation.x = -0.6;
-  j.ArmLowerL.rotation.x = -1.85;
-  j.ArmLowerR.rotation.x = -1.95;
-  j.ArmUpperL.rotation.z = 0.14;
-  j.ArmUpperR.rotation.z = -0.1;
-}
-
-/** 突きの伸び／昇りの跳躍／大振りの振り下ろし */
-const PUNCH_ARM = -1.55;
-const UPPER_ARM = -2.7;
-const UPPER_LIFT = 0.5;
-/**
- * 大振りは**縦の弧（振りかぶって振り下ろす）**にする。横薙ぎ（体のヨー回転）にすると、
- * 乱闘の横視点固定カメラ（CLAUDE.md ③）ではほぼ奥行き方向の動きになり、突きと
- * 見分けが付かない（実機で並べて確認して差し替えた）。角度は「下向き=0・後ろ回りが正」
- * なので、後ろ上（2.9≒166°）から回し続けて前下（6.0≒344°）まで**真上を通って**降りる。
- */
-const SWING_ARM_FROM = 2.9;
-const SWING_ARM_TO = 6;
-const GRAB_ARM = -1.5;
-
-/**
- * 乱闘の技。**当たる瞬間（t=0.5）に伸び切る山形**（`sin`）で書くので、どの技も
- * 「出して・当てて・戻す」が1つの進行度から出る。技ごとに違うのは伸ばす先だけ。
- */
-function applyBrawlAttack(j: Joints, style: BrawlAttackStyle, t: number): void {
-  const p = clamp01(t);
-  const ext = Math.sin(Math.PI * p);
-  applyFightStance(j, false);
-  switch (style) {
-    case 'straight':
-      // 打つ腕（+X側）を突き出し、逆の手は顔の前に残す（横から見て残り拳が分かる）
-      j.ArmUpperR.rotation.x = PUNCH_ARM * ext;
-      j.ArmLowerR.rotation.x = -1.95 * (1 - ext);
-      j.ArmUpperR.rotation.z = -0.1 * (1 - ext);
-      j.Torso.rotation.y = FIGHT_TORSO_OPEN + 0.35 * ext;
-      j.Torso.rotation.x = -0.1 * ext;
-      break;
-    case 'upper':
-      // 跳び上がりながら拳を上へ。**踏み切りから着地まで放物線**（脚は畳む）
-      j.Pelvis.position.y = groundedHipY(FIGHT_THIGH, FIGHT_SHIN) + UPPER_LIFT * ext;
-      j.ArmUpperR.rotation.x = UPPER_ARM * ext;
-      j.ArmLowerR.rotation.x = -0.15 * (1 - ext);
-      j.ArmUpperL.rotation.x = -0.9 - 0.3 * ext;
-      j.LegUpperL.rotation.x = -0.5 * ext;
-      j.LegLowerL.rotation.x = 1.2 * ext;
-      j.LegUpperR.rotation.x = -0.25 * ext;
-      // わずかに前傾（後ろへ反らせると、突き上げた拳が背中側へ流れて昇りに見えない）
-      j.Torso.rotation.x = -0.1 * ext;
-      break;
-    case 'swing':
-      // 振りかぶって振り下ろす。**戻らずに振り抜く**ので、腕は始点から終点への片道
-      // （`ext` ではなく `p` で回す＝当たった後も止まらずに降り切る）
-      j.ArmUpperR.rotation.x = lerp(SWING_ARM_FROM, SWING_ARM_TO, p);
-      j.ArmLowerR.rotation.x = -0.5 * (1 - p);
-      j.ArmUpperR.rotation.z = -0.12;
-      j.ArmUpperL.rotation.x = -0.5;
-      j.ArmLowerL.rotation.x = -1.3;
-      // 体は「反ってから前へ倒れ込む」（振り下ろしと同じ向きに体重が乗る）
-      j.Torso.rotation.x = lerp(0.22, -0.3, p);
-      j.Pelvis.position.y = groundedHipY(FIGHT_THIGH, FIGHT_SHIN) + 0.14 * ext;
-      break;
-    case 'grab':
-      // 両腕を前へ伸ばして掴みかかる（拳ではなく手を開いた形＝突きと見分けが付く）
-      j.ArmUpperL.rotation.x = GRAB_ARM * ext;
-      j.ArmUpperR.rotation.x = GRAB_ARM * ext;
-      j.ArmLowerL.rotation.x = -1.85 * (1 - ext) - 0.2;
-      j.ArmLowerR.rotation.x = -1.95 * (1 - ext) - 0.2;
-      j.ArmUpperL.rotation.z = 0.28;
-      j.ArmUpperR.rotation.z = -0.28;
-      j.Torso.rotation.x = -0.2 * ext;
-      break;
-  }
-}
-
-/** のけぞり：食らった瞬間がいちばん深く、立ち直るにつれて構えへ戻る */
-const HURT_LEAN = 0.55;
-
-function applyBrawlHurt(j: Joints, t: number): void {
-  applyFightStance(j, false);
-  // p=0（食らった瞬間）で最大、p=1 で0＝**動けるようになるフレームと姿勢が戻るフレームが一致**
-  const lean = 1 - clamp01(t);
-  j.Torso.rotation.x = HURT_LEAN * lean;
-  j.Head.rotation.x = 0.4 * lean;
-  j.ArmUpperL.rotation.x = -0.75 + 0.9 * lean;
-  j.ArmUpperR.rotation.x = -0.6 + 1.0 * lean;
-  j.ArmUpperL.rotation.z = 0.14 + 0.4 * lean;
-  j.ArmUpperR.rotation.z = -0.1 - 0.4 * lean;
-  // 膝を沈める（足の裏は `flexLegs` が地面に着けたまま保つ）
-  flexLegs(j, FIGHT_THIGH - 0.2 * lean, FIGHT_SHIN + 0.35 * lean);
 }
 
 function lerp(a: number, b: number, t: number): number {

@@ -34,7 +34,8 @@
     "balance:release": "vite-node tools/balance/release.ts",
     "balance:ball": "vite-node tools/balance/ball.ts",
     "balance:flight": "vite-node tools/balance/flight.ts",
-    "balance:plate": "vite-node tools/balance/plate.ts"
+    "balance:plate": "vite-node tools/balance/plate.ts",
+    "balance:brawl": "vite-node tools/balance/brawlReport.ts"
   },
   "dependencies": {
     "@fontsource/dotgothic16": "^5.3.0",

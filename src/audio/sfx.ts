@@ -321,28 +321,6 @@ export const sfx = {
 
   // ---- 乱闘 ----
 
-  /** 乱闘：技を繰り出した（拳の風切り） */
-  brawlAttack(): void {
-    const g = audio();
-    if (!g) return;
-    noise(g, { dur: 0.11, gain: 0.3, type: 'bandpass', freq: 600, freqEnd: 2200, q: 1.1, attack: 0.02 });
-  },
-
-  /** 乱闘：命中。ガードされたら硬い「ガッ」、素通しなら重い「ドゴッ」 */
-  brawlHit(guarded: boolean): void {
-    const g = audio();
-    if (!g) return;
-    if (guarded) {
-      noise(g, { dur: 0.05, gain: 0.45, type: 'bandpass', freq: 2200, q: 2.5, send: 0.12 });
-      tone(g, { freq: 540, freqEnd: 420, dur: 0.06, gain: 0.2, type: 'triangle' });
-      return;
-    }
-    tone(g, { freq: 135, freqEnd: 52, dur: 0.18, gain: 0.7 });
-    noise(g, { dur: 0.1, gain: 0.5, type: 'lowpass', freq: 950, send: 0.15 });
-    noise(g, { dur: 0.018, gain: 0.4, type: 'highpass', freq: 2600 });
-    crowd.react('ooh', 0.35);
-  },
-
   /** 乱闘：開始のゴング（カーン、カーン）＋場内がどよめく */
   brawlStart(): void {
     const g = audio();
@@ -362,6 +340,189 @@ export const sfx = {
     noise(g, { at: t, dur: 0.2, gain: 0.55, type: 'lowpass', freq: 700, send: 0.3 });
     for (let i = 0; i < 3; i += 1) bell(g, t + 0.25 + i * 0.16, 900, 0.26);
     crowd.react('roar', 1);
+  },
+
+  // ---- 乱闘v3（フェーズXX-72）：ストIIの音の役割をひととおり ----
+  //
+  // 桜井ノウハウ「音の優先度や大きさはプレイヤーに大きく関係するものをより大きくする」＝
+  // **決着（KO）＞超必殺・必殺技の命中＞通常技の命中＞技の出だし・動き**の階層を守る。
+  // 出だしの音（風切り）は小さく、当たった音だけを大きくする＝**音で当たったかが分かる**。
+
+  /** 技の振り（当たり判定が出た瞬間の風切り）。蹴りは低く長く、重い技ほど太い */
+  brawlSwing(kick: boolean, heavy: boolean): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, {
+      dur: heavy ? 0.16 : 0.09,
+      gain: heavy ? 0.26 : 0.18,
+      type: 'bandpass',
+      freq: kick ? 380 : 700,
+      freqEnd: kick ? 1400 : 2600,
+      q: 1.2,
+      attack: 0.015,
+    });
+  },
+
+  /** 命中。重い当たり（ダウン・必殺技）は低い芯を足して長く響かせる */
+  brawlImpact(heavy: boolean, pan = 0): void {
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: heavy ? 120 : 170, freqEnd: heavy ? 38 : 70, dur: heavy ? 0.3 : 0.14, gain: heavy ? 0.85 : 0.6, pan });
+    noise(g, { dur: heavy ? 0.16 : 0.08, gain: heavy ? 0.6 : 0.45, type: 'lowpass', freq: heavy ? 800 : 1300, send: heavy ? 0.25 : 0.12, pan });
+    noise(g, { dur: 0.02, gain: 0.45, type: 'highpass', freq: 2800, pan });
+    if (heavy) crowd.react('ooh', 0.55);
+  },
+
+  /** ガードされた（硬い「バシッ」＝素通しの重い音と聞き分けられる） */
+  brawlBlock(pan = 0): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.045, gain: 0.4, type: 'bandpass', freq: 2400, q: 2.8, send: 0.1, pan });
+    tone(g, { freq: 620, freqEnd: 480, dur: 0.05, gain: 0.16, type: 'triangle', pan });
+  },
+
+  /** 気を溜めて撃つ（波動拳・真空波動拳）。溜めの低いうなり→放つ「ボウッ」 */
+  brawlProjectile(big: boolean): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    tone(g, { at: t, freq: 180, freqEnd: big ? 520 : 380, dur: 0.18, gain: 0.25, type: 'sawtooth', attack: 0.06 });
+    noise(g, { at: t + 0.1, dur: big ? 0.45 : 0.32, gain: big ? 0.5 : 0.38, type: 'bandpass', freq: 500, freqEnd: 1800, q: 0.9, send: 0.3 });
+    tone(g, { at: t + 0.1, freq: big ? 220 : 300, freqEnd: 90, dur: 0.35, gain: 0.35, send: 0.25 });
+  },
+
+  /** 飛び道具どうしの相殺（弾ける高い火花） */
+  brawlClash(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.25, gain: 0.5, type: 'highpass', freq: 3200, send: 0.35 });
+    tone(g, { freq: 1500, freqEnd: 400, dur: 0.22, gain: 0.25, type: 'square' });
+  },
+
+  /** 昇る技（昇龍拳・サマーソルト・バット龍拳）。上へ抜ける風と炎 */
+  brawlRising(fire: boolean): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.3, gain: 0.35, type: 'bandpass', freq: 400, freqEnd: 3200, q: 0.9, attack: 0.01, send: 0.2 });
+    if (fire) noise(g, { dur: 0.45, gain: 0.3, type: 'lowpass', freq: 1500, freqEnd: 500, send: 0.3 });
+  },
+
+  /** 回転する蹴り（竜巻旋風脚）。風切りを3回重ねる */
+  brawlSpin(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    for (let i = 0; i < 3; i += 1) {
+      noise(g, { at: t + i * 0.12, dur: 0.1, gain: 0.22, type: 'bandpass', freq: 500, freqEnd: 1900, q: 1.3, attack: 0.02 });
+    }
+  },
+
+  /** 突進（頭突き・急降下キック）。低い突風 */
+  brawlDash(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.22, gain: 0.3, type: 'lowpass', freq: 900, freqEnd: 300, attack: 0.02 });
+  },
+
+  /** 掴んだ（衣擦れ）→ 叩きつけ（重い「ドサッ」＋場内のどよめき） */
+  brawlGrab(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.08, gain: 0.3, type: 'bandpass', freq: 1400, q: 0.8 });
+  },
+  brawlSlam(): void {
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: 90, freqEnd: 34, dur: 0.35, gain: 0.85, send: 0.25 });
+    noise(g, { dur: 0.25, gain: 0.55, type: 'lowpass', freq: 500, send: 0.3 });
+    crowd.react('ooh', 0.6);
+  },
+
+  /** 投げ抜け（弾き合う「パァン」） */
+  brawlTech(): void {
+    const g = audio();
+    if (!g) return;
+    noise(g, { dur: 0.06, gain: 0.5, type: 'bandpass', freq: 1800, q: 1.5, send: 0.2 });
+  },
+
+  /** 倒れる・着地（体が地面に落ちる） */
+  brawlThud(heavy: boolean): void {
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: heavy ? 80 : 110, freqEnd: 40, dur: heavy ? 0.25 : 0.1, gain: heavy ? 0.6 : 0.22 });
+    noise(g, { dur: heavy ? 0.2 : 0.06, gain: heavy ? 0.35 : 0.12, type: 'lowpass', freq: 600 });
+  },
+
+  /** ピヨった（頭の上で鳥が鳴くような高いさえずり） */
+  brawlDizzy(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    for (let i = 0; i < 4; i += 1) {
+      tone(g, { at: t + i * 0.13, freq: 2600, freqEnd: 3400, dur: 0.07, gain: 0.08, type: 'sine' });
+    }
+    crowd.react('gasp', 0.5);
+  },
+
+  /** 子分を呼ぶ（指笛） */
+  brawlWhistle(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    tone(g, { at: t, freq: 2100, freqEnd: 2700, dur: 0.12, gain: 0.18 });
+    tone(g, { at: t + 0.13, freq: 2700, freqEnd: 1900, dur: 0.22, gain: 0.18 });
+  },
+
+  /** 超必殺の暗転（キラッ＋低い「ドン」） */
+  brawlSuperFlash(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    tone(g, { at: t, freq: 55, freqEnd: 30, dur: 0.6, gain: 0.7, send: 0.35 });
+    for (const [i, f] of [1320, 1760, 2640].entries()) {
+      tone(g, { at: t + i * 0.05, freq: f, dur: 0.4, gain: 0.14, type: 'triangle', send: 0.4 });
+    }
+    crowd.react('roar', 0.6);
+  },
+
+  /** ゲージが満タンになった（上がっていく3音） */
+  brawlMeterFull(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    [880, 1109, 1319].forEach((f, i) => tone(g, { at: t + i * 0.06, freq: f, dur: 0.14, gain: 0.12, type: 'square' }));
+  },
+
+  /** ラウンドの呼び出し（ゴング1つ） */
+  brawlRound(): void {
+    const g = audio();
+    if (!g) return;
+    bell(g, g.ctx.currentTime, 880, 0.28);
+  },
+
+  /** 「ファイト！」（ゴング2つ＋場内が沸く） */
+  brawlFight(): void {
+    const g = audio();
+    if (!g) return;
+    const t = g.ctx.currentTime;
+    bell(g, t, 990, 0.3);
+    bell(g, t + 0.14, 990, 0.3);
+    crowd.react('roar', 0.6);
+  },
+
+  /** 残り10秒の秒読み */
+  brawlTick(): void {
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: 1600, dur: 0.035, gain: 0.1, type: 'square' });
+  },
+
+  /** 時間切れ（ブザー） */
+  brawlTimeUp(): void {
+    const g = audio();
+    if (!g) return;
+    tone(g, { freq: 196, dur: 0.6, gain: 0.3, type: 'square' });
+    tone(g, { freq: 208, dur: 0.6, gain: 0.2, type: 'square' });
   },
 
   /** 試合終了（場内が沸く。勝敗のジングルは BGM の側） */

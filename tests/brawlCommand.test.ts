@@ -1,206 +1,150 @@
+/**
+ * 乱闘v3のコマンド入力（ストII準拠。フェーズXX-72）。1フレーム＝1/60秒の時計で、
+ * 波動・竜巻・昇龍・溜め・一回転・連打・ダッシュを判定する。
+ */
 import { describe, expect, it } from 'vitest';
 import {
-  type CommandBuffer,
-  type Direction,
-  type FightFacing,
-  CHARGE_SEC,
-  COMMAND_MOTION,
-  COMMAND_WINDOW_SEC,
-  commandNotation,
-  consumeCommand,
-  createCommandBuffer,
-  detectCommand,
+  type FrameInput,
+  type InputHistory,
+  type MotionId,
+  CHARGE_FRAMES,
+  MASH_PRESSES,
+  MOTION_TAIL,
+  MOTION_SEQUENCE,
+  NEUTRAL_INPUT,
+  consumeInput,
+  createInputHistory,
+  detectMotion,
+  motionNotation,
   numpadOf,
-  stepCommandBuffer,
+  stepInput,
 } from '../src/core/brawlCommand';
 
-const DT = 1 / 60;
+type Step = Partial<FrameInput>;
 
-/** 打者（画面左＝前が +X）から見た8方向 */
-const N: Direction = { x: 0, y: 0 };
-const F: Direction = { x: 1, y: 0 };
-const B: Direction = { x: -1, y: 0 };
-const D: Direction = { x: 0, y: -1 };
-const U: Direction = { x: 0, y: 1 };
-const DF: Direction = { x: 1, y: -1 };
-const DB: Direction = { x: -1, y: -1 };
-
-function hold(buf: CommandBuffer, dir: Direction, seconds: number, facing: FightFacing = 1): CommandBuffer {
-  let next = buf;
-  for (let i = 0; i < Math.round(seconds / DT); i++) {
-    next = stepCommandBuffer(next, dir, facing, DT);
-  }
-  return next;
+/** 入力の列を1フレームずつ流す（`facing` は前が +x の打者側） */
+function feed(steps: readonly Step[], facing: 1 | -1 = 1, h: InputHistory = createInputHistory()): InputHistory {
+  let out = h;
+  for (const st of steps) out = stepInput(out, { ...NEUTRAL_INPUT, ...st }, facing).history;
+  return out;
 }
 
-/** 方向の並びを順に入れる（1つあたり `each` 秒） */
-function input(dirs: readonly Direction[], each = 0.06, facing: FightFacing = 1): CommandBuffer {
-  let buf = createCommandBuffer();
-  for (const dir of dirs) buf = hold(buf, dir, each, facing);
-  return buf;
-}
+const down: Step = { y: -1 };
+const downFwd: Step = { y: -1, x: 1 };
+const fwd: Step = { x: 1 };
+const back: Step = { x: -1 };
+const downBack: Step = { y: -1, x: -1 };
+const up: Step = { y: 1 };
 
-describe('numpadOf: 向きで前後を入れ替えてからテンキー表記に畳む', () => {
-  it('打者（前=+X）は右入力が 6（前）になる', () => {
-    expect(numpadOf(F, 1)).toBe(6);
-    expect(numpadOf(B, 1)).toBe(4);
-    expect(numpadOf(DF, 1)).toBe(3);
-  });
-
-  it('投手（前=-X）は**同じ「前」が左入力**になる（両者が同じコマンド表を使える）', () => {
-    expect(numpadOf({ x: -1, y: 0 }, -1)).toBe(6);
-    expect(numpadOf({ x: 1, y: 0 }, -1)).toBe(4);
-    expect(numpadOf({ x: -1, y: -1 }, -1)).toBe(3);
-  });
-
-  it('ニュートラルは5、上下は向きによらない', () => {
-    expect(numpadOf(N, 1)).toBe(5);
-    expect(numpadOf(N, -1)).toBe(5);
-    expect(numpadOf(U, 1)).toBe(8);
-    expect(numpadOf(D, -1)).toBe(2);
+describe('テンキー表記', () => {
+  it('向きで前後が入れ替わる（画面右の投手は ← が前）', () => {
+    expect(numpadOf(1, 0, 1)).toBe(6);
+    expect(numpadOf(1, 0, -1)).toBe(4);
+    expect(numpadOf(-1, -1, -1)).toBe(3);
+    expect(numpadOf(0, 1, 1)).toBe(8);
   });
 });
 
-describe('detectCommand: 昇龍拳コマンド（前→下→前下）', () => {
-  it('前→下→前下 と入れると成立する', () => {
-    expect(detectCommand(input([F, D, DF]))).toBe('dp');
+describe('コマンドの判定', () => {
+  it('波動（↓↘→）', () => {
+    expect(detectMotion(feed([down, downFwd, fwd]), 'qcf')).toBe(true);
+    // 途中を飛ばすと出ない（↓→）
+    expect(detectMotion(feed([down, {}, fwd]), 'qcf')).toBe(false);
   });
 
-  it('間にニュートラルが挟まっても成立する（キーボードは必ずここを通る）', () => {
-    expect(detectCommand(input([F, N, D, N, DF]))).toBe('dp');
+  it('波動は画面右の投手なら ↓↙← で出る（向きで読み替える）', () => {
+    expect(detectMotion(feed([down, downBack, back], -1), 'qcf')).toBe(true);
+    expect(detectMotion(feed([down, downFwd, fwd], -1), 'qcf')).toBe(false);
   });
 
-  it('投手側（前=左）でも同じ手順で成立する', () => {
-    const buf = input([{ x: -1, y: 0 }, D, { x: -1, y: -1 }], 0.06, -1);
-    expect(detectCommand(buf)).toBe('dp');
+  it('竜巻（↓↙←）', () => {
+    expect(detectMotion(feed([down, downBack, back]), 'qcb')).toBe(true);
   });
 
-  it('最後が前下でなければ成立しない（下→前 では出ない）', () => {
-    expect(detectCommand(input([F, DF, D]))).toBeNull();
+  it('昇龍（→↓↘）', () => {
+    expect(detectMotion(feed([fwd, down, downFwd]), 'dp')).toBe(true);
+    expect(detectMotion(feed([down, downFwd]), 'dp')).toBe(false);
   });
 
-  it('順番が違えば成立しない', () => {
-    expect(detectCommand(input([D, F, DF]))).toBeNull();
+  it('受付時間を過ぎたコマンドは出ない', () => {
+    const slow = [down, ...Array(30).fill(down), downFwd, fwd];
+    // ↓を押しっぱなしで長く待っても、最後に↓へ入った時刻は古い＝窓の外
+    expect(detectMotion(feed([down, ...Array(40).fill({}), downFwd, fwd]), 'qcf')).toBe(false);
+    expect(detectMotion(feed(slow), 'qcf')).toBe(true);
   });
 
-  it('受付時間を超えてゆっくり入れると成立しない', () => {
-    let buf = createCommandBuffer();
-    buf = hold(buf, F, 0.06);
-    buf = hold(buf, D, COMMAND_WINDOW_SEC.dp);
-    buf = hold(buf, DF, 0.06);
-    expect(detectCommand(buf)).toBeNull();
+  it('溜め（後ろを溜めて前）。溜めが足りなければ出ない', () => {
+    expect(detectMotion(feed([...Array(CHARGE_FRAMES).fill(back), fwd]), 'chargeBF')).toBe(true);
+    expect(detectMotion(feed([...Array(CHARGE_FRAMES - 10).fill(back), fwd]), 'chargeBF')).toBe(false);
+    // キーボードでは←を離してから→を押すまでにニュートラルを挟む＝それでも出る
+    expect(detectMotion(feed([...Array(CHARGE_FRAMES).fill(back), {}, {}, fwd]), 'chargeBF')).toBe(true);
+    // 斜め後ろ下でも溜まる
+    expect(detectMotion(feed([...Array(CHARGE_FRAMES).fill(downBack), fwd]), 'chargeBF')).toBe(true);
   });
 
-  it('成立したコマンドは消費すると二度は出ない（1入力1発）', () => {
-    const buf = input([F, D, DF]);
-    expect(detectCommand(buf)).toBe('dp');
-    expect(detectCommand(consumeCommand(buf))).toBeNull();
-  });
-});
-
-describe('detectCommand: 溜めコマンド（後ろをためて前）', () => {
-  it('1秒ためてから前を入れると成立する', () => {
-    let buf = hold(createCommandBuffer(), B, CHARGE_SEC + 0.05);
-    buf = hold(buf, F, 0.05);
-    expect(detectCommand(buf)).toBe('charge');
+  it('下溜め→上', () => {
+    expect(detectMotion(feed([...Array(CHARGE_FRAMES).fill(down), up]), 'chargeDU')).toBe(true);
   });
 
-  it('ためが足りなければ成立しない', () => {
-    let buf = hold(createCommandBuffer(), B, CHARGE_SEC - 0.2);
-    buf = hold(buf, F, 0.05);
-    expect(detectCommand(buf)).toBeNull();
+  it('一回転（上下左右を順に）。どちら回りでもよい', () => {
+    expect(detectMotion(feed([fwd, down, back, up]), 'spin')).toBe(true);
+    expect(detectMotion(feed([back, down, fwd, up]), 'spin')).toBe(true);
+    expect(detectMotion(feed([fwd, down, back]), 'spin')).toBe(false);
   });
 
-  it('後ろを離してから前を押すまでにニュートラルを挟んでも成立する', () => {
-    let buf = hold(createCommandBuffer(), B, CHARGE_SEC + 0.05);
-    buf = hold(buf, N, 0.1);
-    buf = hold(buf, F, 0.05);
-    expect(detectCommand(buf)).toBe('charge');
+  it('連打（受付の窓の中で同じボタンを4回）', () => {
+    const presses: Step[] = [];
+    for (let i = 0; i < MASH_PRESSES; i++) presses.push({ p: true }, {});
+    expect(detectMotion(feed(presses), 'mash', 'p')).toBe(true);
+    expect(detectMotion(feed(presses.slice(0, -2)), 'mash', 'p')).toBe(false);
   });
 
-  it('開放が遅すぎると成立しない（離してから受付時間だけ）', () => {
-    let buf = hold(createCommandBuffer(), B, CHARGE_SEC + 0.05);
-    buf = hold(buf, N, COMMAND_WINDOW_SEC.charge + 0.1);
-    buf = hold(buf, F, 0.05);
-    expect(detectCommand(buf)).toBeNull();
+  it('ダッシュ（→ ニュートラル →）', () => {
+    expect(detectMotion(feed([fwd, {}, fwd]), 'dashF')).toBe(true);
+    expect(detectMotion(feed([fwd, fwd]), 'dashF')).toBe(false);
+    expect(detectMotion(feed([back, {}, back]), 'dashB')).toBe(true);
   });
 
-  it('斜め後ろ（下後ろ）でもためられる（しゃがみながら溜める）', () => {
-    let buf = hold(createCommandBuffer(), DB, CHARGE_SEC + 0.05);
-    buf = hold(buf, F, 0.05);
-    expect(detectCommand(buf)).toBe('charge');
+  it('成立したコマンドは使ったら消える（同じ入力で2回出ない）', () => {
+    const h = feed([down, downFwd, fwd]);
+    expect(detectMotion(h, 'qcf')).toBe(true);
+    expect(detectMotion(consumeInput(h), 'qcf')).toBe(false);
   });
 
-  it('ためた後で前を離すと（ニュートラルのままでは）成立しない', () => {
-    let buf = hold(createCommandBuffer(), B, CHARGE_SEC + 0.05);
-    buf = hold(buf, N, 0.05);
-    expect(detectCommand(buf)).toBeNull();
-  });
-});
-
-describe('detectCommand: 一回転（上下左右をひと回り）', () => {
-  it('時計回りで成立する', () => {
-    expect(detectCommand(input([F, D, B, U]))).toBe('super');
-  });
-
-  it('反時計回りでも成立する', () => {
-    expect(detectCommand(input([F, U, B, D]))).toBe('super');
-  });
-
-  it('3方向しか通らなければ成立しない', () => {
-    expect(detectCommand(input([F, D, B]))).toBeNull();
-  });
-
-  it('途中で戻ると（往復では）成立しない', () => {
-    expect(detectCommand(input([F, D, F, D]))).toBeNull();
-  });
-
-  it('斜めは通過点として無視される（レバーを回すと必ず通るため）', () => {
-    expect(detectCommand(input([F, DF, D, DB, B, U], 0.05))).toBe('super');
-  });
-
-  it('一回転は昇龍拳より先に見る（回転の軌跡が昇龍の並びを含みうる）', () => {
-    // 反時計回り（前→上→後ろ→下）のあと前下へ入れると、昇龍の「前・下・前下」も
-    // 部分列として現れる。**難しいコマンドを先に見ないと、一回転が永久に出せない**
-    const buf = input([F, U, B, D, DF], 0.05);
-    expect(detectCommand(buf)).toBe('super');
+  it('押した瞬間だけを「押した」と返す（押しっぱなしは1回）', () => {
+    let h = createInputHistory();
+    const a = stepInput(h, { ...NEUTRAL_INPUT, p: true }, 1);
+    h = a.history;
+    const b = stepInput(h, { ...NEUTRAL_INPUT, p: true }, 1);
+    expect(a.pressed.p).toBe(true);
+    expect(b.pressed.p).toBe(false);
   });
 });
 
-describe('commandNotation: 表示は判定と同じ数列から起こす', () => {
-  it('打者側（前=右）は右向きの矢印で出る', () => {
-    expect(commandNotation('dp', 1)).toBe('→↓↘');
-  });
-
-  it('投手側（前=左）は左右が鏡像になる（その人が押す向きで出す）', () => {
-    expect(commandNotation('dp', -1)).toBe('←↓↙');
-  });
-
-  it('溜めは「ためる」ことが本体なので印を添える', () => {
-    expect(commandNotation('charge', 1)).toBe('←溜め→');
-  });
-
-  it('一回転は4方向をそのまま並べる', () => {
-    expect(commandNotation('super', 1)).toBe('→↓←↑');
-  });
-
-  it('表記の長さはコマンドの入力列と一致する（表と実装が二重に持たれていない）', () => {
-    for (const command of ['dp', 'super'] as const) {
-      expect([...commandNotation(command, 1)]).toHaveLength(COMMAND_MOTION[command].length);
-    }
+describe('表示', () => {
+  it('表示は判定と同じ数列から起こす（押す向きで出す）', () => {
+    const ids: MotionId[] = ['qcf', 'qcb', 'dp'];
+    for (const id of ids) expect(motionNotation(id, 1).length).toBe(MOTION_SEQUENCE[id].length);
+    expect(motionNotation('qcf', 1)).toBe('↓↘→');
+    expect(motionNotation('qcf', -1)).toBe('↓↙←');
+    expect(motionNotation('chargeBF', 1)).toBe('←溜め→');
+    expect(motionNotation('chargeBF', -1)).toBe('→溜め←');
+    expect(motionNotation('mash', 1)).toBe('連打');
   });
 });
 
-describe('純粋性', () => {
-  it('stepCommandBuffer は入力のバッファを変更しない', () => {
-    const buf = createCommandBuffer();
-    const snapshot = JSON.parse(JSON.stringify(buf));
-    stepCommandBuffer(buf, F, 1, DT);
-    expect(buf).toEqual(snapshot);
+describe('キーボードの猶予（XX-72 の実機で分かった）', () => {
+  it('最後の方向を離してからボタンを押しても、数フレーム以内なら出る（↓↘→ と叩いてから押す）', () => {
+    const h = feed([down, down, downFwd, downFwd, fwd, fwd, {}, {}, {}]);
+    expect(detectMotion(h, 'qcf')).toBe(true);
   });
 
-  it('同じ入力列は常に同じ結果になる（乱数不使用）', () => {
-    const results = new Set(Array.from({ length: 10 }, () => detectCommand(input([F, D, DF]))));
-    expect(results.size).toBe(1);
+  it('離してから長く待つと出ない（猶予は MOTION_TAIL フレームまで）', () => {
+    const h = feed([down, downFwd, fwd, ...Array(MOTION_TAIL + 2).fill({})]);
+    expect(detectMotion(h, 'qcf')).toBe(false);
+  });
+
+  it('昇龍も同じ（→↓↘ と叩いてから押す）', () => {
+    expect(detectMotion(feed([fwd, fwd, down, down, downFwd, downFwd, {}, {}]), 'dp')).toBe(true);
   });
 });

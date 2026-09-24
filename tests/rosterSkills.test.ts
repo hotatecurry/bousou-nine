@@ -245,9 +245,9 @@ describe('スキル: 能力値への反映（派生ビュー）', () => {
   it('乱闘の装備はスキルから組まれる（必殺技の解禁）', () => {
     const roster = createTeamRoster(TEST_TEAM);
     const id = roster.lineup[0];
-    expect(brawlLoadoutOf(roster, id).moves).not.toContain('shoryu');
+    expect(brawlLoadoutOf(roster, id).specials).not.toContain('shoryu');
     const { roster: next } = grantSkill(roster, id, 'shoryuken');
-    expect(brawlLoadoutOf(next, id).moves).toContain('shoryu');
+    expect(brawlLoadoutOf(next, id).specials).toContain('shoryu');
   });
 });
 

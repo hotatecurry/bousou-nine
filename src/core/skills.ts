@@ -61,7 +61,7 @@
  *   両方が書ける**。寿命の終わりは `gameMachine` の `advanceLineup`（打席が終わる唯一の場所）
  *   1か所が畳む。
  */
-import type { FighterLoadout, MoveId } from './brawl';
+import type { BrawlPassives, FighterLoadout, SpecialId, SuperId } from './brawl';
 import { BRAWL_MAX_HP, DEFAULT_LOADOUT } from './brawl';
 import { type RngState, createRngState, nextIndex, nextWeightedIndex, sampleWithoutReplacement } from './rng';
 
@@ -288,14 +288,21 @@ export interface PlayModifier {
   dropkickRange?: number;
 }
 
-/** 乱闘への効果（動詞系のうち、乱闘だけは値で表せるのでここに持つ） */
+/**
+ * 乱闘への効果（動詞系のうち、乱闘だけは値で表せるのでここに持つ）。
+ * 乱闘v3（フェーズXX-72）で**必殺技・超必殺・体質**の3つを配れるようにした。
+ */
 export interface BrawlModifier {
   /** 体力の上乗せ */
   hp?: number;
-  /** 技の威力倍率（重ねがけは掛け算） */
+  /** 技の威力倍率（重ねがけは足し算＝`brawlLoadoutFor`） */
   powerScale?: number;
-  /** 解禁する技 */
-  unlockMove?: MoveId;
+  /** 配る必殺技（コマンドで出る） */
+  special?: SpecialId;
+  /** 配る超必殺（ゲージ満タンで G） */
+  super?: SuperId;
+  /** 体質（ダッシュ・スーパーアーマー・怒り・鉄の拳・威嚇…） */
+  passive?: Partial<BrawlPassives>;
 }
 
 export type SkillId =
@@ -306,6 +313,7 @@ export type SkillId =
   | 'karate'
   | 'dosukoi'
   | 'shoryuken'
+  | 'hadouken'
   | 'doroppukikku'
   | 'abareguse'
   | 'haganenokarada'
@@ -374,6 +382,7 @@ export type SkillId =
   | 'shinimonogurui'
   // デュオ（★4。系統ごとに2つ＝どの系統を引いてもランの目標が2通りある）
   | 'battoshoryuken'
+  | 'shinkuhadouken'
   | 'roketokikku'
   | 'homingudan'
   | 'tabosukebo'
@@ -498,8 +507,10 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'violence',
     rarity: 1,
     target: 'any',
-    text: '乱闘の体力+30',
-    brawl: { hp: 30 },
+    // 乱闘v3（XX-72）：**前ダッシュ・バックステップ**（→→／←←）。間合いを一気に詰める・
+    // 離す手段は素の選手には無い（歩きだけ）ので、名前どおり「すぐ喧嘩を始められる」札。
+    text: '乱闘でダッシュ（→→）',
+    brawl: { hp: 10, passive: { dash: true } },
   },
   tekko: {
     id: 'tekko',
@@ -507,8 +518,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'violence',
     rarity: 1,
     target: 'any',
-    text: '乱闘の威力1.2倍',
-    brawl: { powerScale: 1.2 },
+    // 乱闘v3（XX-72）：**鉄の拳**＝通常技もガードの上から削る（素の通常技は削らない）。
+    text: '拳が鉄 ガードの上も削る',
+    brawl: { powerScale: 1.1, passive: { ironFist: true } },
   },
   zutsuki: {
     id: 'zutsuki',
@@ -516,10 +528,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'violence',
     rarity: 1,
     target: 'any',
-    // 体力と威力を少しずつ。★1の中で「どちらにも効くが尖っていない」枠で、
-    // ケンカッパヤイ（体力だけ）・テッコウ（威力だけ）との選び分けになる。
-    text: '乱闘の体力と威力',
-    brawl: { hp: 20, powerScale: 1.1 },
+    // 乱闘v3（XX-72）：**必殺技・頭突き**（←溜め→＋P）。飛び道具をくぐって突っ込む。
+    text: '必殺技・頭突き',
+    brawl: { hp: 10, special: 'zutsuki' },
   },
   karate: {
     id: 'karate',
@@ -527,11 +538,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'violence',
     rarity: 1,
     target: 'any',
-    // ★1の「威力寄りだが体力も少し」。テッコウ（威力だけ1.2）との選び分けになる幅で、
-    // 同じ軸の札を複数置くときは**必ずどちらかが上位互換にならない配分**にする
-    // （でないと片方が死に札になる）。
-    text: '乱闘が少し強い',
-    brawl: { hp: 10, powerScale: 1.15 },
+    // 乱闘v3（XX-72）：**必殺技・竜巻旋風脚**（↓↙←＋K）。回りながら前へ出る蹴り。
+    text: '必殺技・竜巻旋風脚',
+    brawl: { special: 'tatsu' },
   },
   dosukoi: {
     id: 'dosukoi',
@@ -542,9 +551,10 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // ボウリョク系統で唯一、**打席にも効く**★1（体当たりの力がそのまま打球に乗る）。
     // 乱闘は死球が起きた試合にしか出番が無いので、系統を引き当てた試合が
     // 「何も起きなければ全部空振り」にならないための逃げ道でもある。
-    text: '押しが強く力もつく',
+    // 乱闘v3（XX-72）：**必殺技・百裂張り手**（P連打）。打席でも押しが強い（長打力）。
+    text: '百裂張り手 打席でも力',
     modifier: { power: 0.1 },
-    brawl: { hp: 20 },
+    brawl: { special: 'hyakuretsu' },
   },
   shoryuken: {
     id: 'shoryuken',
@@ -556,7 +566,18 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // `core/brawl.ts` の `MOVES` が持つので、ここに書くのは「どの技が解禁されるか」だけ
     // （表示の技表もコマンド判定も同じ1か所から起きる）。
     text: '必殺技・昇龍拳',
-    brawl: { unlockMove: 'shoryu' },
+    brawl: { special: 'shoryu' },
+  },
+  hadouken: {
+    id: 'hadouken',
+    name: '波動拳',
+    lineage: 'violence',
+    rarity: 2,
+    target: 'any',
+    // 乱闘v3（XX-72）：**必殺技・波動拳**（↓↘→＋P）。テストプレイ「スキルの波動拳を
+    // 試してみたい」。気の飛び道具で、**遠くから撃つ技**（撃った後が長い）。
+    text: '必殺技・波動拳',
+    brawl: { special: 'hadou' },
   },
   doroppukikku: {
     id: 'doroppukikku',
@@ -569,6 +590,8 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // こちらは**試合そのものの中で殴る**ので、実体は `core/fielding.ts` のドロップキック定数と
     // `scenes/chicchaiScene.ts` の走塁にある（バイクと同じ置き方）。
     text: 'Gで野手を蹴り倒す',
+    // 乱闘でも使える（跳んで↓＋K＝急降下キック。XX-72）
+    brawl: { special: 'divekick' },
   },
   abareguse: {
     id: 'abareguse',
@@ -576,8 +599,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'violence',
     rarity: 2,
     target: 'any',
-    text: '乱闘が全面的に強い',
-    brawl: { hp: 40, powerScale: 1.2 },
+    // 乱闘v3（XX-72）：**怒り**＝体力が3割を切ると威力1.5倍（追い込まれてから暴れる）。
+    text: '追い込まれると威力1.5倍',
+    brawl: { hp: 20, passive: { rage: 1.5 } },
   },
   haganenokarada: {
     id: 'haganenokarada',
@@ -585,10 +609,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'violence',
     rarity: 2,
     target: 'any',
-    // 体力に全振りした★2。**負けない**ほうへ寄せた札で、威力寄りの `イカク` と対になる
-    // （乱闘は体力と威力の2軸しか無いので、★2はその両端を1枚ずつ持たせる）。
-    text: '乱闘の体力+60',
-    brawl: { hp: 60 },
+    // 乱闘v3（XX-72）：**スーパーアーマー**＝技を出している間は1ラウンドに2発まで怯まない。
+    text: '技の最中は2発まで怯まない',
+    brawl: { hp: 30, passive: { armor: 2 } },
   },
   ikaku: {
     id: 'ikaku',
@@ -596,8 +619,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     lineage: 'violence',
     rarity: 2,
     target: 'any',
-    text: 'にらみで乱闘が有利',
-    brawl: { powerScale: 1.3 },
+    // 乱闘v3（XX-72）：**威嚇**＝にらまれた相手の威力が 0.85倍になる。
+    text: 'にらみで相手の威力を下げる',
+    brawl: { powerScale: 1.1, passive: { intimidate: 0.85 } },
   },
   tetsugeta: {
     id: 'tetsugeta',
@@ -623,8 +647,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 乱闘v2（G-27）：威力に加えて**溜めコマンドの大技**を配る★3。ショウリュウケン（★2）が
     // 「速くて出しやすい必殺技」なのに対し、こちらは**1秒ためて待つ**ことが代償の一撃
     // ＝同じ「必殺技を配る札」でもどちらかが上位互換にならない（F-26-7の配分方針）。
-    text: '威力1.5倍＋溜め技',
-    brawl: { powerScale: 1.5, unlockMove: 'buki' },
+    // 乱闘v3（XX-72）：**必殺技・武器振り回し**（←溜め→＋K）。とても長いが遅い。
+    text: '武器振り回し 威力1.25倍',
+    brawl: { powerScale: 1.25, special: 'buki' },
   },
   oyabun: {
     id: 'oyabun',
@@ -634,8 +659,9 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     target: 'any',
     // ★3は「試合の形が変わるもの」。乱闘に持ち込めば**ほぼ負けない**体力と威力で、
     // 死球を受けた（撃たれた）ときに乱闘を選ぶかどうかの判断そのものを反転させる。
-    text: '乱闘がめちゃくちゃ強い',
-    brawl: { hp: 50, powerScale: 1.3 },
+    // 乱闘v3（XX-72）：**子分を呼ぶ**（↓↙←＋P。1ラウンドに1回）。子分が後ろから駆け込む。
+    text: '子分を呼ぶ 体力と威力',
+    brawl: { hp: 40, powerScale: 1.15, special: 'kobun' },
   },
 
   // ---- メカ：走塁と飛び道具 ----
@@ -1282,9 +1308,22 @@ export const SKILLS: Record<SkillId, SkillDef> = {
     // 揃えた選手への報酬として、**一回転コマンドの最大威力技**を配る。前提の2技も持って
     // いるので、格の上がる順（ジャブ→パンチ→昇龍→タメ→バット）にコンボが繋がる
     // ＝「誰に集めるか」がそのまま乱闘の強さになる（CLAUDE.md ⑧のデュオの狙い）。
-    text: '一回転の最大必殺',
-    brawl: { hp: 20, powerScale: 1.5, unlockMove: 'batto' },
+    // 乱闘v3（XX-72）：**超必殺・バット龍拳**（ゲージ満タンでG）。燃えるバットで昇る4段。
+    text: '超必殺・バット龍拳',
+    brawl: { hp: 20, super: 'batto' },
     requires: ['shoryuken', 'bukimochikomi'],
+  },
+  shinkuhadouken: {
+    id: 'shinkuhadouken',
+    name: '真空波動拳',
+    lineage: 'violence',
+    rarity: DUO_RARITY,
+    target: 'any',
+    // 乱闘v3（XX-72）：前提2つ（波動拳＝飛び道具／空手＝竜巻旋風脚）を揃えた選手への報酬＝
+    // **超必殺・真空波動拳**（ゲージ満タンでG。大きな気弾が5回当たる）。
+    text: '超必殺・真空波動拳',
+    brawl: { hp: 10, super: 'shinku' },
+    requires: ['hadouken', 'karate'],
   },
   /**
    * 強化デュオ（F-26-8）。**前提は消費型1つだけ**で、`テツゲタ` を**まだ使い切って
@@ -1668,17 +1707,30 @@ export function brawlLoadoutFor(skills: readonly SkillId[]): FighterLoadout {
   let maxHp = BRAWL_MAX_HP;
   // 足し算にするため「1 からの増分」を積む（1.5 なら +0.5）
   let powerBonus = 0;
-  // 素の技は**乱闘の側が決める**（`DEFAULT_LOADOUT`）。ここに書き写すと、v2で投げを
-  // 全員に配ったときのように「素の技が増えたのにスキル経由の装備だけ古いまま」になる。
-  const moves: MoveId[] = [...DEFAULT_LOADOUT.moves];
+  const specials: SpecialId[] = [...DEFAULT_LOADOUT.specials];
+  let superMove: SuperId | null = DEFAULT_LOADOUT.super;
+  const passives: BrawlPassives = { ...DEFAULT_LOADOUT.passives };
   for (const id of skills) {
     const brawl = SKILLS[id]?.brawl;
     if (!brawl) continue;
     if (brawl.hp) maxHp += brawl.hp;
     if (brawl.powerScale) powerBonus += brawl.powerScale - 1;
-    if (brawl.unlockMove && !moves.includes(brawl.unlockMove)) moves.push(brawl.unlockMove);
+    if (brawl.special && !specials.includes(brawl.special)) specials.push(brawl.special);
+    if (brawl.super) superMove = brawl.super;
+    const p = brawl.passive;
+    if (p) {
+      if (p.dash) passives.dash = true;
+      if (p.ironFist) passives.ironFist = true;
+      if (p.armor) passives.armor += p.armor;
+      // 倍率の体質は「1 からの差」を足す（重ねても極端にならない）
+      if (p.rage) passives.rage += p.rage - 1;
+      if (p.intimidate) passives.intimidate += p.intimidate - 1;
+      if (p.walk) passives.walk += p.walk - 1;
+      if (p.jump) passives.jump += p.jump - 1;
+      if (p.stunGuard) passives.stunGuard += p.stunGuard;
+    }
   }
-  return { maxHp, powerScale: 1 + powerBonus, moves };
+  return { maxHp, powerScale: 1 + powerBonus, specials, super: superMove, passives };
 }
 
 // ---- 抽選 ----

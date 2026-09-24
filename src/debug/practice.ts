@@ -15,6 +15,7 @@
  * | `pitch` | 人間が投げる／CPU打者は**振る/振らないを切替** | 球の軌道・コース・変化・判定 |
  * | `bat` | 人間が打つ／CPU投手が投げる | 打撃のタイミング・立ち位置・CPUの配球 |
  * | `field` | 人間が守る／**ノックで打球を打ち出す** | 捕球・送球・タッチ・走者の帰結 |
+ * | `brawl` | 人間が打者で乱闘／**必殺技と超必殺を全部持つ**・相手の動きを切替 | 乱闘v3の技・当たり方（XX-72） |
  *
  * ## 設計の柱：判定には1つも触らない
  *
@@ -30,16 +31,25 @@
  *   （同ユーザー判断）＝打った結果も守備の帰結も画面で見えるが、場面は元のまま。
  */
 import { type BattedBallLaunch, type BattedBall, createBattedBall } from '../core/batting';
+import {
+  type FighterLoadout,
+  type SpecialId,
+  type SuperId,
+  DEFAULT_LOADOUT,
+  MOVE_NAME,
+} from '../core/brawl';
+import type { BrawlDummy } from '../core/brawlAi';
 import type { TeamSide } from '../core/rules';
 
 /** デバッグモードの種類（モード選択の DEBUG の下に並ぶ順） */
-export type PracticeMode = 'pitch' | 'bat' | 'field';
+export type PracticeMode = 'pitch' | 'bat' | 'field' | 'brawl';
 
 /** モード選択の DEBUG の中身。ラベルはモード選択の他の行と同じカタカナ表記に揃える */
 export const PRACTICE_MODES: readonly { id: PracticeMode; label: string; note: string }[] = [
   { id: 'pitch', label: '投球', note: '自分が投げる（打者は振る／振らないを切り替え）' },
   { id: 'bat', label: '打撃', note: '自分が打つ（CPUが投げる）' },
   { id: 'field', label: '守備', note: 'ノックで打ち出して守備する' },
+  { id: 'brawl', label: '乱闘', note: '必殺技を全部試す（相手の動きを切り替え）' },
 ];
 
 /**
@@ -51,7 +61,59 @@ export const PRACTICE_MODES: readonly { id: PracticeMode; label: string; note: s
  * 選ばせない（段を1つ減らす＝確認したい局面へ最短で入る、というこのモードの目的そのもの）。
  */
 export function practiceHumanSide(mode: PracticeMode): TeamSide {
-  return mode === 'bat' ? 'away' : 'home';
+  // 乱闘は**殴られた打者の側**（画面左）で戦う＝攻撃側（先攻）
+  return mode === 'bat' || mode === 'brawl' ? 'away' : 'home';
+}
+
+// ---------------------------------------------------------------------------
+// 乱闘の練習（`brawl` モード。フェーズXX-72）
+// ---------------------------------------------------------------------------
+//
+// テストプレイ「スキルの波動拳とかも作り込んで試してみたい」。スキルを揃えないと出ない
+// 技を**全部持った状態**で始め、相手の動きを数字キーで切り替える。**体力は減っても戻り、
+// ゲージは常に満タン・時間は止まる**（`core/brawl.ts` の練習の扱い＝判定そのものは本番と同じ）。
+
+/** 練習で持たせる必殺技（名鑑の全部。技表と同じ順） */
+export const PRACTICE_SPECIALS: readonly SpecialId[] = [
+  'hadou',
+  'shoryu',
+  'tatsu',
+  'zutsuki',
+  'hyakuretsu',
+  'screw',
+  'buki',
+  'somersault',
+  'divekick',
+  'kobun',
+];
+
+/** 練習で切り替える超必殺 */
+export const PRACTICE_SUPERS: readonly SuperId[] = ['shinku', 'batto'];
+
+/** 練習の相手の動き（数字キー1で回す） */
+export const PRACTICE_DUMMIES: readonly { id: BrawlDummy; label: string }[] = [
+  { id: 'stand', label: '棒立ち' },
+  { id: 'guard', label: '立ちガード' },
+  { id: 'crouchGuard', label: 'しゃがみガード' },
+  { id: 'jump', label: 'ジャンプし続ける' },
+  { id: 'cpu', label: 'CPU' },
+];
+
+export interface BrawlPracticeSetup {
+  dummy: number;
+  super: number;
+  /** 相手にも必殺技を持たせる（CPUの対空・飛び道具を見る） */
+  foeSpecials: boolean;
+}
+
+export const INITIAL_BRAWL_PRACTICE: BrawlPracticeSetup = { dummy: 0, super: 0, foeSpecials: false };
+
+export function practiceBrawlLoadout(superIdx: number): FighterLoadout {
+  return { ...DEFAULT_LOADOUT, specials: [...PRACTICE_SPECIALS], super: PRACTICE_SUPERS[superIdx % PRACTICE_SUPERS.length] };
+}
+
+export function practiceFoeLoadout(setup: BrawlPracticeSetup): FighterLoadout {
+  return setup.foeSpecials ? { ...DEFAULT_LOADOUT, specials: ['hadou', 'shoryu', 'tatsu'] } : DEFAULT_LOADOUT;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +212,17 @@ export function knockLabel(setup: KnockSetup): string {
  */
 export function practiceHudLines(
   mode: PracticeMode,
-  state: { swing: boolean; knock: KnockSetup },
+  state: { swing: boolean; knock: KnockSetup; brawl?: BrawlPracticeSetup },
 ): string {
+  if (mode === 'brawl') {
+    const b = state.brawl ?? INITIAL_BRAWL_PRACTICE;
+    return (
+      `DEBUG 乱闘  体力は戻る・ゲージ満タン・時間は止まる
+` +
+      `1:相手 ${PRACTICE_DUMMIES[b.dummy].label}  2:超必殺 ${MOVE_NAME[PRACTICE_SUPERS[b.super]]}  ` +
+      `3:相手の必殺技 ${b.foeSpecials ? 'あり' : 'なし'}`
+    );
+  }
   const head = `DEBUG ${PRACTICE_MODES.find((m) => m.id === mode)?.label ?? ''}  カウントは0-0に戻る`;
   if (mode === 'pitch') {
     return `${head}\n1:打者のスイング ${state.swing ? '振る' : '振らない'}`;
@@ -167,4 +238,7 @@ export const PRACTICE_KEYS = {
   cycleKind: 'Digit2',
   cycleRunners: 'Digit3',
   knock: 'Digit4',
+  brawlDummy: 'Digit1',
+  brawlSuper: 'Digit2',
+  brawlFoe: 'Digit3',
 } as const;

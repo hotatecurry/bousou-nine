@@ -480,12 +480,14 @@ describe('SKILLS: ドロップキック', () => {
    * ドロップキックは**試合の中で**効くので、データ側には何も持たない＝効き先の違いが
    * 型に出ていることを固定しておく（brawl を足すと乱闘エンジンへ迷い込む）。
    */
-  it('動詞系＝データ側に効果を持たない（乱闘スキルとは効き先が違う）', () => {
+  it('動詞系＝能力値は動かさない。乱闘では名前どおり急降下キックになる（XX-72）', () => {
     expect(SKILLS.doroppukikku.modifier).toBeUndefined();
-    expect(SKILLS.doroppukikku.brawl).toBeUndefined();
     expect(combinedModifier(['doroppukikku'])).toEqual({});
-    expect(brawlLoadoutFor(['doroppukikku'])).toEqual(brawlLoadoutFor([]));
-    expect(SKILLS.shoryuken.brawl).toBeDefined();
+    // 乱闘v3：跳んで↓＋K（体力・威力は動かさない＝必殺技が1つ増えるだけ）
+    const lo = brawlLoadoutFor(['doroppukikku']);
+    expect(lo.specials).toEqual(['divekick']);
+    expect(lo.maxHp).toBe(brawlLoadoutFor([]).maxHp);
+    expect(lo.powerScale).toBe(1);
   });
 
   it('抽選プールに載り、誰にでも付けられる', () => {
@@ -527,83 +529,72 @@ describe('combinedModifier: パラメータ系の合成', () => {
   });
 });
 
-describe('brawlLoadoutFor: 乱闘の装備', () => {
-  it('スキルなしなら既定＝必殺技が出せない（ジャブ・パンチ・投げだけ）', () => {
+describe('brawlLoadoutFor: 乱闘の装備（乱闘v3。XX-72）', () => {
+  it('スキルなしなら既定＝必殺技も超必殺も無い（通常技と投げだけ）', () => {
     const loadout = brawlLoadoutFor([]);
     expect(loadout.maxHp).toBe(BRAWL_MAX_HP);
     expect(loadout.powerScale).toBe(1);
-    expect(loadout.moves).toEqual(DEFAULT_LOADOUT.moves);
+    expect(loadout.specials).toEqual([]);
+    expect(loadout.super).toBeNull();
+    expect(loadout.passives).toEqual(DEFAULT_LOADOUT.passives);
   });
 
-  it('ショウリュウケンで必殺技（昇龍コマンド）が解禁される', () => {
-    expect(brawlLoadoutFor(['shoryuken']).moves).toContain('shoryu');
+  it('名前どおりの必殺技を配る（昇龍拳・波動拳・竜巻旋風脚・頭突き・百裂張り手・武器・子分）', () => {
+    expect(brawlLoadoutFor(['shoryuken']).specials).toContain('shoryu');
+    expect(brawlLoadoutFor(['hadouken']).specials).toContain('hadou');
+    expect(brawlLoadoutFor(['karate']).specials).toContain('tatsu');
+    expect(brawlLoadoutFor(['dosukoi']).specials).toContain('hyakuretsu');
+    expect(brawlLoadoutFor(['bukimochikomi']).specials).toContain('buki');
+    expect(brawlLoadoutFor(['oyabun']).specials).toContain('kobun');
+    expect(brawlLoadoutFor(['doroppukikku']).specials).toContain('divekick');
   });
 
-  it('ブキモチコミは威力に加えて溜めコマンドの技を配る（乱闘v2）', () => {
-    expect(brawlLoadoutFor(['bukimochikomi']).moves).toContain('buki');
+  it('体質を配る札（ダッシュ・鉄の拳・怒り・アーマー・威嚇）', () => {
+    expect(brawlLoadoutFor(['kenkappayai']).passives.dash).toBe(true);
+    expect(brawlLoadoutFor(['tekko']).passives.ironFist).toBe(true);
+    expect(brawlLoadoutFor(['abareguse']).passives.rage).toBeGreaterThan(1);
+    expect(brawlLoadoutFor(['haganenokarada']).passives.armor).toBeGreaterThan(0);
+    expect(brawlLoadoutFor(['ikaku']).passives.intimidate).toBeLessThan(1);
   });
 
-  it('ケンカッパヤイで体力が増える', () => {
-    expect(brawlLoadoutFor(['kenkappayai']).maxHp).toBe(BRAWL_MAX_HP + 30);
+  it('デュオは超必殺を配る（前提2つの必殺技はそのまま残る）', () => {
+    const batto = brawlLoadoutFor(['shoryuken', 'bukimochikomi', 'battoshoryuken']);
+    expect(batto.super).toBe('batto');
+    expect(batto.specials).toEqual(expect.arrayContaining(['shoryu', 'buki']));
+    const shinku = brawlLoadoutFor(['hadouken', 'karate', 'shinkuhadouken']);
+    expect(shinku.super).toBe('shinku');
+    expect(shinku.specials).toEqual(expect.arrayContaining(['hadou', 'tatsu']));
   });
 
-  it('ブキモチコミで威力が上がる', () => {
-    expect(brawlLoadoutFor(['bukimochikomi']).powerScale).toBeCloseTo(1.5);
+  it('真空波動拳の前提は同じ系統の2枚（波動拳・空手）', () => {
+    expect(SKILLS.shinkuhadouken.requires).toEqual(['hadouken', 'karate']);
+    for (const id of SKILLS.shinkuhadouken.requires!) {
+      expect(SKILLS[id].lineage).toBe(SKILLS.shinkuhadouken.lineage);
+    }
   });
 
-  it('デュオは前提2つの効果に上乗せされる（威力は足し算で伸びる）', () => {
-    const duo = brawlLoadoutFor(['shoryuken', 'bukimochikomi', 'battoshoryuken']);
-    expect(duo.moves).toContain('shoryu');
-    // デュオ自身も技を配る（前提2つを揃えた選手だけの一回転コマンド）
-    expect(duo.moves).toContain('batto');
-    // フェーズI-29で掛け算（1.5×1.5=2.25）から足し算（1+0.5+0.5=2.0）へ変えた。
-    // 他の補正（レーティング・プレー定数）と同じ重ね方に揃えるのが第一の理由で、
-    // 副産物として下の「一撃では倒せない」が成り立つ。
-    expect(duo.powerScale).toBeCloseTo(1 + 0.5 + 0.5);
-    expect(duo.maxHp).toBe(BRAWL_MAX_HP + 20);
-    // 前提2つだけの状態より必ず強い＝揃えにいく価値がある
-    const before = brawlLoadoutFor(['shoryuken', 'bukimochikomi']);
-    expect(duo.powerScale).toBeGreaterThan(before.powerScale);
+  it('威力は足し算で重なる（フェーズI-29と同じ重ね方）', () => {
+    const lo = brawlLoadoutFor(['tekko', 'bukimochikomi']);
+    expect(lo.powerScale).toBeCloseTo(1 + 0.1 + 0.25);
   });
 
-  it('どんなに威力を積んでも、必殺技1発では相手を倒しきれない（フェーズI-29）', () => {
-    // 掛け算で重ねていたころは `バットリュウケン` 単発が 46×2.25＝104 ＝ 100HP を
-    // 一撃で超えていた（実測 0.83秒KO）。**当てれば勝ち**になると読み合いが消えるので、
-    // 「もう一度当てにいく」局面が必ず残ることを固定する。
-    // 見るのは「その装備で**実際に出せる**いちばん強い技」。技を配るスキルと威力を
-    // 上げるスキルは別なので、装備に無い技の威力で測っても意味が無い。
-    const strongestOf = (skills: readonly SkillId[]): number => {
-      const loadout = brawlLoadoutFor(skills);
-      const power = Math.max(...loadout.moves.map((m) => MOVES[m].power));
-      return power * loadout.powerScale;
-    };
-
-    // (1) デュオまで揃えた最強の組（前提2つ＋デュオで枠3つを使い切る）
-    expect(strongestOf(['shoryuken', 'bukimochikomi', 'battoshoryuken'])).toBeLessThan(
-      BRAWL_MAX_HP,
-    );
-
-    // (2) 抽選だけで積める最悪の組（威力の上がるスキルを枠いっぱいまで）
+  it('どんなに威力を積んでも、1発では相手を倒しきれない（当てれば勝ちにしない）', () => {
+    // 抽選だけで積める最悪の組（威力の上がる札を枠いっぱいまで）に、怒りの倍率まで乗せる
     const draftablePower = DRAFTABLE_SKILL_IDS.filter(
-      (id) => (SKILLS[id].brawl?.powerScale ?? 0) > 0,
+      (id) => (SKILLS[id].brawl?.powerScale ?? 0) > 1,
     );
     const worst = [...draftablePower]
       .sort((a, b) => (SKILLS[b].brawl?.powerScale ?? 0) - (SKILLS[a].brawl?.powerScale ?? 0))
       .slice(0, MAX_SKILLS_PER_PLAYER);
     expect(worst).toHaveLength(MAX_SKILLS_PER_PLAYER);
-    expect(strongestOf(worst)).toBeLessThan(BRAWL_MAX_HP);
-  });
-
-  it('デュオを揃えた必殺技は素の必殺技より実際にダメージが大きい', () => {
-    const plain = brawlLoadoutFor(['shoryuken']);
-    const duo = brawlLoadoutFor(['shoryuken', 'bukimochikomi', 'battoshoryuken']);
-    expect(Math.round(MOVES.shoryu.power * duo.powerScale)).toBeGreaterThan(
-      Math.round(MOVES.shoryu.power * plain.powerScale),
-    );
+    const lo = brawlLoadoutFor(worst);
+    const strongest = Math.max(...Object.values(MOVES).map((m) => m.damage * (m.hits ?? 1)));
+    const rage = brawlLoadoutFor(['abareguse']).passives.rage;
+    expect(strongest * lo.powerScale * rage).toBeLessThan(BRAWL_MAX_HP);
   });
 
   it('知らないIDが混ざっていても壊れない', () => {
-    expect(brawlLoadoutFor(['shoryuken', 'nonexistent' as SkillId]).moves).toContain('shoryu');
+    expect(brawlLoadoutFor(['shoryuken', 'nonexistent' as SkillId]).specials).toContain('shoryu');
   });
 });
 

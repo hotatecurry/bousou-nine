@@ -23,6 +23,8 @@
  */
 import type { GameContext } from '../../core/gameMachine';
 import type { EdgeMarker } from '../../core/camera';
+import type { BrawlHudView } from '../../scenes/brawlScene';
+import { type BrawlCalloutTone, createBrawlHud } from './brawlHud';
 import { type Half, battingTeam, fieldingTeam } from '../../core/rules';
 import {
   type SideControllers,
@@ -56,7 +58,7 @@ import { skillDef } from '../../core/skills';
 import type { RunProgress } from '../../core/run';
 import { CALL_BANNER_SEC, GUN_TELEGRAPH_SEC } from '../../core/tempo';
 import type { PlayPromptKind } from '../../scenes/chicchaiScene';
-import { type PixelLabel, createPixelLabel, uiScale } from './pixelText';
+import { createPixelLabel, uiScale } from './pixelText';
 
 /**
  * ちっちゃいモードの操作ヒントの文言（走塁＝説明書p19の進塁B／帰塁A、
@@ -203,13 +205,6 @@ export type BannerKind =
   // ユニフォームを別の色に塗って知らせていた（その色が以後の全選手に残っていた）。
   | 'ejected';
 
-/** 乱闘の体力ゲージ1本ぶんの表示（真実は `core/brawl.ts` の `BrawlState` の側） */
-export interface BrawlGaugeView {
-  hp: number;
-  maxHp: number;
-  /** いま繋がっているコンボのヒット数（0=繋がっていない。2以上のときだけ表示する） */
-  combo: number;
-}
 
 export interface Hud {
   /**
@@ -237,18 +232,22 @@ export interface Hud {
   /** 銃命中時のシリアス演出（緊迫感重視・コミカルにしない暗転フラッシュ） */
   gunHitFlash(): void;
   /**
-   * 乱闘中のみ毎フレーム呼ぶ。体力ゲージとコンボ数を更新する。
-   * **最大値を両者ぶん受け取る**（フェーズF-26-1）：スキル `ケンカッパヤイ` で体力が
-   * 増えるので分母が両者で違いうる。**コンボ数も同じ引数で受ける**（フェーズG-27）＝
-   * 体力と同じく `BrawlState` からの導出なので、別経路で更新されて食い違うことがない。
+   * 乱闘中のみ毎フレーム呼ぶ（乱闘v3。フェーズXX-72）。体力・減りしろ・ラウンドの印・
+   * 残り時間・超必殺のゲージ・連続技の数（`brawlHud.ts`）。真実は `BrawlState` の側。
    */
-  updateBrawl(batter: BrawlGaugeView, pitcher: BrawlGaugeView): void;
+  updateBrawl(view: BrawlHudView, dt: number): void;
+  /** 乱闘の大きな呼び出し（第1ラウンド／ファイト！／K.O.／タイムアップ／〇〇の勝ち） */
+  brawlCallout(text: string, tone: BrawlCalloutTone): void;
+  /** 超必殺の暗転（画面全体が一瞬暗くなる） */
+  brawlSuperFlash(): void;
   /**
-   * 乱闘中に出す操作説明と技表（フェーズG-27）。null で既定に戻す。
+   * 乱闘中に出す操作説明と技表（フェーズG-27）。null で消す。
    * **HUDが自分では組めない**（誰がどの必殺技を持っているか＝スキル、その人が押す
    * 向き＝画面左右で前が逆、2Pのキー名の読み替え）ので、main.ts が組んで渡す。
+   * 乱闘v3（XX-72）で**側ごとに2枚**（打者＝左下／投手＝右下）にした＝真ん中で戦う
+   * 2人に掛からない（技表が12行に増えたので、中央に1枚だと足元がまるごと隠れた）。
    */
-  setBrawlHint(text: string | null): void;
+  setBrawlHint(hint: { batter: string | null; pitcher: string | null } | null): void;
   /** ホームラン・安打・三振・四球の決着演出バナー。一定時間で自動的に消える */
   playBanner(kind: BannerKind, text: string): void;
   /**
@@ -709,16 +708,19 @@ export function createHud(root: HTMLElement): Hud {
   // **画面の下端に、小さく出す**：技表は最大5行になるので、中央のメッセージ枠に出すと
   // 殴り合っている2人をまるごと覆ってしまう（実機で確認）。乱闘は画面下部に何も置かない
   // （打者・投手カードはでっかいモード専用）ので、ここが空いている。
-  const brawlHintPanel = createPixelLabel('', { scale: 1, color: '#ffe066', align: 'center' });
-  applyPanelChrome(brawlHintPanel.el);
-  Object.assign(brawlHintPanel.el.style, {
-    position: 'fixed',
-    bottom: '16px',
-    left: '50%',
-    transform: 'translateX(-50%)',
-    display: 'none',
+  const brawlHintPanels = (['batter', 'pitcher'] as const).map((side) => {
+    const panel = createPixelLabel('', { scale: 1, color: '#ffe066', align: 'left' });
+    applyPanelChrome(panel.el);
+    Object.assign(panel.el.style, {
+      position: 'fixed',
+      bottom: '8px',
+      [side === 'batter' ? 'left' : 'right']: '8px',
+      opacity: '0.88',
+      display: 'none',
+    });
+    root.appendChild(panel.el);
+    return panel;
   });
-  root.appendChild(brawlHintPanel.el);
 
   // ---- デバッグモードの状態表示（フェーズPP-64。update() の管理外の独立チャンネル） ----
   const debugPanel = createPixelLabel('', { scale: 1, color: '#7ee081', align: 'center' });
@@ -759,7 +761,7 @@ export function createHud(root: HTMLElement): Hud {
   root.appendChild(banner.el);
   let bannerHideTimer: ReturnType<typeof setTimeout> | null = null;
   /** 乱闘の操作説明と技表（フェーズG-27。main.ts が `setBrawlHint` で渡す） */
-  let brawlHint: string | null = null;
+  let brawlHint: { batter: string | null; pitcher: string | null } | null = null;
   /**
    * 直前に `update` へ渡ってきたモード。**`update` は毎フレームではなく状態が変わったときに
    * だけ呼ばれる**（main.ts の `refresh`）ので、乱闘の最中に渡ってくる技表を出すには、
@@ -769,9 +771,18 @@ export function createHud(root: HTMLElement): Hud {
 
   /** 技表を実際に画面へ書く（乱闘中だけ出す。渡っていなければ出さない） */
   function syncBrawlHint(): void {
-    const show = lastModeState === 'brawl' && brawlHint !== null;
-    if (show) brawlHintPanel.setText(brawlHint as string);
-    brawlHintPanel.el.style.display = show ? 'block' : 'none';
+    const inBrawl = lastModeState === 'brawl';
+    (['batter', 'pitcher'] as const).forEach((side, i) => {
+      const text = brawlHint?.[side] ?? null;
+      const show = inBrawl && text !== null;
+      if (show) brawlHintPanels[i].setText(text as string);
+      brawlHintPanels[i].el.style.display = show ? 'block' : 'none';
+    });
+    // 乱闘の画面は上端を体力ゲージが、真ん中を2人が使うので、デバッグの行は右下へ
+    // （1P の乱闘では右下＝相手の技表の場所が空いている）
+    Object.assign(debugPanel.el.style, inBrawl
+      ? { top: 'auto', bottom: '8px', left: 'auto', right: '8px', transform: 'none' }
+      : { top: '8px', bottom: 'auto', left: '50%', right: 'auto', transform: 'translateX(-50%)' });
   }
 
   // ---- 画面下部（操作ヒント／打者・投手カード） ----
@@ -943,68 +954,8 @@ export function createHud(root: HTMLElement): Hud {
     });
   }
 
-  // ---- 乱闘の体力ゲージ（打者=左／投手=右。対戦格闘ゲームの定番レイアウト） ----
-  const brawlOverlay = document.createElement('div');
-  brawlOverlay.style.cssText = `
-    position: fixed;
-    top: 16px;
-    left: 0;
-    right: 0;
-    display: none;
-    justify-content: space-between;
-    padding: 0 24px;
-    pointer-events: none;
-  `;
-  function createGaugeBar(align: 'left' | 'right'): {
-    column: HTMLElement;
-    fill: HTMLElement;
-    combo: PixelLabel;
-  } {
-    const column = document.createElement('div');
-    column.style.cssText = `
-      width: 40%;
-      display: flex;
-      flex-direction: column;
-      align-items: ${align === 'right' ? 'flex-end' : 'flex-start'};
-      gap: 6px;
-    `;
-    const wrap = document.createElement('div');
-    wrap.style.cssText = `
-      width: 100%;
-      height: 20px;
-      background: #200000;
-      border: 3px solid #fff;
-      box-shadow: 3px 3px 0 0 rgba(0, 0, 0, 0.55);
-      overflow: hidden;
-      direction: ${align === 'right' ? 'rtl' : 'ltr'};
-    `;
-    const fill = document.createElement('div');
-    fill.style.cssText = `
-      height: 100%;
-      width: 100%;
-      background: #33dd55;
-      transition: width 120ms linear, background-color 120ms linear;
-    `;
-    wrap.appendChild(fill);
-    // コンボ数（乱闘v2＝フェーズG-27）。**繋がっている間だけ出す**＝繋げられたことが
-    // その場で分かり、途切れた瞬間に消える（`BrawlState` のコンボ数からの導出そのもの）。
-    const combo = createPixelLabel('', { color: '#ffdd55', scale: 2, outline: '#10101c' });
-    combo.el.style.display = 'none';
-    column.appendChild(wrap);
-    column.appendChild(combo.el);
-    return { column, fill, combo };
-  }
-  const batterGauge = createGaugeBar('left');
-  const pitcherGauge = createGaugeBar('right');
-  brawlOverlay.appendChild(batterGauge.column);
-  brawlOverlay.appendChild(pitcherGauge.column);
-  root.appendChild(brawlOverlay);
-
-  function gaugeColor(ratio: number): string {
-    if (ratio <= 0.25) return '#dd3333';
-    if (ratio <= 0.5) return '#ddaa33';
-    return '#33dd55';
-  }
+  // ---- 乱闘の画面（乱闘v3。フェーズXX-72＝`brawlHud.ts`） ----
+  const brawlHud = createBrawlHud(root);
 
   /**
    * 状況パネルの `◆ソウサ:` の行（フェーズD-20で2P対応）。
@@ -1055,7 +1006,7 @@ export function createHud(root: HTMLElement): Hud {
         showCards(false);
         message.setText(winnerText(game));
         message.el.style.display = 'block';
-        brawlOverlay.style.display = 'none';
+        brawlHud.setVisible(false);
         return;
       }
 
@@ -1064,7 +1015,7 @@ export function createHud(root: HTMLElement): Hud {
       scoreboard.setText(scoreboardText(game, run));
       scoreboard.el.style.display = showFieldPanels ? 'block' : 'none';
       situation.el.style.display = showFieldPanels ? 'block' : 'none';
-      brawlOverlay.style.display = modeState === 'brawl' ? 'flex' : 'none';
+      brawlHud.setVisible(modeState === 'brawl');
       // 打者・投手カード（フェーズD-18）は打席の情報なので、でっかいモードだけで出す。
       showCards(modeState === 'dekkai');
 
@@ -1141,18 +1092,16 @@ export function createHud(root: HTMLElement): Hud {
       flashOverlay('#3a0000', 0.6, 280);
     },
 
-    updateBrawl(batter, pitcher) {
-      const apply = (gauge: typeof batterGauge, view: BrawlGaugeView) => {
-        const ratio = Math.max(0, Math.min(1, view.hp / Math.max(1, view.maxHp)));
-        gauge.fill.style.width = `${ratio * 100}%`;
-        gauge.fill.style.backgroundColor = gaugeColor(ratio);
-        // 1発は「コンボ」ではないので2ヒット目から出す（毎回出ると意味が薄れる）
-        const show = view.combo >= 2;
-        if (show) gauge.combo.setText(`${view.combo}ヒット！`);
-        gauge.combo.el.style.display = show ? 'block' : 'none';
-      };
-      apply(batterGauge, batter);
-      apply(pitcherGauge, pitcher);
+    updateBrawl(view, dt) {
+      brawlHud.update(view, dt);
+    },
+
+    brawlCallout(text, tone) {
+      brawlHud.callout(text, tone);
+    },
+
+    brawlSuperFlash() {
+      flashOverlay('#000010', 0.6, 650);
     },
 
     setDebugLine(text) {
@@ -1164,9 +1113,14 @@ export function createHud(root: HTMLElement): Hud {
       debugPanel.el.style.display = 'block';
     },
 
-    setBrawlHint(text) {
-      if (text === brawlHint) return;
-      brawlHint = text;
+    setBrawlHint(hint) {
+      if (
+        hint === brawlHint ||
+        (hint !== null && brawlHint !== null && hint.batter === brawlHint.batter && hint.pitcher === brawlHint.pitcher)
+      ) {
+        return;
+      }
+      brawlHint = hint;
       // 渡ってきたぶんはその場で書く（`update` が呼ばれるのは**状態が変わったときだけ**
       // なので、変数を書くだけでは画面に出ない＝実機で「技表が出ない」を踏んで気づいた）。
       // playPrompt・interlude と同じ「update の管理外の独立チャンネル」の扱いに揃えた形。

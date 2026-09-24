@@ -36,15 +36,6 @@ import {
   shouldCpuRetreat,
   type Vec2,
 } from '../src/core/fielding';
-import {
-  CPU_BRAWL_REACTION_SEC,
-  DEFAULT_LOADOUT,
-  MOVES,
-  chooseCpuBrawlAction,
-  createFighterState,
-  strongestStrike,
-  type FighterState,
-} from '../src/core/brawl';
 
 // ---- 1. CPU投手の自動継投（B-11で保留していた非対称／Z-47で「代えるか続投か」に） ----
 
@@ -411,94 +402,7 @@ describe('shouldCpuBreakForNextBase（けん制のにらみ合いからの走り
   });
 });
 
-// ---- 4. CPUの乱闘（相手の状態を見る決定的な規則） ----
-
-const hurt = (): FighterState => ({ ...createFighterState(), phase: 'hitstun', timer: 0.4 });
-const winding = (): FighterState => ({
-  ...createFighterState(),
-  phase: 'startup',
-  timer: 0.2,
-  pendingMove: 'punch',
-});
-const guarding = (): FighterState => ({ ...createFighterState(), guarding: true });
-
-describe('chooseCpuBrawlAction（CPUの乱闘。三すくみを規則で使う）', () => {
-  const idle = createFighterState();
-
-  it('相手が技を出そうとしていたらガードする', () => {
-    expect(chooseCpuBrawlAction(idle, winding(), DEFAULT_LOADOUT)).toEqual({ kind: 'guard' });
-  });
-
-  it('相手がガードしていたら投げる（ガードを崩す唯一の手段）', () => {
-    expect(chooseCpuBrawlAction(idle, guarding(), DEFAULT_LOADOUT)).toEqual({
-      kind: 'attack',
-      move: 'throw',
-    });
-  });
-
-  it('相手が硬直・のけぞり中なら、装備でいちばん強い打撃を叩き込む', () => {
-    const loadout = { ...DEFAULT_LOADOUT, moves: ['jab', 'punch', 'throw', 'shoryu'] as const };
-    const action = chooseCpuBrawlAction(idle, hurt(), { ...loadout, moves: [...loadout.moves] });
-    expect(action).toEqual({ kind: 'attack', move: 'shoryu' });
-  });
-
-  it('にらみ合いではジャブ（いちばん発生が速く、当たればコンボの起点になる）', () => {
-    expect(chooseCpuBrawlAction(idle, idle, DEFAULT_LOADOUT)).toEqual({
-      kind: 'attack',
-      move: 'jab',
-    });
-  });
-
-  it('自分が動けない間は何もしない', () => {
-    const self: FighterState = { ...createFighterState(), phase: 'hitstun', timer: 0.3 };
-    expect(chooseCpuBrawlAction(self, idle, DEFAULT_LOADOUT)).toEqual({ kind: 'wait' });
-  });
-
-  it('技を当てた直後は格上へキャンセルする（人間と同じコンボ）', () => {
-    const self: FighterState = {
-      ...createFighterState(),
-      phase: 'recovery',
-      timer: 0.2,
-      lastMove: 'jab',
-      cancelable: true,
-    };
-    expect(chooseCpuBrawlAction(self, hurt(), DEFAULT_LOADOUT)).toEqual({
-      kind: 'attack',
-      move: 'punch',
-    });
-  });
-
-  it('ガードされた直後（cancelable=false）は繋げない＝守り切れば相手の番になる', () => {
-    const self: FighterState = {
-      ...createFighterState(),
-      phase: 'recovery',
-      timer: 0.2,
-      lastMove: 'jab',
-      cancelable: false,
-    };
-    expect(chooseCpuBrawlAction(self, idle, DEFAULT_LOADOUT)).toEqual({ kind: 'wait' });
-  });
-
-  it('持っていない技は選ばない（素の選手はジャブ・パンチ・投げだけ）', () => {
-    const action = chooseCpuBrawlAction(createFighterState(), hurt(), DEFAULT_LOADOUT);
-    expect(action).toEqual({ kind: 'attack', move: 'punch' });
-    expect(strongestStrike(DEFAULT_LOADOUT)).toBe('punch');
-  });
-
-  it('反応時間はジャブの発生より長い＝見てから防がれない技が残る（差し込む価値）', () => {
-    expect(CPU_BRAWL_REACTION_SEC).toBeGreaterThan(MOVES.jab.startupSec);
-    // 人間の単純反応（およそ0.2秒）より遅い＝人間に不可能な速さでは反応しない
-    expect(CPU_BRAWL_REACTION_SEC).toBeGreaterThanOrEqual(0.2);
-  });
-
-  it('同じ状況からは必ず同じ手（決定的・乱数不使用）', () => {
-    const seen = guarding();
-    const first = chooseCpuBrawlAction(idle, seen, DEFAULT_LOADOUT);
-    for (let i = 0; i < 5; i += 1) {
-      expect(chooseCpuBrawlAction(idle, seen, DEFAULT_LOADOUT)).toEqual(first);
-    }
-  });
-});
+// ---- 4. CPUの乱闘は XX-72 で `core/brawlAi.ts` へ移った（tests/brawlAi.test.ts） ----
 
 describe('CPU守備の送球先（Y-46。押しバントで先頭走者が送球に勝てるようになった）', () => {
   // 並びはシーン層の `live` と同じ＝**もっとも進んだ走者が最後**

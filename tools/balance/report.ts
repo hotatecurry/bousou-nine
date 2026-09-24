@@ -21,9 +21,9 @@ import {
   RUNNER_SPEED_MIN,
   type FielderId,
 } from '../../src/core/fielding';
-import { BRAWL_MAX_HP, MOVES } from '../../src/core/brawl';
+import { DEFAULT_LOADOUT } from '../../src/core/brawl';
 import { type SkillId, brawlLoadoutFor } from '../../src/core/skills';
-import { type Tactic, fight } from './brawl';
+import { matchup } from './brawl';
 import { carryOf, fenceInfo, heightAtFence, requiredExitSpeed } from './physics';
 import { pct, summarize, sweep } from './sweep';
 
@@ -285,61 +285,24 @@ function reportCarry(): void {
   }
 }
 
-// ---- 9. 乱闘v2（G-27の未確認事項） ----
+// ---- 9. 乱闘v3（XX-72。詳しくは `npm run balance:brawl`） ----
 
 function reportBrawl(): void {
-  heading('9. 乱闘：型どうしの総当たり（勝者/決着までの秒数。60秒で打ち切り）');
-  const tactics: Tactic[] = ['idle', 'guard', 'jab', 'combo', 'throw', 'cpu'];
-  const widths = [10, ...tactics.map(() => 10)];
-  row(['打者＼投手', ...tactics], widths);
-  for (const b of tactics) {
+  heading('9. 乱闘：スキルから組んだ装備（打者側）×素の相手。CPUどうし36通り');
+  const widths = [24, 8, 10, 8];
+  row(['装備', '勝率', '1R秒', '時間切'], widths);
+  for (const [label, skills] of [
+    ['素', []],
+    ['昇龍拳', ['shoryuken']],
+    ['武器持ち込み', ['bukimochikomi']],
+    ['デュオ バット龍拳', DUO_BUILD],
+  ] as const) {
+    const m = matchup(brawlLoadoutFor(skills as readonly SkillId[]), DEFAULT_LOADOUT);
     row(
-      [
-        b,
-        ...tactics.map((p) => {
-          const r = fight(b, p);
-          const w = r.winner === 'batter' ? '打' : r.winner === 'pitcher' ? '投' : '－';
-          return `${w}/${r.seconds.toFixed(1)}s`;
-        }),
-      ],
+      [label, pct(m.batterWins / m.games), m.avgRoundSeconds.toFixed(1), pct(m.timeUpRate)],
       widths,
     );
   }
-
-  heading('9b. 乱闘：必殺技を持つ選手と持たない選手の差（相手はCPUの固定スクリプト）');
-  const w2 = [18, 8, 10, 8, 12, 12];
-  row(['装備', 'HP', '威力', '技数', 'コンボ型', 'CPU型'], w2);
-  for (const [label, skills] of [
-    ['素', []],
-    ['ショウリュウケン', ['shoryuken']],
-    ['ブキモチコミ', ['bukimochikomi']],
-    ['デュオ バットリュウケン', ['shoryuken', 'bukimochikomi', 'battoshoryuken']],
-  ] as const) {
-    const loadout = brawlLoadoutFor(skills as readonly SkillId[]);
-    const a = fight('combo', 'cpu', { batter: loadout });
-    const b = fight('cpu', 'cpu', { batter: loadout });
-    row(
-      [
-        label,
-        loadout.maxHp,
-        `x${loadout.powerScale.toFixed(2)}`,
-        loadout.moves.length,
-        `${a.seconds.toFixed(2)}s`,
-        `${b.seconds.toFixed(2)}s`,
-      ],
-      w2,
-    );
-  }
-  const strongest = Math.max(
-    ...brawlLoadoutFor(DUO_BUILD).moves.map(
-      (m) => MOVES[m].power,
-    ),
-  );
-  const scale = brawlLoadoutFor(DUO_BUILD).powerScale;
-  console.log(
-    `  最強の一撃：${(strongest * scale).toFixed(0)} ダメージ（素の体力 ${BRAWL_MAX_HP}）＝` +
-      `${strongest * scale >= BRAWL_MAX_HP ? '一撃でKO' : '一撃ではKOできない'}`,
-  );
 }
 
 function main(): void {

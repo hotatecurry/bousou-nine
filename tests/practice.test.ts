@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { createActor } from 'xstate';
 import {
+  INITIAL_BRAWL_PRACTICE,
   INITIAL_KNOCK,
+  PRACTICE_DUMMIES,
+  PRACTICE_SPECIALS,
+  PRACTICE_SUPERS,
+  practiceBrawlLoadout,
+  practiceFoeLoadout,
   KNOCK_DIRECTIONS,
   KNOCK_KINDS,
   KNOCK_RUNNER_PATTERNS,
@@ -40,8 +46,23 @@ function fly(setup: typeof INITIAL_KNOCK): {
 }
 
 describe('デバッグモードの入口（フェーズPP-64）', () => {
-  it('3つのモードが並ぶ（投球・打撃・守備）', () => {
-    expect(PRACTICE_MODES.map((m) => m.id)).toEqual(['pitch', 'bat', 'field']);
+  it('4つのモードが並ぶ（投球・打撃・守備・乱闘）', () => {
+    expect(PRACTICE_MODES.map((m) => m.id)).toEqual(['pitch', 'bat', 'field', 'brawl']);
+  });
+
+  it('乱闘の練習（XX-72）：打者の側で戦い、必殺技と超必殺を全部持つ', () => {
+    expect(practiceHumanSide('brawl')).toBe('away');
+    const lo = practiceBrawlLoadout(0);
+    expect(lo.specials).toEqual([...PRACTICE_SPECIALS]);
+    expect(lo.super).toBe(PRACTICE_SUPERS[0]);
+    expect(practiceBrawlLoadout(1).super).toBe(PRACTICE_SUPERS[1]);
+    // 相手は既定で素の選手（必殺技の当たり方だけを見る）
+    expect(practiceFoeLoadout(INITIAL_BRAWL_PRACTICE).specials).toEqual([]);
+    // 練習の相手は棒立ちから始まる（CPUに跳び越されて向きが変わると、コマンドの前後が入れ替わる）
+    expect(PRACTICE_DUMMIES[INITIAL_BRAWL_PRACTICE.dummy].id).toBe('stand');
+    const line = practiceHudLines('brawl', { swing: false, knock: INITIAL_KNOCK, brawl: INITIAL_BRAWL_PRACTICE });
+    expect(line).toContain('1:相手');
+    expect(line).toContain('2:超必殺');
   });
 
   it('操作する側はモードから決まる＝入口で「操作する側」を選ばせない', () => {

@@ -1,160 +1,171 @@
 /**
- * 乱闘v2の計測（フェーズI-29。G-27の未確認事項）。
+ * 乱闘v3の計測（フェーズXX-72）。**CPUどうしを最後まで戦わせて**、装備ごとの勝ち方を数える。
  *
- * 見るのは記録されていた4点：
- * (1) 1回の乱闘が短すぎないか（＝決着までの秒数）
- * (2) 投げ（20ダメージ・ガード不能）が強すぎないか
- * (3) 必殺技を持つ選手と持たない選手の差
- * (4) ガードの価値（固めているだけで勝てないか）
+ * 判定は `core/brawl.ts` の `stepBrawl`、CPUの判断は `core/brawlAi.ts` の `cpuInput` を
+ * **そのまま**回す（ここに判定式もCPUの規則も書かない＝定数を動かせば計測も一緒に動く）。
  *
- * **判定は `core/brawl.ts` の `stepBrawl` をそのまま回す**。ここが持つのは
- * 「どう入力するか」＝戦い方の型だけで、CPUの型は `scenes/brawlScene.ts` の
- * 固定スクリプトを写してある（あちらは Three.js に依存するので import できない）。
+ * CPUは決定的なので、同じ組み合わせは何度やっても同じ結果になる。**ばらつきは巡回の
+ * 出だし（`cycle`）を 0..5 でずらして作る**（6×6＝36通り）＝乱数を使わずに、読み合いの
+ * 始まり方が違う試合を並べる。
  */
 import {
+  type BrawlEvent,
+  type BrawlLoadouts,
   type BrawlSide,
-  type BrawlState,
   type FighterLoadout,
-  type MoveId,
   DEFAULT_LOADOUT,
-  MOVES,
   createBrawlState,
-  isDefeated,
-  setGuarding,
   stepBrawl,
-  tryStartAttack,
 } from '../../src/core/brawl';
+import { type CpuBrain, REACTION_FRAMES, createCpuBrain, cpuInput } from '../../src/core/brawlAi';
 
-const DT = 1 / 60;
-
-/** brawlScene.ts の CPU固定スクリプト（写し。あちらを変えたらここも直す） */
-export const CPU_CYCLE_SEC = 3;
-export const CPU_GUARD_WINDOW: readonly [number, number] = [0.95, 1.45];
-export const CPU_ATTACK_SCRIPT: ReadonlyArray<{ at: number; move: MoveId | 'finisher' }> = [
-  { at: 0.3, move: 'jab' },
-  { at: 0.5, move: 'punch' },
-  { at: 1.6, move: 'throw' },
-  { at: 2.3, move: 'finisher' },
-];
-
-function finisherOf(loadout: FighterLoadout): MoveId {
-  let best: MoveId = 'punch';
-  for (const move of loadout.moves) {
-    if (MOVES[move].command !== undefined && MOVES[move].rank > MOVES[best].rank) best = move;
-  }
-  return best;
-}
-
-/** 戦い方の型（決定的） */
-export type Tactic = 'cpu' | 'guard' | 'jab' | 'combo' | 'throw' | 'idle';
-
-interface Runner {
-  elapsed: number;
-  fired: Set<number>;
-}
-
-/**
- * 1フレームぶん、その型に沿って入力する。**入力の窓口は人間と同じ**
- * （`tryStartAttack` / `setGuarding`）なので、型を変えても判定の通り道は変わらない。
- */
-function act(
-  state: BrawlState,
-  side: BrawlSide,
-  tactic: Tactic,
-  runner: Runner,
-  dt: number,
-): BrawlState {
-  const loadout = state.loadouts[side];
-  const me = state[side];
-  const put = (next: typeof me): BrawlState => ({ ...state, [side]: next });
-
-  if (tactic === 'idle') return state;
-  if (tactic === 'guard') return put(setGuarding(me, true));
-
-  if (tactic === 'jab') return put(tryStartAttack(me, 'jab', loadout));
-
-  if (tactic === 'throw') return put(tryStartAttack(me, 'throw', loadout));
-
-  if (tactic === 'combo') {
-    // ジャブ→パンチ→（持っていれば）必殺技。**当てた技だけがキャンセルできる**ので、
-    // 毎フレーム上から順に試すだけでコンボになる（格上へしか通らない）。
-    const finisher = finisherOf(loadout);
-    for (const move of ['jab', 'punch', finisher] as MoveId[]) {
-      const next = tryStartAttack(me, move, loadout);
-      if (next !== me) return put(next);
-    }
-    return state;
-  }
-
-  // cpu：3秒周期の固定スクリプト
-  const elapsed = runner.elapsed + dt;
-  runner.elapsed = elapsed >= CPU_CYCLE_SEC ? elapsed - CPU_CYCLE_SEC : elapsed;
-  if (elapsed >= CPU_CYCLE_SEC) runner.fired = new Set();
-  const now = runner.elapsed;
-  let next = setGuarding(me, now >= CPU_GUARD_WINDOW[0] && now < CPU_GUARD_WINDOW[1]);
-  CPU_ATTACK_SCRIPT.forEach((step, i) => {
-    if (runner.fired.has(i) || now < step.at) return;
-    const move = step.move === 'finisher' ? finisherOf(loadout) : step.move;
-    next = tryStartAttack(next, move, loadout);
-    runner.fired.add(i);
-  });
-  return put(next);
-}
-
-export interface FightResult {
-  /** 決着までの秒数（決着しなければ上限） */
-  seconds: number;
+export interface BrawlStats {
   winner: BrawlSide | null;
-  batterHp: number;
-  pitcherHp: number;
-  /** 与えた総ダメージ */
+  rounds: number;
+  /** ラウンドごとの長さ（秒） */
+  roundSeconds: number[];
+  /** 時間切れで終わったラウンドの数 */
+  timeUps: number;
+  hits: Record<BrawlSide, number>;
+  blocked: Record<BrawlSide, number>;
   damage: Record<BrawlSide, number>;
-  /** 最大コンボ数 */
-  maxCombo: Record<BrawlSide, number>;
+  specials: Record<BrawlSide, number>;
+  supers: Record<BrawlSide, number>;
+  throws: Record<BrawlSide, number>;
+  dizzies: Record<BrawlSide, number>;
+  /** 1ラウンドでいちばん多く繋がったコンボ */
+  maxCombo: number;
 }
 
-/** 2つの型を戦わせて決着までを測る */
-export function fight(
-  batter: Tactic,
-  pitcher: Tactic,
-  loadouts?: Partial<Record<BrawlSide, FighterLoadout>>,
-  maxSeconds = 60,
-): FightResult {
-  let state = createBrawlState({
-    batter: loadouts?.batter ?? DEFAULT_LOADOUT,
-    pitcher: loadouts?.pitcher ?? DEFAULT_LOADOUT,
-  });
-  const runners: Record<BrawlSide, Runner> = {
-    batter: { elapsed: 0, fired: new Set() },
-    pitcher: { elapsed: 0, fired: new Set() },
-  };
-  const damage: Record<BrawlSide, number> = { batter: 0, pitcher: 0 };
-  const maxCombo: Record<BrawlSide, number> = { batter: 0, pitcher: 0 };
+const zero = (): Record<BrawlSide, number> => ({ batter: 0, pitcher: 0 });
 
-  let t = 0;
-  while (t < maxSeconds) {
-    state = act(state, 'batter', batter, runners.batter, DT);
-    state = act(state, 'pitcher', pitcher, runners.pitcher, DT);
-    const stepped = stepBrawl(state, DT);
-    state = stepped.state;
-    for (const hit of stepped.hits) {
-      damage[hit.attacker] += hit.damage;
-      maxCombo[hit.attacker] = Math.max(maxCombo[hit.attacker], hit.combo);
+/** 1試合（乱闘）を最後まで。`offsets` は巡回の出だし（ばらつき） */
+export function simulateBrawl(
+  loadouts: Partial<BrawlLoadouts>,
+  offsets: Record<BrawlSide, number> = { batter: 0, pitcher: 0 },
+  maxFrames = 60 * 60 * 6,
+): BrawlStats {
+  let s = createBrawlState({ batter: DEFAULT_LOADOUT, pitcher: DEFAULT_LOADOUT, ...loadouts });
+  // 反応の遅れも出だしでずらす（14〜16フレーム）。同じ規則・同じ遅れのCPUどうしは
+  // 鏡写しに動いて相打ちを繰り返す（両者KO＝引き分けばかりになる）ので、計測の上だけの工夫
+  const reaction = (o: number): number => REACTION_FRAMES + ((o % 3) - 1);
+  const brains: Record<BrawlSide, CpuBrain> = {
+    batter: { ...createCpuBrain(reaction(offsets.batter)), cycle: offsets.batter },
+    pitcher: { ...createCpuBrain(reaction(offsets.pitcher + 1)), cycle: offsets.pitcher },
+  };
+  const stats: BrawlStats = {
+    winner: null,
+    rounds: 0,
+    roundSeconds: [],
+    timeUps: 0,
+    hits: zero(),
+    blocked: zero(),
+    damage: zero(),
+    specials: zero(),
+    supers: zero(),
+    throws: zero(),
+    dizzies: zero(),
+    maxCombo: 0,
+  };
+  let roundStart = 0;
+  for (let frame = 0; frame < maxFrames && s.phase !== 'done'; frame++) {
+    const b = cpuInput(brains.batter, s, 'batter');
+    const p = cpuInput(brains.pitcher, s, 'pitcher');
+    brains.batter = b.brain;
+    brains.pitcher = p.brain;
+    const r = stepBrawl(s, { batter: b.input, pitcher: p.input });
+    s = r.state;
+    for (const e of r.events) count(stats, e);
+    for (const e of r.events) {
+      if (e.k === 'fight') roundStart = frame;
+      if (e.k === 'ko' || e.k === 'timeUp') stats.roundSeconds.push((frame - roundStart) / 60);
+      if (e.k === 'timeUp') stats.timeUps += 1;
     }
-    t += DT;
-    if (isDefeated(state.batter) || isDefeated(state.pitcher)) break;
   }
-  const winner = isDefeated(state.batter)
-    ? 'pitcher'
-    : isDefeated(state.pitcher)
-      ? 'batter'
-      : null;
+  stats.winner = s.winner;
+  stats.rounds = s.results.length;
+  return stats;
+}
+
+function count(stats: BrawlStats, e: BrawlEvent): void {
+  switch (e.k) {
+    case 'hit':
+      if (e.blocked) stats.blocked[e.attacker] += 1;
+      else stats.hits[e.attacker] += 1;
+      stats.damage[e.attacker] += e.damage;
+      if (!e.blocked) stats.maxCombo = Math.max(stats.maxCombo, e.combo);
+      break;
+    case 'special':
+      stats.specials[e.side] += 1;
+      break;
+    case 'super':
+      stats.supers[e.side] += 1;
+      break;
+    case 'throw':
+      stats.throws[e.side] += 1;
+      break;
+    case 'dizzy':
+      stats.dizzies[e.side] += 1;
+      break;
+    default:
+      break;
+  }
+}
+
+/** 36通り（巡回の出だし 6×6）を戦わせてまとめる */
+export interface MatchupSummary {
+  batterWins: number;
+  pitcherWins: number;
+  games: number;
+  avgRoundSeconds: number;
+  timeUpRate: number;
+  avgRounds: number;
+  hitsPerRound: number;
+  blockRate: number;
+  specialsPerRound: number;
+  throwsPerRound: number;
+  maxCombo: number;
+}
+
+export function matchup(batter: FighterLoadout, pitcher: FighterLoadout, spread = 6): MatchupSummary {
+  let bw = 0;
+  let pw = 0;
+  let rounds = 0;
+  let seconds = 0;
+  let timeUps = 0;
+  let hits = 0;
+  let blocked = 0;
+  let specials = 0;
+  let throws = 0;
+  let maxCombo = 0;
+  let games = 0;
+  for (let i = 0; i < spread; i++) {
+    for (let j = 0; j < spread; j++) {
+      const r = simulateBrawl({ batter, pitcher }, { batter: i, pitcher: j });
+      games += 1;
+      if (r.winner === 'batter') bw += 1;
+      if (r.winner === 'pitcher') pw += 1;
+      rounds += r.rounds;
+      seconds += r.roundSeconds.reduce((a, b) => a + b, 0);
+      timeUps += r.timeUps;
+      hits += r.hits.batter + r.hits.pitcher;
+      blocked += r.blocked.batter + r.blocked.pitcher;
+      specials += r.specials.batter + r.specials.pitcher;
+      throws += r.throws.batter + r.throws.pitcher;
+      maxCombo = Math.max(maxCombo, r.maxCombo);
+    }
+  }
   return {
-    seconds: t,
-    winner,
-    batterHp: state.batter.hp,
-    pitcherHp: state.pitcher.hp,
-    damage,
+    batterWins: bw,
+    pitcherWins: pw,
+    games,
+    avgRoundSeconds: rounds > 0 ? seconds / rounds : 0,
+    timeUpRate: rounds > 0 ? timeUps / rounds : 0,
+    avgRounds: rounds / games,
+    hitsPerRound: rounds > 0 ? hits / rounds : 0,
+    blockRate: hits + blocked > 0 ? blocked / (hits + blocked) : 0,
+    specialsPerRound: rounds > 0 ? specials / rounds : 0,
+    throwsPerRound: rounds > 0 ? throws / rounds : 0,
     maxCombo,
   };
 }

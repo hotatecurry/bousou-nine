@@ -143,7 +143,15 @@ import {
   runnerSpeed,
 } from './core/fielding';
 import { type Ballpark, type BallparkId, DEFAULT_BALLPARK, ballparkById } from './core/ballpark';
-import { type BrawlLoadouts, type BrawlSide, shouldCpuStartBrawl } from './core/brawl';
+import {
+  type BrawlEvent,
+  type BrawlLoadouts,
+  type BrawlSide,
+  type BrawlState,
+  MOVES,
+  MOVE_NAME,
+  shouldCpuStartBrawl,
+} from './core/brawl';
 import {
   chooseCpuPinchHitter,
   chooseCpuPinchRunner,
@@ -168,13 +176,19 @@ import {
 } from './input/keyboard';
 import { type MatchSelection, runRosterPlanSelect, runTeamSelect } from './ui/teamSelect';
 import {
+  type BrawlPracticeSetup,
   type KnockSetup,
   type PracticeMode,
+  INITIAL_BRAWL_PRACTICE,
   INITIAL_KNOCK,
   KNOCK_RUNNER_PATTERNS,
+  PRACTICE_DUMMIES,
   PRACTICE_KEYS,
+  PRACTICE_SUPERS,
   cycleKnock,
   knockLaunch,
+  practiceBrawlLoadout,
+  practiceFoeLoadout,
   practiceHudLines,
 } from './debug/practice';
 import {
@@ -635,13 +649,15 @@ let practice: PracticeMode | null = null;
 let practiceSwing = false;
 /** `field` モードのノックの設定（方向・種類・走者） */
 let practiceKnock: KnockSetup = INITIAL_KNOCK;
+/** `brawl` モードの設定（相手の動き・超必殺・相手の必殺技） */
+let practiceBrawl: BrawlPracticeSetup = INITIAL_BRAWL_PRACTICE;
 
 /** デバッグ行を書き直す（設定を触ったときと試合開始時だけ呼ぶ） */
 function syncPracticeHud(): void {
   hud.setDebugLine(
     practice === null
       ? null
-      : practiceHudLines(practice, { swing: practiceSwing, knock: practiceKnock }),
+      : practiceHudLines(practice, { swing: practiceSwing, knock: practiceKnock, brawl: practiceBrawl }),
   );
 }
 
@@ -1057,21 +1073,144 @@ function brawlLoadouts(): BrawlLoadouts {
  * `commandNotation` が facing から起こす）、**2Pのキー名の読み替え**（D-20の約束＝
  * 1Pのキー名をそのまま見せるのは案内として間違っている）。
  */
-function brawlHintText(): string {
+function brawlHintText(): { batter: string | null; pitcher: string | null } {
   const half = currentHalf();
-  const lines = ['乱闘！'];
+  const out: { batter: string | null; pitcher: string | null } = { batter: null, pitcher: null };
   for (const side of ['batter', 'pitcher'] as const) {
     const team = side === 'batter' ? battingTeam(half) : fieldingTeam(half);
     const player = playerOfSide(controllers, team);
     if (!player) continue;
     const label = isTwoPlayer(controllers) ? `${PLAYER_LABEL[player]} ` : '';
-    const keys = player === 'p2' ? { a: '[2]', b: '[1]' } : { a: 'K', b: 'J' };
-    lines.push(`${label}${keys.a}:攻撃 ${keys.b}:ガード 前+${keys.b}:投げ`);
+    const keys = player === 'p2' ? { a: '[2]', b: '[1]', g: '[3]' } : { a: 'K', b: 'J', g: 'G' };
+    // 乱闘v3（XX-72）：P＝パンチ（A）／K＝キック（B）／後ろでガード／近くで横＋Pで投げ
+    const lines = [`${label}${keys.a}:パンチ ${keys.b}:キック 後ろ:ガード`, `近くで横+${keys.a}:投げ`];
     for (const hint of brawl.moveHints(side)) {
-      lines.push(`${label}${hint.name} ${hint.notation}+${keys.a}`);
+      // エンジンの表記（P＝パンチ／K＝キック）をその人のキー名へ（1回で置き換える＝
+      // 「+P→+K」の後に「+K→+J」が重ねて効いてしまわないように）
+      const notation = hint.notation
+        .replace(/\+([PK])$/, (_m, b: string) => `+${b === 'P' ? keys.a : keys.b}`)
+        .replace('ゲージ満タンでG', `ゲージ満タンで${keys.g}`);
+      lines.push(`${hint.name} ${notation}`);
+    }
+    out[side] = lines.join('\n');
+  }
+  return out;
+}
+
+/** 乱闘のHUDに出す名前（殴られた打者と、いまの投手） */
+function brawlNames(): Record<BrawlSide, string> {
+  const ctx = gameActor.getSnapshot().context;
+  const battingRoster = ctx.rosters[battingTeam(ctx.half)];
+  const fieldingRoster = ctx.rosters[fieldingTeam(ctx.half)];
+  const batterId =
+    pendingHbpRestore === null
+      ? currentBatterId(battingRoster)
+      : battingRoster.lineup[pendingHbpRestore.battingLineupIndex];
+  return {
+    batter: battingRoster.players[batterId]?.name ?? '打者',
+    pitcher: fieldingRoster.players[fieldingRoster.pitcher]?.name ?? '投手',
+  };
+}
+
+/**
+ * 乱闘のイベント → 音と大きな呼び出し（乱闘v3。フェーズXX-72）。シーンは音を鳴らさない
+ * （既存の約束）ので、エンジンが出したイベントをここで音に変える。
+ * **音の階層**：決着（KO）＞超必殺・必殺技の命中＞通常技の命中＞技の出だし・動き。
+ */
+let lastBrawlTick = -1;
+function handleBrawlEvents(events: readonly BrawlEvent[], state: BrawlState): void {
+  const nameOf = (side: BrawlSide): string => brawlNames()[side];
+  for (const e of events) {
+    switch (e.k) {
+      case 'swing': {
+        const def = MOVES[e.move];
+        const kick = e.move === 'sK' || e.move === 'crK' || e.move === 'jK' || def.button === 'k';
+        if (def.kind === 'normal') sfx.brawlSwing(kick, e.move === 'sK');
+        break;
+      }
+      case 'hit': {
+        const pan = Math.max(-0.8, Math.min(0.8, e.x / 4));
+        if (e.blocked) sfx.brawlBlock(pan);
+        else sfx.brawlImpact(e.heavy, pan);
+        break;
+      }
+      case 'special':
+        if (e.move === 'shoryu' || e.move === 'somersault') sfx.brawlRising(e.move === 'shoryu');
+        else if (e.move === 'tatsu') sfx.brawlSpin();
+        else if (e.move === 'zutsuki' || e.move === 'divekick') sfx.brawlDash();
+        else if (e.move === 'kobun') sfx.brawlWhistle();
+        else if (e.move === 'hyakuretsu' || e.move === 'buki') sfx.brawlSwing(false, true);
+        break;
+      case 'super':
+        sfx.brawlSuperFlash();
+        hud.brawlSuperFlash();
+        hud.brawlCallout(MOVE_NAME[e.move], 'super');
+        if (e.move === 'batto') sfx.brawlRising(true);
+        break;
+      case 'projectile':
+        if (e.kind !== 'kobun') sfx.brawlProjectile(e.kind === 'shinku');
+        break;
+      case 'clash':
+        sfx.brawlClash();
+        break;
+      case 'throw':
+        sfx.brawlGrab();
+        break;
+      case 'slam':
+        sfx.brawlSlam();
+        break;
+      case 'throwTech':
+        sfx.brawlTech();
+        hud.brawlCallout('投げ抜け', 'info');
+        break;
+      case 'knockdown':
+        sfx.brawlThud(true);
+        break;
+      case 'land':
+        sfx.brawlThud(false);
+        break;
+      case 'dash':
+        sfx.brawlDash();
+        break;
+      case 'dizzy':
+        sfx.brawlDizzy();
+        break;
+      case 'meterFull':
+        sfx.brawlMeterFull();
+        break;
+      case 'round':
+        sfx.brawlRound();
+        hud.brawlCallout(state.practice ? '練習' : `第${e.round}ラウンド`, 'round');
+        break;
+      case 'fight':
+        sfx.brawlFight();
+        hud.brawlCallout('ファイト！', 'fight');
+        break;
+      case 'ko':
+        sfx.ko();
+        hud.brawlCallout('K.O.', 'ko');
+        break;
+      case 'timeUp':
+        sfx.brawlTimeUp();
+        hud.brawlCallout('タイムアップ', 'timeUp');
+        break;
+      case 'roundWin':
+        hud.brawlCallout(e.winner === 'draw' ? '引き分け' : `${nameOf(e.winner)}の勝ち`, 'win');
+        break;
+      case 'matchEnd':
+        sfx.win();
+        hud.brawlCallout(`${nameOf(e.winner)} 乱闘に勝利！`, 'win');
+        break;
+      default:
+        break;
     }
   }
-  return lines.join('\n');
+  // 残り10秒の秒読み
+  if (state.phase === 'fight' && !state.practice) {
+    const sec = Math.ceil(state.timer / 60);
+    if (sec <= 10 && sec !== lastBrawlTick && sec > 0) sfx.brawlTick();
+    lastBrawlTick = sec;
+  }
 }
 
 // ---- 死球のあと：乱闘に持ち込むかは打たれた打者側だけが決める（フェーズWW-71） ----
@@ -1092,8 +1231,9 @@ function enterDeadBall(byGun: boolean): void {
 function startBrawl(): void {
   sfx.brawlStart();
   modeActor.send({ type: 'BRAWL_START' });
-  brawl.enter(brawlLoadouts());
+  brawl.enter(brawlLoadouts(), brawlNames());
 }
+
 
 /** 乱闘を見送って一塁へ歩く */
 function declineBrawl(): void {
@@ -1442,7 +1582,7 @@ const fieldPlay = createFieldPlayController({
   // CLAUDE.md ⑧のトーン「ゲーム側は一切ツッコまない」に従い、蹴られた野手が倒れて
   // ボールがこぼれる、という画面上の事実だけで見せる（煽った瞬間にバカゲーに落ちる）。
   onDropkick: (hit, runnerId) => {
-    if (hit) sfx.brawlAttack();
+    if (hit) sfx.brawlImpact(false);
     else sfx.swingMiss();
     // 消費型 `テツゲタ`（F-26-8）のチャージを1つ使う。**当たっても外れても消費する**
     // ＝1プレーに1回という既存の規則と同じ扱い（当たるまで撃ち直せる札にしない）。
@@ -1891,17 +2031,14 @@ function tryCpuIntentionalWalk(ctx: GameContext): boolean {
 const brawl = createBrawlController({
   batter: brawlFighters.batter,
   pitcher: brawlFighters.pitcher,
+  camera: brawlCamera,
   // 乱闘の打者側＝攻撃側のパッド／投手側＝守備側のパッド（フェーズD-20）。
   // 1P PLAY では相手側が `NULL_PAD` になるので、CPUスクリプトがそのまま動く。
   pads: { batter: offensePad, pitcher: defensePad },
   isHuman: (side) => (side === 'batter' ? isBattingHuman() : isPitchingHuman()),
-  // 投げの空振り（フェーズG-27）は当たっていないので鳴らさない＝**音でも空振りが分かる**
-  // （鳴らすと、掴めたのかどうかが画面より先に音で誤って伝わる）
-  onHit: (hit) => {
-    if (!hit.whiffed) sfx.brawlHit(hit.guarded);
-  },
+  // 音と大きな呼び出しはエンジンのイベントから（乱闘v3。フェーズXX-72）
+  onEvents: handleBrawlEvents,
   onResolved: (loser: BrawlSide) => {
-    sfx.ko(); // 決着イベント（桜井ノウハウ照合：最大音量クラスに設定、sfx.ts参照）
     const preRestoreCtx = gameActor.getSnapshot().context;
     const restore = pendingHbpRestore ?? {
       count: preRestoreCtx.count,
@@ -1937,6 +2074,7 @@ const brawl = createBrawlController({
     hud.setBrawlHint(null);
   },
 });
+scene.add(brawl.root);
 
 // 采配メニュー（セッション9）：Start（ポーズ）で開く、乱闘の強制交代とは独立した任意の
 // 代打/継投。でっかいモードの ready フェーズ（投球動作中でない間）だけ開ける
@@ -2437,6 +2575,20 @@ function fireKnock(): void {
  */
 window.addEventListener('keydown', (e) => {
   if (!practice || e.repeat) return;
+  if (practice === 'brawl') {
+    if (e.code === PRACTICE_KEYS.brawlDummy) {
+      practiceBrawl = { ...practiceBrawl, dummy: (practiceBrawl.dummy + 1) % PRACTICE_DUMMIES.length };
+      brawl.setDummy('pitcher', PRACTICE_DUMMIES[practiceBrawl.dummy].id);
+    } else if (e.code === PRACTICE_KEYS.brawlSuper) {
+      practiceBrawl = { ...practiceBrawl, super: (practiceBrawl.super + 1) % PRACTICE_SUPERS.length };
+      startPracticeBrawl();
+    } else if (e.code === PRACTICE_KEYS.brawlFoe) {
+      practiceBrawl = { ...practiceBrawl, foeSpecials: !practiceBrawl.foeSpecials };
+      startPracticeBrawl();
+    } else return;
+    syncPracticeHud();
+    return;
+  }
   if (practice === 'pitch' && e.code === PRACTICE_KEYS.toggleSwing) {
     practiceSwing = !practiceSwing;
     syncPracticeHud();
@@ -2727,6 +2879,22 @@ function startGame(setup: GameSetup): void {
 }
 
 /**
+ * デバッグの乱闘（フェーズXX-72）。**死球の画面を通らずに乱闘へ入る**（打者＝人間・
+ * 必殺技と超必殺を全部持つ）。体力は戻り・ゲージは満タン・時間は止まるので終わらない。
+ */
+function startPracticeBrawl(): void {
+  const mode = currentMode();
+  if (mode === 'dekkai') modeActor.send({ type: 'DEAD_BALL' });
+  if (currentMode() === 'deadBall') modeActor.send({ type: 'BRAWL_START' });
+  brawl.enter(
+    { batter: practiceBrawlLoadout(practiceBrawl.super), pitcher: practiceFoeLoadout(practiceBrawl) },
+    brawlNames(),
+    { refillHp: true, fullMeter: true },
+  );
+  brawl.setDummy('pitcher', PRACTICE_DUMMIES[practiceBrawl.dummy].id);
+}
+
+/**
  * チーム選択の結果から試合を始める（起動時と、ラン／2Pの試合が終わった後の再挑戦）。
  *
  * **1P PLAY はラン（5試合の勝ち抜き。フェーズF-26-6）、2P PLAY は1試合完結**
@@ -2740,6 +2908,7 @@ function startMatch(selection: MatchSelection): void {
   practice = selection.practice ?? null;
   practiceSwing = false;
   practiceKnock = INITIAL_KNOCK;
+  practiceBrawl = INITIAL_BRAWL_PRACTICE;
   // **null なら消える**ので、デバッグモードの後に通常のプレイを始めても行が残らない
   // （デバッグの状態はここ1か所でしか切り替わらない）。
   syncPracticeHud();
@@ -2763,6 +2932,7 @@ function startMatch(selection: MatchSelection): void {
     });
     gameStarted = true;
     hudRoot.style.display = '';
+    if (practice === 'brawl') startPracticeBrawl();
     return;
   }
   if (selection.mode === '2p') {
@@ -3085,10 +3255,9 @@ function onA(player: PlayerSlot): void {
       declineBrawl();
       break;
     case 'brawl':
-      // 十字キーで選んだ技（上=特殊技、左右=パンチ、それ以外=ジャブ）を繰り出す。
-      // **押した人が操作している側の技**（フェーズD-20：2P PLAY では投手側も人間）。
-      sfx.brawlAttack();
-      brawl.attack(role === 'pitching' ? 'pitcher' : 'batter');
+      // 乱闘v3（XX-72）：A＝パンチ。**押した人が操作している側**（2P PLAY では投手側も人間）。
+      // 押しっぱなしはシーンがパッドから読むので、ここは「押した瞬間」を取りこぼさないためだけ。
+      brawl.press(role === 'pitching' ? 'pitcher' : 'batter', 'p');
       break;
   }
 }
@@ -3106,9 +3275,8 @@ function onB(player: PlayerSlot): void {
     if (role !== 'batting') return;
     startBrawl();
   } else if (mode === 'brawl') {
-    // 乱闘v2（フェーズG-27）：**前を入れながらB＝投げ**（ガードを崩す唯一の手段）。
-    // 前を入れていなければ何も起きない＝そのままガード（押しっぱなしを update が拾う）。
-    brawl.grab(role === 'pitching' ? 'pitcher' : 'batter');
+    // 乱闘v3（XX-72）：B＝キック（ガードは後ろを入れる。ストIIと同じ）
+    brawl.press(role === 'pitching' ? 'pitcher' : 'batter', 'k');
   } else if (mode === 'chicchai') {
     if (role === 'pitching') {
       // 守備側のBは「ランダンプレイ」（説明書p25：十字キーで塁を指示。
@@ -3147,6 +3315,11 @@ function onGun(player: PlayerSlot): void {
   }
   const role = roleOfPlayer(controllers, currentHalf(), player);
   if (role === null) return;
+  // 乱闘では G＝超必殺（乱闘v3。ゲージ満タンのときだけ出る）
+  if (currentMode() === 'brawl') {
+    brawl.press(role === 'pitching' ? 'pitcher' : 'batter', 's');
+    return;
+  }
   // ちっちゃいモードでは同じGが「ドロップキック」になる（フェーズF-26-4）。銃は
   // でっかいモードの投手側、ドロップキックはちっちゃいモードの走者側なので、
   // **同じキーでも同時に両方が意味を持つ場面が無い**（A/Bが場面で機能を変える
@@ -3418,8 +3591,7 @@ runTeamSelect(app, pads).then((selection) => {
     const brawlActive = currentMode() === 'brawl' && !gameIsOver();
     brawl.update(dt, brawlActive);
     if (brawlActive) {
-      const view = brawl.view();
-      hud.updateBrawl(view.batter, view.pitcher);
+      hud.updateBrawl(brawl.view(), dt);
       // 技表も**毎フレーム組み直す**（体力・コンボと同じ扱い）。乱闘に入った瞬間に一度だけ
       // 渡す形だと、渡す順番（モード遷移・装備の確定・HUDの更新）のどれか1つでも前後した
       // ときに黙って既定の文言に戻る＝実機で実際に踏んだ。導出しておけば必ず今の装備と一致する。
