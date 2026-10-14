@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { type BaseRunners, type Bases, EMPTY_BASES } from '../src/core/rules';
 import { type BattedBall, createBattedBall, stepBattedBall } from '../src/core/batting';
-import { CATCH_Z, RELEASE_Z, SPEED_NEUTRAL, SPEED_SLOW } from '../src/core/pitch';
+import {
+  CATCH_Z,
+  PITCH_WINDUP_SEC,
+  SPEED_NEUTRAL,
+  SPEED_SLOW,
+  flightSecondsUntil,
+  releasePitchFlight,
+} from '../src/core/pitch';
+import { STEAL_GO_SEC } from '../src/core/keyframes';
 import { TEAMS, fielderRowStats } from '../src/core/teams';
 // 守備側の入口（`shouldCpuPickoff`）と攻撃側の入口（`canTakeLeadOff`）が噛み合って
 // いることを固定するため（フェーズKK-58）。
@@ -57,6 +65,7 @@ import {
   chooseCpuFinePlay,
   chooseCpuPickoffThrow,
   chooseCpuSteals,
+  groupMoveDirection,
   chooseCpuTagUp,
   chooseSendRunners,
   cpuStealDefenseSlack,
@@ -848,18 +857,23 @@ describe('ランダンプレイ（説明書p25：ボールを捕ってから+で
     });
   });
 
-  describe('走る速さの関係（挟殺が読み合いになる前提）', () => {
-    it('ボールを持った野手のほうが走者より速い＝追えばいつかは詰められる', () => {
-      expect(FIELDER_SPEED).toBeGreaterThan(RUNNER_SPEED);
+  describe('走る速さの関係（フェーズBBB-82：原作の実測 6.0／BBB-85：少し速い 7.0）', () => {
+    it('ボールを持った野手は平均的な走者より遅い＝追いかけても追いつけない（投げて刺す守備）', () => {
+      // 原作の実測：走者 7.4m/s・野手 約6.0m/s。それまでの 8.5m/s は「追えばいつかは
+      // 詰められる」というこちらの前提から置いた値で、原作にもとづいていなかった。
+      // BBB-85（テストプレイ「守備の移動がちょっと遅すぎる」）で 7.0 へ：平均の走者（7.5）よりは
+      // 遅いまま。いちばん遅い走者（6.8）とはほぼ同じ＝塁間まるごと追っても 1m も詰まらない。
+      expect(FIELDER_SPEED).toBeLessThan(RUNNER_SPEED);
+      const gainedOverBasePath = (FIELDER_SPEED - RUNNER_SPEED_MIN) * (BASE_PATH / RUNNER_SPEED_MIN);
+      expect(gainedOverBasePath).toBeLessThan(1);
     });
 
-    it('ただし1秒で詰められるのは1mだけ＝塁に近い走者は逃げ切れる', () => {
-      // 塁間27.4mの中央（13.7m）で挟んでも、走者が塁へ着くまでに詰められるのは
-      // (FIELDER_SPEED - RUNNER_SPEED) * (13.7 / RUNNER_SPEED) ≒ 1.8m しかない。
-      // つまり「走って追うだけ」では届かず、送球と組み合わせる必要がある。
+    it('それでもランダンは成立する：走者より先にその塁へ着ける位置からなら間に合う', () => {
+      // 塁間の中央の走者（塁まで13.7m）に対し、塁から10mの野手は先に着く
       const runnerTime = BASE_PATH / 2 / RUNNER_SPEED;
-      const closed = (FIELDER_SPEED - RUNNER_SPEED) * runnerTime;
-      expect(closed).toBeLessThan(BASE_PATH / 2);
+      expect(10 / FIELDER_SPEED).toBeLessThan(runnerTime);
+      // 走者と同じ距離からでは間に合わない＝近いほうの塁を選ぶ・投げる判断が要る
+      expect(BASE_PATH / 2 / FIELDER_SPEED).toBeGreaterThan(runnerTime);
     });
   });
 });
@@ -1003,6 +1017,104 @@ describe('けん制球（説明書p24：Bでちっちゃいモードに切替→
     });
   });
 
+  // ---- フェーズBBB-81：人間の一斉移動は斜めでも同じ速さ ----
+  describe('groupMoveDirection（人間の守備の一斉移動の向き）', () => {
+    it('上下・左右はそのままの向き（上＝外野＝-Z／右＝一塁側＝+X）', () => {
+      expect(groupMoveDirection(1, 0)).toEqual({ x: 1, z: -0 });
+      expect(groupMoveDirection(-1, 0)).toEqual({ x: -1, z: -0 });
+      expect(groupMoveDirection(0, 1).z).toBe(-1);
+      expect(groupMoveDirection(0, -1).z).toBe(1);
+    });
+
+    it('斜めでも長さは1＝野手の足（8.5m/s）は向きによらない', () => {
+      for (const [x, y] of [
+        [1, 1],
+        [1, -1],
+        [-1, 1],
+        [-1, -1],
+      ] as const) {
+        const d = groupMoveDirection(x, y);
+        expect(Math.hypot(d.x, d.z)).toBeCloseTo(1, 12);
+        expect(Math.sign(d.x)).toBe(x);
+        expect(Math.sign(d.z)).toBe(-y);
+      }
+    });
+
+    it('何も押していなければ動かない', () => {
+      expect(groupMoveDirection(0, 0)).toEqual({ x: 0, z: 0 });
+    });
+  });
+
+  // ---- フェーズBBB-81：刺される深さまで出るのは「次の球で走るつもりの走者」だけ ----
+  describe('cpuLeadDistance：走るつもりの無いCPU走者はけん制で刺されない（BBB-81）', () => {
+    const RUNS = [0, 0.25, 0.5, 0.75, 1] as const;
+
+    it('走るつもりの無い一・二塁走者は、どの走力でも刺される境界の手前で止まる', () => {
+      for (const r of RUNS) {
+        const speed = runnerSpeed(r);
+        for (const base of ['first', 'second'] as const) {
+          expect(cpuLeadDistance(base, speed, MOUND, false)).toBeLessThan(
+            pickoffOutLead(base, MOUND, speed),
+          );
+        }
+      }
+    });
+
+    it('その深さからは、けん制球が届く前に必ず帰塁できる（＝どのタイミングで投げてもセーフ）', () => {
+      // リードは0からこの深さまで育つだけなので、いちばん深い瞬間に投げられても間に合えば十分
+      for (const r of RUNS) {
+        const speed = runnerSpeed(r);
+        for (const base of ['first', 'second', 'third'] as const) {
+          const lead = cpuLeadDistance(base, speed, MOUND, false);
+          const returnSec = lead / speed;
+          const throwSec = Math.hypot(MOUND.x - BASE_POSITIONS[base].x, MOUND.z - BASE_POSITIONS[base].z) / THROW_SPEED;
+          expect(returnSec).toBeLessThan(throwSec);
+        }
+      }
+    });
+
+    it('走るつもりの走者は従来どおり境界を踏み越す（＝けん制が効く。渡さない呼び出しも同じ値）', () => {
+      for (const r of RUNS) {
+        const speed = runnerSpeed(r);
+        for (const base of ['first', 'second'] as const) {
+          expect(cpuLeadDistance(base, speed, MOUND, true)).toBeGreaterThan(pickoffOutLead(base, MOUND, speed));
+          expect(cpuLeadDistance(base, speed, MOUND, true)).toBe(cpuLeadDistance(base, speed));
+        }
+      }
+    });
+
+    it('三塁走者は走るつもりでも手前で止まる（従来どおり）', () => {
+      for (const r of RUNS) {
+        const speed = runnerSpeed(r);
+        expect(cpuLeadDistance('third', speed, MOUND, true)).toBeLessThan(pickoffOutLead('third', MOUND, speed));
+        expect(cpuLeadDistance('third', speed, MOUND, true)).toBe(cpuLeadDistance('third', speed, MOUND, false));
+      }
+    });
+
+    it('手前で止まる幅は一・二塁でも三塁と同じ（新しい数値は持ち込まない）', () => {
+      const speed = runnerSpeed(0.5);
+      const short = (base: 'first' | 'second' | 'third') =>
+        (pickoffOutLead(base, MOUND, speed) - cpuLeadDistance(base, speed, MOUND, false)) / speed;
+      expect(short('first')).toBeCloseTo(short('third'), 6);
+      expect(short('second')).toBeCloseTo(short('third'), 6);
+    });
+
+    it('「走るつもり」は次の球で実際に走る走者と同じ（標準のリードでは俊足だけ）', () => {
+      const bases = { first: true, second: false, third: false };
+      const intent = (run: number) => chooseCpuSteals(bases, { speedOf: () => runnerSpeed(run) });
+      expect(intent(0)).toEqual([]);
+      expect(intent(0.5)).toEqual([]);
+      expect(intent(1)).toEqual(['first']);
+    });
+
+    it('走るつもりの無い走者が取った深さを持ち越しても、平均的な走者は次の球で走らない', () => {
+      const bases = { first: true, second: false, third: false };
+      const speed = runnerSpeed(0.5);
+      const carried = cpuLeadDistance('first', speed, MOUND, false);
+      expect(chooseCpuSteals(bases, { speedOf: () => speed, leadOf: () => carried })).toEqual([]);
+    });
+  });
+
   describe('chooseCpuPickoffThrow（CPU投手のけん制送球判断）', () => {
     it('リードが浅いうちは投げない（無駄弾を撃たない）', () => {
       expect(chooseCpuPickoffThrow(MOUND, { first: 1 })).toBeNull();
@@ -1045,12 +1157,18 @@ describe('けん制球（説明書p24：Bでちっちゃいモードに切替→
 });
 
 describe('盗塁（説明書p13：投球中も走塁操作が可能）', () => {
-  // 投球が捕手のミットへ届くまでの時間（core/pitch.ts の座標・球速から算出）。
-  // 盗塁の窓は「仕掛けた瞬間の投球の残り時間」で決まるので、この2つが比較の基準になる。
-  const FLIGHT_NEUTRAL = (CATCH_Z - RELEASE_Z) / SPEED_NEUTRAL;
-  const FLIGHT_SLOW = (CATCH_Z - RELEASE_Z) / SPEED_SLOW;
-  /** ワインドアップの長さ（dekkaiScene.ts の WINDUP_SEC）。ここでは下限の目安としてのみ使う */
-  const WINDUP_SEC = 0.35;
+  // 投球が捕手のミットへ届くまでの時間。**ゲームが投げる球とまったく同じ** `releasePitchFlight`
+  // （原作の速さの時計＝BBB-76・フォークの手元の失速＝BBB-77）で数える（dekkaiScene.ts の
+  // timeToCatcher と同じ）。盗塁の窓は「仕掛けた瞬間の投球の残り時間」で決まるので、
+  // この2つが比較の基準になる。
+  const FLIGHT_NEUTRAL = flightSecondsUntil(releasePitchFlight(0, SPEED_NEUTRAL, 0), CATCH_Z);
+  const FLIGHT_SLOW = flightSecondsUntil(releasePitchFlight(0, SPEED_SLOW, 0), CATCH_Z);
+  /**
+   * 走者が使えるモーションの長さ（フェーズBBB-76）＝**投手が本塁へ踏み出してから
+   * リリースまで**。モーションそのものは原作の70フレームだが、走り出せるのは踏み出してから
+   * （`STEAL_GO_SEC`）。ここでは下限の目安としてのみ使う。
+   */
+  const WINDUP_SEC = PITCH_WINDUP_SEC - STEAL_GO_SEC;
 
   describe('stealSafeJumpSec（間に合うスタートの境界）', () => {
     it('捕手の持ち替えと送球時間ぶんだけ、走者の所要時間から引いた値', () => {
@@ -1062,11 +1180,23 @@ describe('盗塁（説明書p13：投球中も走塁操作が可能）', () => {
       );
     });
 
-    it('一塁走者はモーション中〜リリース直後に走れば間に合う', () => {
-      // 境界が「飛行時間まるごと」より短い＝リリースの瞬間に走ってもまだ間に合う。
-      // かつ0より大きい＝捕手が捕ってから走ったのでは間に合わない（遅れれば刺される）。
+    it('一塁走者は投手が踏み出してからリリースのあたりまでに走れば間に合う', () => {
+      // 0より大きい＝捕手が捕ってから走ったのでは間に合わない（遅れれば刺される）。
       expect(stealSafeJumpSec('first')).toBeGreaterThan(0);
-      expect(stealSafeJumpSec('first')).toBeLessThan(FLIGHT_NEUTRAL);
+      // 踏み出しからなら間に合う（モーションの中に窓がある）
+      expect(stealSafeJumpSec('first')).toBeLessThan(WINDUP_SEC + FLIGHT_NEUTRAL);
+      // 原作の速さの球（BBB-76）では、基準速の球は**リリースの瞬間ではわずかに遅い**
+      // （0.02秒）。遅い球ならリリースの後でも間に合う＝球種で窓が変わる。
+      expect(stealSafeJumpSec('first') - FLIGHT_NEUTRAL).toBeLessThan(0.05);
+      expect(stealSafeJumpSec('first')).toBeLessThan(FLIGHT_SLOW);
+    });
+
+    it('走り出せるのは投手が本塁へ踏み出してから＝モーションの頭で押しても持ち時間は増えない（BBB-76）', () => {
+      // 踏み出しは原作の4枚目（腕を後ろへ引く絵）＝44フレーム目
+      expect(STEAL_GO_SEC * 60).toBeCloseTo(44, 6);
+      // 踏み出しからリリースまでは、それまでのモーション（0.35秒）とほぼ同じ長さ
+      expect(WINDUP_SEC).toBeGreaterThan(0.35);
+      expect(WINDUP_SEC).toBeLessThan(0.5);
     });
 
     it('二塁走者（三塁への盗塁）は一塁走者より窓が狭い＝モーション中でないと間に合わない', () => {
@@ -1079,6 +1209,20 @@ describe('盗塁（説明書p13：投球中も走塁操作が可能）', () => {
     it('本塁への盗塁はどんなスタートでも間に合わない（捕手が本塁に立っている）', () => {
       // もっとも遅い球（＝残り時間がもっとも長い）でモーションの頭から走っても届かない。
       expect(stealSafeJumpSec('third')).toBeGreaterThan(WINDUP_SEC + FLIGHT_SLOW);
+      // **BBB-77でフォークが手元で失速するようになっても、リードの上限でまだ届かない**
+      // （残り 1.227秒 vs 境界 1.25秒）＝余裕は0.02秒しか無いので、フォークを遅くするときは
+      // ここが最初に崩れる。
+      expect(stealSafeJumpSec('third', BASE_POSITIONS.home, MAX_LEAD)).toBeGreaterThan(
+        WINDUP_SEC + FLIGHT_SLOW,
+      );
+    });
+
+    it('フォークなら塁の上（リード0）からでも二盗が間に合う（BBB-77：手元で失速するぶん捕手に着くのが遅い）', () => {
+      // L-32の当時は遅い球にだけ残っていた穴で、BBB-76（緩急の幅が原作どおり狭くなった）で
+      // いったん閉じていた。**フォークを原作どおり「手元で止まって落ちる」球にした**（ユーザー判断）
+      // ので戻った＝走者の側から見ると「フォークのカウントで走る」が読みになる。
+      expect(stealSafeJumpSec('first', BASE_POSITIONS.home, 0)).toBeLessThan(WINDUP_SEC + FLIGHT_SLOW);
+      expect(stealSafeJumpSec('first', BASE_POSITIONS.home, 0)).toBeGreaterThan(WINDUP_SEC + FLIGHT_NEUTRAL);
     });
 
     it('リードが深いほど窓が広い（塁の上からでは基準速の球に間に合わない）', () => {
@@ -1414,11 +1558,18 @@ describe('runnerSpeed（走力→走者速度：フェーズB-8）', () => {
   });
 
   /**
-   * どんな俊足でも野手より遅いことが、守備側の操作（追いつく・詰める）が
-   * 無意味にならない条件そのもの。挟殺プレイの読み合いはこの大小関係で成立している。
+   * **野手の足は、原作の実測（6.0）より少し速い 7.0**（フェーズBBB-85。ユーザー判断）。
+   * 原作は走者 7.4m/s に対して野手 約 5.8〜6.0m/s＝走者のおよそ0.8倍（BBB-82 はそのまま採った）。
+   * こちらの画面は原作より広く映すので、同じ m/s でも画面の上では原作の65%の速さだった。
+   * B-8 が置いていた「どんな俊足でも野手より遅い」（野手 8.5m/s）には戻していない
+   * （その速さが深い打球を全部アウトにしていた）。
    */
-  it('最速の走者でも野手の足より遅い（守備が追いつける前提を壊さない）', () => {
-    expect(RUNNER_SPEED_MAX).toBeLessThan(FIELDER_SPEED);
+  it('野手の足は基準速の走者のおよそ0.9倍（原作の0.8倍より少し速い。平均の走者よりは遅い）', () => {
+    const ratio = FIELDER_SPEED / RUNNER_SPEED;
+    expect(ratio).toBeGreaterThan(0.85);
+    expect(ratio).toBeLessThan(1);
+    // 足の速い走者（走力0.5以上）には、どれだけ追っても追いつけない
+    expect(FIELDER_SPEED).toBeLessThan(runnerSpeed(0.5));
   });
 
   it('走力の差は塁間の所要時間の差として出る（俊足は鈍足より0.5秒以上速い）', () => {

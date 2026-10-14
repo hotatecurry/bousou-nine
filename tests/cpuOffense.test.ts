@@ -17,6 +17,7 @@ import {
 import {
   BASE_POSITIONS,
   CPU_TAG_UP_MARGIN_SEC,
+  PICKUP_RELEASE_SEC,
   RUNNER_SPEED,
   RUNNER_SPEED_MAX,
   RUNNER_SPEED_MIN,
@@ -183,7 +184,8 @@ describe('打球での余分な進塁（X-45。cpuExtraBaseSlack / chooseCpuExtr
   it('余白の既定は CPU_TAG_UP_MARGIN_SEC（新しい自由変数を作っていない）', () => {
     // ちょうど margin ぶんだけ足りない場面を作り、既定と明示指定が一致することを見る
     const slack = cpuExtraBaseSlack({ from: 'second', speed: RUNNER_SPEED, ...DEEP });
-    const tight = { ...DEEP, secureSec: DEEP.secureSec + slack + CPU_TAG_UP_MARGIN_SEC };
+    // 境目ちょうどは浮動小数の端数で揺れるので、わずかに内側へ置く
+    const tight = { ...DEEP, secureSec: DEEP.secureSec + slack + CPU_TAG_UP_MARGIN_SEC + 1e-9 };
     expect(chooseCpuExtraBases(['second'], tight)).toEqual(['second']);
     expect(
       chooseCpuExtraBases(['second'], { ...tight, margin: CPU_TAG_UP_MARGIN_SEC + 0.01 }),
@@ -200,9 +202,9 @@ describe('打球での余分な進塁（X-45。cpuExtraBaseSlack / chooseCpuExtr
 
   it('走る距離は塁間そのもの（BASE_POSITIONS から導出していて定数を持たない）', () => {
     const zeroThrow = { securePoint: BASE_POSITIONS.third, secureSec: 0 };
-    // 送球距離0・確保0秒なら、余裕はそのまま走者の所要時間になる
+    // 送球距離0・確保0秒なら、余裕は「走者の所要時間 − 拾ってからの持ち替え」（フェーズBBB-82）
     expect(cpuExtraBaseSlack({ from: 'second', speed: RUNNER_SPEED, ...zeroThrow })).toBeCloseTo(
-      27.43 / RUNNER_SPEED,
+      27.43 / RUNNER_SPEED - PICKUP_RELEASE_SEC,
       1,
     );
   });

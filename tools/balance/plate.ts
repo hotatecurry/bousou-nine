@@ -11,37 +11,53 @@
  * ここまで無かった＝`tools/balance/` は**打席の中を一度も回していない**（`sweep.ts` は
  * 当たった後の格子、`runExpectancy.ts` は三振・四球ぶんを外から仮定して足す）。
  *
- * そのせいで、いくつもの数字が**仮定の上に積まれている**：
- * `homerun.ts` の「三振・四球ぶん 23%」（JJ-57が抗力を決めた分母）／`relief.ts` の
- * 「1打席4球・1試合140球」（Z-47の物差し）／`walk.ts`・`lineup.ts`・`pinchrun.ts` の
- * 「一様な格子の分布」（Q-38の敬遠 0.80、R-39の盗塁 0.73、GG-54の代走 0.10）。
+ * ## フェーズAAA-75：CPU打者に「ぶれ」が入った
+ *
+ * CPU打者は**直前のストライクの速さに合わせて振り、人間並みにタイミングがぶれる**
+ * （`cpuBatter.ts` の `cpuSwingLead` / `CPU_SWING_SIGMA_SEC`）。**同じ対戦でも打席ごとに
+ * 結果が散る**ので、各段は**1つのぶれの系列を共有して何度も回す**（`REPS`）＝割合が
+ * 分布として出る。系列はシードで決まるので、何度走らせても同じ数字になる。
+ *
+ * 旧来の段のうち、**決定的なCPU打者の性質を測っていたもの**（8段目＝速球の早振りの罰／
+ * 11段目の階段／13段目＝早振りの罰の帯）は、仕組みそのものが無くなったので置き換えた
+ * （経緯は ORIGINAL_PARITY.md の SS-67・TT-68・AAA-75 のフェーズ記録にある）。
+ *
+ * ## フェーズBBB-83：守備の追い方（16段目）と、人間の打者の構え（17段目）
+ *
+ * - **16段目＝CPU守備の追い方と反応**。BBB-82 までのCPU守備（いちばん近い野手を球へ向ける・
+ *   打った瞬間に動く）と、BBB-83 の先回り＋反応の遅れを、同じ打席で比べる。
+ * - **17段目＝投手の立ち位置を読んで構える打者**。1〜15段目の打者はCPUの規則（直前のストライクへ
+ *   寄る）で構えるが、**人間は投手がプレートのどちら側に立つかを見て寄れる**。BBB-83 では
+ *   「内外角は投げる前に100%読める」という穴としてここで見つかり、**BBB-84 で立つ側を別系列から
+ *   引く＋立ち位置は外れる手がかり**（外角側に立ったときだけ、3回に1回、内角のストライクへ）に
+ *   した（詳しい計測は `npm run balance:tell`）。
+ *
+ * ## フェーズBBB-84：CPU投手の内外角は引く（全段の基準が動いた）
+ *
+ * `simulateAtBat` は既定で**ぶれの系列と同じ種から内外角の系列を起こす**（実機と同じ）。
+ * あわせて、CPU投手は踏み込んでいる打者の体へ投げず、投げた後に踏み込んで当たった球は死球に
+ * ならない（どちらも実機と同じ＝既定）。BBB-83 までの規則で回すには
+ * `sides: null`・`avoidCrowder: false`・`noAwardIfSteppedIn: false` を渡す。
  */
-import {
-  type PitcherStats,
-  createTeamRoster,
-  pitchArmOf,
-  pitcherControl,
-} from '../../src/core/roster';
+import { type PitcherStats, createTeamRoster, pitchArmOf, pitcherControl } from '../../src/core/roster';
 import { TEAMS, pitcherRowPitching, teamById } from '../../src/core/teams';
 import { HOT_MODIFIER } from '../../src/core/condition';
 import { BALLPARKS, DEFAULT_BALLPARK } from '../../src/core/ballpark';
-import { runnerSpeed } from '../../src/core/fielding';
+import { CPU_FIELD_REACTION_SEC, FIELDER_HOME_POSITIONS, runnerSpeed } from '../../src/core/fielding';
 import {
+  BATTER_STANCE_RANGE,
   CATCH_Z,
   STRIKE_ZONE_HALF_WIDTH,
-  SPEED_FAST,
   armReleaseOffsetX,
-  releaseXFor,
-  SPEED_NEUTRAL,
-  SPEED_SLOW,
   createPitchFlight,
+  releaseXFor,
+  neutralSpeedFor,
   speedForPitchSelection,
   stepPitchFlight,
+  forkBounces,
 } from '../../src/core/pitch';
 import {
   AVG_MISHIT_RELIEF,
-  CONTACT_PLANE_Z,
-  MAX_DIRECTION_DEG,
   SWING_ACTIVE_SEC,
   SWING_IDEAL_SEC,
   TIMING_SPEED_PENALTY,
@@ -49,11 +65,10 @@ import {
   judgeSwing,
 } from '../../src/core/batting';
 import {
+  CPU_SWING_SIGMA_SEC,
   CPU_TIMING_PENALTY_SEC,
   SELECTIVE_HALF_WIDTH,
   TWO_STRIKE_HALF_WIDTH,
-  crossesSwingDecisionPoint,
-  shouldCpuSwing,
 } from '../../src/core/cpuBatter';
 import {
   CORNER_MARGIN,
@@ -67,14 +82,18 @@ import {
 } from '../../src/core/cpuPitcher';
 import type { Count } from '../../src/core/rules';
 import {
+  type AtBatOptions,
+  type AtBatResult,
+  type HumanPitch,
   batterSideOf,
   controlOf,
   pitchProfileOf,
   simulateAtBat,
   simulatePitch,
+  swingNoiseStream,
 } from './atbat';
 import { SIM_DT, simulatePlay } from './sim';
-import { distributionFor, paOutcomeOf, solveLineup } from './runExpectancy';
+import { type PaDistribution, distributionFor, paOutcomeOf, solveLineup } from './runExpectancy';
 
 const row = (cells: readonly string[], width = 12): string =>
   cells.map((c) => c.padStart(width)).join('');
@@ -82,6 +101,12 @@ const pct = (v: number): string => `${(v * 100).toFixed(1)}%`;
 const f2 = (v: number): string => v.toFixed(2);
 
 const ROSTERS = TEAMS.map((t) => createTeamRoster(teamById(t.id)));
+const STAFFS = TEAMS.map((t) => teamById(t.id).pitchers.map((r) => pitcherRowPitching(r)));
+
+/** 1つの対戦を何度回すか（ぶれの系列を共有して回す＝打席ごとに違うぶれが乗る） */
+const REPS = 12;
+/** 人間の配球（17段目）は1つの形あたりこの回数 */
+const HUMAN_REPS = 8;
 
 /** 対戦の作り方＝**i番目の打線 vs i+1番目の先発**（16通り。名鑑をひと巡り舐める） */
 function matchups() {
@@ -91,80 +116,233 @@ function matchups() {
   });
 }
 
-/**
- * **4・5段目で「振らせて」測るための幅**（フェーズTT-68）。TT-68 で通常の球の狙いが
- * 打者が手を出す幅の縁（`SELECTIVE_HALF_WIDTH`）へ移ったので、**CPU打者は初球の速球を
- * 見送る**（2段目の 0-0 が 100%「振らず」）＝そのままでは打球が1つも採れない。
- * 4・5段目が答える問いは「**振ったときにどこへ飛ぶか**」（QQ-65のファウルラインの山・
- * 球場別の入り方）で、振るかどうかとは別なので、**2ストライクの幅を渡して振らせる**。
- */
-const SWING_AT_NORMAL = { normal: TWO_STRIKE_HALF_WIDTH } as const;
+/** 打席の集計 */
+interface Tally {
+  n: number;
+  strikeout: number;
+  swingK: number;
+  walk: number;
+  hitByPitch: number;
+  inPlay: number;
+  out: number;
+  single: number;
+  double: number;
+  triple: number;
+  homerun: number;
+  pitches: number;
+  swings: number;
+  misses: number;
+  fouls: number;
+  takes: number;
+  longest: number;
+}
+
+function tally(results: readonly AtBatResult[]): Tally {
+  const t: Tally = {
+    n: 0,
+    strikeout: 0,
+    swingK: 0,
+    walk: 0,
+    hitByPitch: 0,
+    inPlay: 0,
+    out: 0,
+    single: 0,
+    double: 0,
+    triple: 0,
+    homerun: 0,
+    pitches: 0,
+    swings: 0,
+    misses: 0,
+    fouls: 0,
+    takes: 0,
+    longest: 0,
+  };
+  for (const r of results) {
+    t.n += 1;
+    t[r.kind] += 1;
+    if (r.kind === 'strikeout' && r.misses > 0) t.swingK += 1;
+    if (r.outcome) t[r.outcome] += 1;
+    t.pitches += r.pitches;
+    t.swings += r.swings;
+    t.misses += r.misses;
+    t.fouls += r.fouls;
+    t.takes += r.takes;
+    t.longest = Math.max(t.longest, r.pitches);
+  }
+  return t;
+}
+
+const hitsOf = (t: Tally): number => t.single + t.double + t.triple + t.homerun;
+/** 打率＝安打 ÷（打席 − 四死球） */
+const avgOf = (t: Tally): number => hitsOf(t) / Math.max(1, t.n - t.walk - t.hitByPitch);
+
+/** 先発16人×打線9人を `reps` 回ずつ回す（ぶれの系列は1本を共有） */
+function runStarters(opts: AtBatOptions = {}, reps = REPS, seed = 1): AtBatResult[] {
+  const noise = opts.noise ?? swingNoiseStream(seed, CPU_SWING_SIGMA_SEC);
+  const out: AtBatResult[] = [];
+  for (const m of matchups()) {
+    for (const id of m.off.lineup) {
+      for (let r = 0; r < reps; r += 1) {
+        out.push(simulateAtBat(m.pitcher, m.off.players[id].batting, { ...opts, noise }));
+      }
+    }
+  }
+  return out;
+}
+
+/** 人間の配球の形（17段目）。1文字目＝緩急（F/N/S）、2文字目＝コース（m/c/b/o） */
+const SEL: Record<string, -1 | 0 | 1> = { F: -1, N: 0, S: 1 };
+/** 打者から見たコース（外角）。c＝投手の通常の狙い／b＝ゾーンの縁の内側／o＝ボール */
+const LOC: Record<string, number> = { m: 0, c: -NORMAL_TARGET_X, b: -0.43, o: -0.6 };
+const HUMAN_PATTERNS: readonly (readonly string[])[] = [
+  ['Fm'],
+  ['Nm'],
+  ['Sm'],
+  ['Fb'],
+  ['Sb'],
+  ['Fc'],
+  ['Fm', 'Sm'],
+  ['Sm', 'Fm'],
+  ['Fm', 'Fm', 'Sm'],
+  ['Fm', 'Nm', 'Sm'],
+  ['Nm', 'Fm', 'Sm'],
+  ['Fo', 'Sm'],
+  ['Fb', 'Sm'],
+  ['Sb', 'Fm'],
+  ['Fc', 'Sc'],
+];
+
+/** 人間がある配球の形を投げ続けたときの、CPU打線144人ぶんの帰結 */
+function runHuman(pattern: readonly string[], opts: AtBatOptions = {}, reps = HUMAN_REPS): Tally {
+  const noise = opts.noise ?? swingNoiseStream(7, CPU_SWING_SIGMA_SEC);
+  const humanPitch = (_: Count, i: number): HumanPitch => {
+    const tok = pattern[i % pattern.length];
+    return { selection: SEL[tok[0]], localX: LOC[tok[1]] };
+  };
+  const out: AtBatResult[] = [];
+  for (const m of matchups()) {
+    for (const id of m.off.lineup) {
+      for (let r = 0; r < reps; r += 1) {
+        out.push(simulateAtBat(m.pitcher, m.off.players[id].batting, { ...opts, noise, humanPitch }));
+      }
+    }
+  }
+  return tally(out);
+}
+
+/** 人間の配球15通りのうち、いちばん三振を取れる形・いちばん打たれない形・いちばん打たれる形 */
+function humanExtremes(opts: AtBatOptions = {}, reps = HUMAN_REPS) {
+  const rows = HUMAN_PATTERNS.map((p) => ({ label: p.join(','), t: runHuman(p, opts, reps) }));
+  const k = (r: (typeof rows)[number]) => r.t.strikeout / r.t.n;
+  const maxK = rows.reduce((a, b) => (k(b) > k(a) ? b : a));
+  const minAvg = rows.reduce((a, b) => (avgOf(b.t) < avgOf(a.t) ? b : a));
+  const maxAvg = rows.reduce((a, b) => (avgOf(b.t) > avgOf(a.t) ? b : a));
+  return { rows, maxK, minAvg, maxAvg };
+}
+
+const KNOWN = '   実際の野球は 三振22% / 四球8.5% / 死球1%未満 / 打率.250前後 / 1打席3.9球 / HRは約30打席に1本。';
 
 console.log('打席まるごとの計測（CPU投手 vs CPU打者／球場＝ところざわ／名鑑16球団をひと巡り）');
 console.log('土台：tools/balance/atbat.ts（判定・CPUの判断はすべて src/core の純粋関数）');
+console.log(
+  `CPU打者のぶれ σ=${(CPU_SWING_SIGMA_SEC * 1000).toFixed(0)}ms・緩急1段のずれ ${(CPU_TIMING_PENALTY_SEC * 1000).toFixed(0)}ms（窓の1/3）・各対戦を${REPS}回`,
+);
 
 // ============================================================
 // 1. 打席の帰結（三振・四球は本当に起きるのか）
 // ============================================================
 
-console.log('\n=== 1. CPU打者の打席の帰結（16球団×9人＝144打席） ===');
+console.log(`\n=== 1. CPU打者の打席の帰結（16球団×9人×${REPS}回） ===`);
 {
-  const tally: Record<string, number> = {};
-  let pitches = 0;
-  let swings = 0;
-  let takes = 0;
-  let fouls = 0;
-  for (const m of matchups()) {
-    for (const id of m.off.lineup) {
-      const b = m.off.players[id];
-      const r = simulateAtBat(m.pitcher, b.batting);
-      const key = r.kind === 'inPlay' ? r.outcome! : r.kind;
-      tally[key] = (tally[key] ?? 0) + 1;
-      pitches += r.pitches;
-      swings += r.swings;
-      takes += r.takes;
-      fouls += r.fouls;
+  const starters = tally(runStarters());
+  // 救援も含めた6人ずつ（相手5球団ぶん）＝**制球の悪い救援が混ざると四死球が増える**
+  const noise = swingNoiseStream(2);
+  const staff: AtBatResult[] = [];
+  ROSTERS.forEach((off, i) => {
+    for (let d = 1; d <= 5; d += 1) {
+      for (const pit of STAFFS[(i + d) % STAFFS.length]) {
+        for (const id of off.lineup) staff.push(simulateAtBat(pit, off.players[id].batting, { noise }));
+      }
     }
-  }
-  const total = Object.values(tally).reduce((s, v) => s + v, 0);
-  console.log(`${'帰結'.padEnd(12)}${row(['打席', '割合'])}`);
-  for (const [k, v] of Object.entries(tally).sort((a, b) => b[1] - a[1])) {
-    console.log(`${k.padEnd(12)}${row([String(v), pct(v / total)])}`);
-  }
+  });
+  const all = tally(staff);
   console.log(
-    `\n   1打席あたり **${(pitches / total).toFixed(2)}球**（振った ${(swings / total).toFixed(2)} / 見送った ${(takes / total).toFixed(2)} / ファウル ${(fouls / total).toFixed(2)}）`,
+    `${'相手'.padEnd(14)}${row(['打席', '三振', '(空振り)', '四球', '死球', '打率', '二塁打+', 'HR', '球数', '空振/振', '最長'], 9)}`,
   );
-  console.log(`   relief.ts が置いている仮定は「1打席 4球」＝ここが実測値。`);
+  for (const [label, t] of [
+    ['先発16人', starters],
+    ['投手陣6人ずつ', all],
+  ] as const) {
+    console.log(
+      `${label.padEnd(14)}${row(
+        [
+          String(t.n),
+          pct(t.strikeout / t.n),
+          pct(t.swingK / t.n),
+          pct(t.walk / t.n),
+          pct(t.hitByPitch / t.n),
+          avgOf(t).toFixed(3),
+          pct((t.double + t.triple) / t.n),
+          pct(t.homerun / t.n),
+          (t.pitches / t.n).toFixed(2),
+          pct(t.misses / Math.max(1, t.swings)),
+          String(t.longest),
+        ],
+        9,
+      )}`,
+    );
+  }
+  console.log(KNOWN);
   console.log(
-    `   homerun.ts が置いている仮定は「三振・四球ぶん 23%」＝実測は ${pct(((tally['strikeout'] ?? 0) + (tally['walk'] ?? 0) + (tally['hitByPitch'] ?? 0)) / total)}。`,
+    `   1打席あたり（先発）：振った ${(starters.swings / starters.n).toFixed(2)} / 見送った ${(starters.takes / starters.n).toFixed(2)} / ファウル ${(starters.fouls / starters.n).toFixed(2)}`,
   );
+  console.log('   AAA-75の前（決定的・1フレーム遅れ）は 三振39.6%（すべて空振り）/ 四球8.3% / 死球4.2% / HR 0本 / 3.79球。');
 }
 
 // ============================================================
-// 2. 球速モード別の1球（CPUの配球はカウントで決まる）
+// 2. カウント別の1球（CPUの配球は自然に緩急を付ける）
 // ============================================================
 //
 // `chooseCpuPitchPlan` は 0-0=速球 / 1ストライク後=フォーク / 3ボール後=基準速（真ん中）/
-// 2ストライク後=決め球（隅）。**同じ投手・同じ打者でもカウントで球種が変わる**ので、
-// 打席の帰結（1段目）を球ごとに分解するとこうなる。
+// 2ストライク後=決め球（隅）。CPU打者は**直前のストライクの速さ**を待つので、
+// 0-1 のフォークは「速球を待っていたところ」へ来る（2段ずれる）。
 
-console.log('\n=== 2. カウント別の1球＝CPUの配球ごとの帰結 ===');
-const COUNTS = [
-  { label: '速球(0-0)', count: { balls: 0, strikes: 0 } },
-  { label: 'フォーク(0-1)', count: { balls: 0, strikes: 1 } },
-  { label: '基準(3-0)', count: { balls: 3, strikes: 0 } },
-  { label: '決め球(0-2)', count: { balls: 0, strikes: 2 } },
+console.log('\n=== 2. カウント別の1球＝CPUの配球ごとの帰結（何を待っていたかを添える） ===');
+const COUNTS: ReadonlyArray<{
+  label: string;
+  count: Count;
+  wait: string;
+  expected: (p: PitcherStats) => number | null;
+}> = [
+  { label: '速球(0-0)', count: { balls: 0, strikes: 0 }, wait: '基準速', expected: () => null },
+  {
+    label: 'フォーク(0-1)',
+    count: { balls: 0, strikes: 1 },
+    wait: '速球',
+    expected: (p) => speedForPitchSelection(-1, p.speed),
+  },
+  { label: '基準(3-0)', count: { balls: 3, strikes: 0 }, wait: '基準速', expected: () => null },
+  {
+    label: '決め球(0-2)',
+    count: { balls: 0, strikes: 2 },
+    wait: 'フォーク',
+    expected: (p) => speedForPitchSelection(1, p.speed),
+  },
 ];
 {
-  console.log(`${'カウント'.padEnd(16)}${row(['アウト', '安打', 'HR', 'ファウル', '振らず', '平均方向'], 10)}`);
+  console.log(
+    `${'カウント'.padEnd(16)}${row(['待つ球', 'アウト', '安打', 'HR', 'ファウル', '空振り', '見送り', '平均|t|'], 9)}`,
+  );
   for (const c of COUNTS) {
+    const noise = swingNoiseStream(3);
     let out = 0;
     let hits = 0;
     let hr = 0;
     let foul = 0;
-    let noSwing = 0;
+    let miss = 0;
+    let take = 0;
     let n = 0;
-    const dirs: number[] = [];
+    const timings: number[] = [];
     for (const m of matchups()) {
       const profile = pitchProfileOf(m.pitcher, 0);
       const control = controlOf(m.pitcher, 0);
@@ -172,263 +350,130 @@ const COUNTS = [
       for (const id of m.off.lineup) {
         const b = m.off.players[id];
         const side = batterSideOf(b.batting, m.pitcher);
-        const p = simulatePitch(
-          profile,
-          control,
-          arm,
-          c.count,
-          { power: b.batting.power, average: b.batting.average },
-          side,
-          0,
-          0,
-        );
-        n += 1;
-        if (!p.launch) {
-          noSwing += 1;
-          continue;
-        }
-        const play = simulatePlay(p.launch, p.contactX, {
-          runnerSpeed: runnerSpeed(b.batting.run),
-        });
-        const o = paOutcomeOf({ timing: 0, course: 0, result: play });
-        dirs.push(play.directionDeg);
-        if (o === null) foul += 1;
-        else if (o === 'out') out += 1;
-        else {
-          hits += 1;
-          if (o === 'homerun') hr += 1;
+        for (let r = 0; r < REPS; r += 1) {
+          const p = simulatePitch(
+            profile,
+            control,
+            arm,
+            c.count,
+            { power: b.batting.power, average: b.batting.average },
+            side,
+            0,
+            0,
+            { expectedSpeed: c.expected(m.pitcher), noise: noise.next() },
+          );
+          n += 1;
+          if (!p.swung) {
+            take += 1;
+            continue;
+          }
+          if (!p.launch) {
+            miss += 1;
+            continue;
+          }
+          if (p.timing !== null) timings.push(Math.abs(p.timing));
+          const play = simulatePlay(p.launch, p.contactX, { runnerSpeed: runnerSpeed(b.batting.run) });
+          const o = paOutcomeOf({ timing: 0, course: 0, result: play });
+          if (o === null) foul += 1;
+          else if (o === 'out') out += 1;
+          else {
+            hits += 1;
+            if (o === 'homerun') hr += 1;
+          }
         }
       }
     }
-    const meanDir = dirs.length ? dirs.reduce((s, d) => s + d, 0) / dirs.length : 0;
+    const meanT = timings.length ? timings.reduce((s, v) => s + v, 0) / timings.length : 0;
     console.log(
       `${c.label.padEnd(16)}${row(
-        [pct(out / n), pct(hits / n), pct(hr / n), pct(foul / n), pct(noSwing / n), `${meanDir.toFixed(0)}°`],
-        10,
+        [c.wait, pct(out / n), pct(hits / n), pct(hr / n), pct(foul / n), pct(miss / n), pct(take / n), meanT.toFixed(2)],
+        9,
       )}`,
     );
   }
-  console.log('   ＝**TT-68以降、通常の球（0-0／0-1）は見送られる**（狙いが打者の手を出す幅の縁にある）');
-  console.log('   ＝カウントが動いてから決着する。3ボール後の真ん中は打たれ、決め球は87.5%が見送り。');
+  console.log('   ＝**速さが変わる球（0-1のフォーク）ほど空振り・ファウルが増え**、待っていた球に近いほど芯に寄る。');
 }
 
 // ============================================================
-// 3. 人間が投げるときの3択（ど真ん中に置いたときの帰結）
+// 3. CPU打者が「実際に振ったときにどこへ飛ぶか」（速球の打球の方向）
 // ============================================================
 //
-// CPUの配球はカウントで決まるが、**人間は毎球3つから選べる**（説明書p19②）。
-// 同じ「ど真ん中」で球速だけ変えたときに何が起きるかを見る＝**人間の投手側に
-// 支配戦略があるか**の確認。
+// QQ-65 が見つけた「速球の打球がファウルラインの上に乗っている」の現在形。
+// AAA-75 以降は**初球の速球は差し込まれて逆方向**、**同じ速球の2球目は芯**になる。
 
-/** ど真ん中へまっすぐ投げた球をCPU打者が打った結果（曲げない＝人間の素直な球） */
-function straightPitch(
-  speed: number,
-  batter: { power: number; average: number; run: number },
-  side: 1 | -1,
-) {
-  let flight = createPitchFlight(0, speed, 0);
-  let swingT: number | null = null;
-  let swung = false;
-  for (let i = 0; i < 600; i += 1) {
-    const prev = flight;
-    const next = stepPitchFlight(prev, 0, SIM_DT, 0);
-    if (swingT === null && !swung && crossesSwingDecisionPoint(prev, next)) {
-      if (shouldCpuSwing(next, { balls: 0, strikes: 0 }, side, 0)) {
-        swingT = 0;
-        swung = true;
-      }
-    }
-    if (swingT !== null) {
-      const cross = contactPlaneCrossing(prev, next);
-      if (cross) {
-        const launch = judgeSwing(
-          { crossX: cross.x, swingTime: swingT + cross.frac * SIM_DT, pitchSpeed: prev.vz },
-          { power: batter.power, average: batter.average },
-          side,
-          0,
-          0,
-        );
-        if (launch) return { launch, contactX: cross.x, swingTime: swingT + cross.frac * SIM_DT };
-        swingT = null;
-      }
-    }
-    flight = next;
-    if (swingT !== null) swingT += SIM_DT;
-    if (next.z >= CATCH_Z) return null;
-  }
-  return null;
-}
-
-console.log('\n=== 3. 人間が「ど真ん中」に投げたときの3択（CPU打者144人） ===');
+console.log('\n=== 3. 速球を振った打球の方向（名鑑96投手 × 打線9人・初球と同じ速さの2球目） ===');
 {
-  console.log(`${'球速'.padEnd(16)}${row(['アウト', '安打', 'HR', 'ファウル', '平均方向', 'スイング'], 10)}`);
-  for (const [label, speed] of [
-    ['速球 42m/s', SPEED_FAST],
-    ['基準 36m/s', SPEED_NEUTRAL],
-    ['フォーク 22m/s', SPEED_SLOW],
+  for (const [label, second] of [
+    ['初球（基準速を待つ）', false],
+    ['2球目（速球を待つ）', true],
   ] as const) {
-    let out = 0;
-    let hits = 0;
-    let hr = 0;
-    let foul = 0;
+    const noise = swingNoiseStream(4);
+    const buckets = new Map<string, number>();
     let n = 0;
-    const dirs: number[] = [];
-    let swingTimeSum = 0;
-    for (const m of matchups()) {
-      for (const id of m.off.lineup) {
-        const b = m.off.players[id];
-        const side = batterSideOf(b.batting, m.pitcher);
-        const hit = straightPitch(speed, b.batting, side);
-        n += 1;
-        if (!hit) continue;
-        swingTimeSum += hit.swingTime;
-        const play = simulatePlay(hit.launch, hit.contactX, {
-          runnerSpeed: runnerSpeed(b.batting.run),
-        });
-        const o = paOutcomeOf({ timing: 0, course: 0, result: play });
-        dirs.push(play.directionDeg);
-        if (o === null) foul += 1;
-        else if (o === 'out') out += 1;
-        else {
-          hits += 1;
-          if (o === 'homerun') hr += 1;
+    let fair = 0;
+    let hr = 0;
+    for (const r of ROSTERS) {
+      for (const pid of [r.pitcher, ...r.bullpen]) {
+        const pit = r.players[pid].pitching!;
+        const profile = pitchProfileOf(pit, 0);
+        const control = controlOf(pit, 0);
+        const arm = pitchArmOf(pit.throws);
+        for (const id of r.lineup) {
+          const b = r.players[id];
+          const p = simulatePitch(
+            profile,
+            control,
+            arm,
+            { balls: 0, strikes: 0 },
+            { power: b.batting.power, average: b.batting.average },
+            batterSideOf(b.batting, pit),
+            0,
+            0,
+            {
+              expectedSpeed: second ? speedForPitchSelection(-1, pit.speed) : null,
+              noise: noise.next(),
+            },
+          );
+          if (!p.launch) continue;
+          const play = simulatePlay(p.launch, p.contactX, { runnerSpeed: runnerSpeed(b.batting.run) });
+          n += 1;
+          const d = play.directionDeg;
+          const a = Math.abs(d);
+          const key = a >= 45 ? 'ファウル(45°以上)' : a >= 25 ? (d < 0 ? '左25〜45°' : '右25〜45°') : '中央±25°';
+          buckets.set(key, (buckets.get(key) ?? 0) + 1);
+          if (play.outcome.kind !== 'foul') fair += 1;
+          if (play.outcome.kind === 'homerun') hr += 1;
         }
       }
     }
-    const meanDir = dirs.length ? dirs.reduce((s, d) => s + d, 0) / dirs.length : 0;
-    console.log(
-      `${label.padEnd(16)}${row(
-        [
-          pct(out / n),
-          pct(hits / n),
-          pct(hr / n),
-          pct(foul / n),
-          `${meanDir.toFixed(0)}°`,
-          `${(swingTimeSum / Math.max(1, dirs.length)).toFixed(3)}s`,
-        ],
-        10,
-      )}`,
+    const cells = ['ファウル(45°以上)', '左25〜45°', '中央±25°', '右25〜45°'].map(
+      (k) => `${k} ${pct((buckets.get(k) ?? 0) / Math.max(1, n))}`,
     );
+    console.log(`   ${label.padEnd(18)} 当たった ${n}本：${cells.join(' / ')} ／ HR ${pct(hr / Math.max(1, fair))}（フェアのうち）`);
   }
-  console.log(
-    `   スイングの理想は 0.090s＝そこからのズレが引っ張り（+）／流し（-）。方向は ズレ×${MAX_DIRECTION_DEG}°。`,
-  );
+  console.log('   ＝**同じ速球を続けるほど芯で捉えられる**（緩急を付けない投手への罰）。');
 }
 
 // ============================================================
-// 4. 速球の打球が「ファウルラインの上」に乗っている
+// 4. 球場別（実際の打席の本塁打）
 // ============================================================
-//
-// 2・3段目の平均方向がどちらも 40°台＝**ファウルライン（±45°）のすぐ内側**。
-// ここが本当に境界の上なら、**HRになるかファウルになるかが投手のわずかな球速差で
-// 決まる**ことになるので、名鑑96人の速球で方向を並べて確かめる。
 
-console.log('\n=== 4. 速球を打った打球の方向（名鑑96投手 × 打線9人） ===');
+console.log(`\n=== 4. 球場別（実際の打席・先発16人×打線9人×${REPS}回） ===`);
 {
-  const buckets = new Map<string, number>();
-  let n = 0;
-  let fair = 0;
-  let hr = 0;
-  for (const r of ROSTERS) {
-    for (const pid of [r.pitcher, ...r.bullpen]) {
-      const pit = r.players[pid].pitching!;
-      const profile = pitchProfileOf(pit, 0);
-      const control = controlOf(pit, 0);
-      const arm = pitchArmOf(pit.throws);
-      for (const id of r.lineup) {
-        const b = r.players[id];
-        const side = batterSideOf(b.batting, pit);
-        const p = simulatePitch(
-          profile,
-          control,
-          arm,
-          { balls: 0, strikes: 0 },
-          { power: b.batting.power, average: b.batting.average },
-          side,
-          0,
-          0,
-          0,
-          SWING_AT_NORMAL,
-        );
-        if (!p.launch) continue;
-        const play = simulatePlay(p.launch, p.contactX, {
-          runnerSpeed: runnerSpeed(b.batting.run),
-        });
-        n += 1;
-        const a = Math.abs(play.directionDeg);
-        const key = a >= 45 ? '45°以上(ファウル)' : a >= 42 ? '42〜45°' : a >= 39 ? '39〜42°' : a >= 30 ? '30〜39°' : '30°未満';
-        buckets.set(key, (buckets.get(key) ?? 0) + 1);
-        if (play.outcome.kind !== 'foul') fair += 1;
-        if (play.outcome.kind === 'homerun') hr += 1;
-      }
-    }
-  }
-  console.log(`${'方向の帯'.padEnd(20)}${row(['打球', '割合'])}`);
-  for (const key of ['45°以上(ファウル)', '42〜45°', '39〜42°', '30〜39°', '30°未満']) {
-    const v = buckets.get(key) ?? 0;
-    if (v === 0) continue;
-    console.log(`${key.padEnd(20)}${row([String(v), pct(v / n)])}`);
-  }
-  console.log(
-    `\n   フェアになった打球 ${pct(fair / n)}／そのうちHR ${pct(hr / Math.max(1, fair))}（HRは全打球の ${pct(hr / n)}）`,
-  );
-  console.log('   ＝**ファウルラインの上に山がある**なら、HRとファウルは投手の球速差で入れ替わる。');
-}
-
-// ============================================================
-// 5. 球場別（両翼が短い球場ほどライン際の打球が入る）
-// ============================================================
-
-console.log('\n=== 5. 球場別（速球を引っ張った打球がどれだけ入るか） ===');
-{
-  console.log(`${'球場'.padEnd(14)}${row(['両翼', '中堅', 'HR率', 'ファウル率'], 11)}`);
+  console.log(`${'球場'.padEnd(14)}${row(['両翼', '中堅', 'HR/打席', '打率'], 11)}`);
   for (const park of BALLPARKS) {
-    let n = 0;
-    let hr = 0;
-    let foul = 0;
-    for (const m of matchups()) {
-      const profile = pitchProfileOf(m.pitcher, 0);
-      const control = controlOf(m.pitcher, 0);
-      const arm = pitchArmOf(m.pitcher.throws);
-      for (const id of m.off.lineup) {
-        const b = m.off.players[id];
-        const side = batterSideOf(b.batting, m.pitcher);
-        const p = simulatePitch(
-          profile,
-          control,
-          arm,
-          { balls: 0, strikes: 0 },
-          { power: b.batting.power, average: b.batting.average },
-          side,
-          0,
-          0,
-          0,
-          SWING_AT_NORMAL,
-        );
-        if (!p.launch) continue;
-        const play = simulatePlay(p.launch, p.contactX, {
-          park,
-          runnerSpeed: runnerSpeed(b.batting.run),
-        });
-        n += 1;
-        if (play.outcome.kind === 'homerun') hr += 1;
-        if (play.outcome.kind === 'foul') foul += 1;
-      }
-    }
+    const t = tally(runStarters({ park }, REPS, 5));
     console.log(
-      `${park.name.padEnd(14)}${row(
-        [`${park.wing}m`, `${park.center}m`, pct(hr / n), pct(foul / n)],
-        11,
-      )}`,
+      `${park.name.padEnd(14)}${row([`${park.wing}m`, `${park.center}m`, pct(t.homerun / t.n), avgOf(t).toFixed(3)], 11)}`,
     );
   }
 }
 
 // ============================================================
-// 6. 既存の計測が置いていた仮定との差
+// 5. 既存の計測が置いていた仮定との差
 // ============================================================
 
-console.log('\n=== 6. 得点・HRの見積もりは何倍ずれているか（16球団平均・1試合） ===');
+console.log('\n=== 5. 得点・HRの見積もり（16球団平均・1試合） ===');
 {
   const NO_CONTACT = 0.23;
   const summarize = (label: string, timing: number | undefined) => {
@@ -449,46 +494,52 @@ console.log('\n=== 6. 得点・HRの見積もりは何倍ずれているか（16
       runs += solved.runs;
       for (let i = 0; i < lineup.length; i += 1) hr += lineup[i].homerun * solved.pa[i];
     }
-    console.log(`${label.padEnd(24)}${row([f2(runs / ROSTERS.length), f2(hr / ROSTERS.length)], 11)}`);
+    console.log(`${label.padEnd(26)}${row([f2(runs / ROSTERS.length), f2(hr / ROSTERS.length)], 11)}`);
   };
-  console.log(`${'分布の作り方'.padEnd(24)}${row(['得点/試合', 'HR/試合'], 11)}`);
+  console.log(`${'分布の作り方'.padEnd(26)}${row(['得点/試合', 'HR/試合'], 11)}`);
   summarize('一様な格子（既存の既定）', undefined);
   summarize('t=0固定（JJ-57の7段目）', 0);
 
-  // 実測＝1段目の打席をそのまま分布にする（決定的なので1人1つの帰結＝確率1の分布）
-  let runs = 0;
-  let hr = 0;
-  for (const m of matchups()) {
-    const lineup = m.off.lineup.map((id) => {
-      const r = simulateAtBat(m.pitcher, m.off.players[id].batting);
-      const d = { out: 0, single: 0, double: 0, triple: 0, homerun: 0 };
-      if (r.kind === 'inPlay') d[r.outcome!] = 1;
-      else d.out = 1;
-      return d;
-    });
-    const solved = solveLineup(lineup);
-    runs += solved.runs;
-    for (let i = 0; i < lineup.length; i += 1) hr += lineup[i].homerun * solved.pa[i];
-  }
-  console.log(
-    `${'**実測の打席（1段目）**'.padEnd(22)}${row([f2(runs / ROSTERS.length), f2(hr / ROSTERS.length)], 11)}`,
-  );
+  // 実測＝1段目の打席を打者ごとの分布にする（ぶれがあるので同じ対戦でも散る＝本物の分布）
+  const byBatter = (walkAsSingle: boolean) => {
+    const noise = swingNoiseStream(1);
+    let runs = 0;
+    let hr = 0;
+    for (const m of matchups()) {
+      const lineup: PaDistribution[] = m.off.lineup.map((id) => {
+        const d: PaDistribution = { out: 0, single: 0, double: 0, triple: 0, homerun: 0 };
+        for (let r = 0; r < REPS; r += 1) {
+          const res = simulateAtBat(m.pitcher, m.off.players[id].batting, { noise });
+          if (res.kind === 'inPlay') d[res.outcome!] += 1 / REPS;
+          else if (walkAsSingle && (res.kind === 'walk' || res.kind === 'hitByPitch')) d.single += 1 / REPS;
+          else d.out += 1 / REPS;
+        }
+        return d;
+      });
+      const solved = solveLineup(lineup);
+      runs += solved.runs;
+      for (let i = 0; i < lineup.length; i += 1) hr += lineup[i].homerun * solved.pa[i];
+    }
+    return { runs: runs / ROSTERS.length, hr: hr / ROSTERS.length };
+  };
+  const asOut = byBatter(false);
+  const asSingle = byBatter(true);
+  console.log(`${'**実測の打席**（四死球＝アウト）'.padEnd(24)}${row([f2(asOut.runs), f2(asOut.hr)], 11)}`);
+  console.log(`${'**実測の打席**（四死球＝単打）'.padEnd(24)}${row([f2(asSingle.runs), f2(asSingle.hr)], 11)}`);
   console.log('   参考：実際の野球は1チーム1試合あたり 約4.5点・HR 約1.1〜1.3本。');
-  console.log(
-    '   ※上2つは「当たった後」の格子から作った分布＝**振るかどうか**が入っていない。実測は1段目そのもの。',
-  );
+  console.log('   ※四死球は分布の語彙に無いので2通りで挟む（本当はその間＝押し出しでしか走者が進まない単打）。');
+  console.log('   AAA-75の前は 1.69点（四死球＝アウト）・HR 0.00本。');
 }
 
 // ============================================================
-// 7. 好調（D-19）とラッキー7
+// 6. 好調（D-19）とラッキー7
 // ============================================================
 
-console.log('\n=== 7. 好調の寄与（実際の打席で測る） ===');
+console.log('\n=== 6. 好調の寄与（実際の打席で測る） ===');
 {
-  const measure = (hotCount: number): { hr: number; hits: number; n: number } => {
-    let hr = 0;
-    let hits = 0;
-    let n = 0;
+  const measure = (hotCount: number) => {
+    const noise = swingNoiseStream(6);
+    const out: AtBatResult[] = [];
     for (const m of matchups()) {
       m.off.lineup.forEach((id, i) => {
         const b = m.off.players[id].batting;
@@ -498,149 +549,32 @@ console.log('\n=== 7. 好調の寄与（実際の打席で測る） ===');
           power: Math.min(1, b.power + (hot ? (HOT_MODIFIER.power ?? 0) : 0)),
           average: Math.min(1, b.average + (hot ? (HOT_MODIFIER.average ?? 0) : 0)),
         };
-        const r = simulateAtBat(m.pitcher, batting);
-        n += 1;
-        if (r.outcome === 'homerun') hr += 1;
-        if (r.outcome && r.outcome !== 'out') hits += 1;
+        for (let r = 0; r < REPS; r += 1) out.push(simulateAtBat(m.pitcher, batting, { noise }));
       });
     }
-    return { hr, hits, n };
+    return tally(out);
   };
-  console.log(`${'状態'.padEnd(20)}${row(['HR率', '安打率'], 11)}`);
+  console.log(`${'状態'.padEnd(20)}${row(['HR/打席', '打率'], 11)}`);
   for (const [label, hot] of [
     ['好調なし', 0],
     ['好調2人（D-19）', 2],
     ['全員好調（ラッキー7）', 9],
   ] as const) {
-    const r = measure(hot);
-    console.log(`${label.padEnd(20)}${row([pct(r.hr / r.n), pct(r.hits / r.n)], 11)}`);
+    const t = measure(hot);
+    console.log(`${label.padEnd(20)}${row([pct(t.homerun / t.n), avgOf(t).toFixed(3)], 11)}`);
   }
 }
 
 // ============================================================
-// 8. 原因はどこにあるか＝速球のタイミング罰を振る
+// 7. タイミングのずれによる減衰（TIMING_SPEED_PENALTY）を振る（QQ-65）
 // ============================================================
-//
-// 2〜4段目が示すのは「**速球はCPU打者に引っ張られ、その角度がファウルラインの上に
-// 乗っている**」こと。引っ張り角は `judgeSwing` の `timing × MAX_DIRECTION_DEG` で
-// 決まり、その `timing` を作っているのが `cpuBatter.ts` の
-// **CPU_FAST_TIMING_PENALTY_SEC**（セッション9で「CPUが速球を100%HRにする」対策として
-// 入れた早振り）。**罰そのものを振ると何が起きるか**を並べる＝直すならどこを触るか、の帯。
-//
-// ここだけ `cpuSwingLead` を使わず自前で lead を作る（定数を触らずに振るため）。
-
-console.log('\n=== 8. 速球のタイミング罰を振ったら（人間がど真ん中へ速球） ===');
-{
-  const timeToPlane = (f: { z: number; vz: number }): number =>
-    f.vz <= 0 ? Infinity : (CONTACT_PLANE_Z - f.z) / f.vz;
-
-  const hitOnce = (
-    speed: number,
-    penalty: number,
-    batter: { power: number; average: number },
-    side: 1 | -1,
-  ) => {
-    const fastness = Math.min(1, Math.max(0, (speed - SPEED_NEUTRAL) / (SPEED_FAST - SPEED_NEUTRAL)));
-    const lead = SWING_IDEAL_SEC + penalty * fastness;
-    let flight = createPitchFlight(0, speed, 0);
-    let swingT: number | null = null;
-    let swung = false;
-    for (let i = 0; i < 600; i += 1) {
-      const prev = flight;
-      const next = stepPitchFlight(prev, 0, SIM_DT, 0);
-      if (swingT === null && !swung && timeToPlane(prev) > lead && timeToPlane(next) <= lead) {
-        if (shouldCpuSwing(next, { balls: 0, strikes: 0 }, side, 0)) {
-          swingT = 0;
-          swung = true;
-        }
-      }
-      if (swingT !== null) {
-        const cross = contactPlaneCrossing(prev, next);
-        if (cross) {
-          const launch = judgeSwing(
-            { crossX: cross.x, swingTime: swingT + cross.frac * SIM_DT, pitchSpeed: prev.vz },
-            batter,
-            side,
-            0,
-            0,
-          );
-          if (launch) return { launch, contactX: cross.x };
-          swingT = null;
-        }
-      }
-      flight = next;
-      if (swingT !== null) swingT += SIM_DT;
-      if (next.z >= CATCH_Z) return null;
-    }
-    return null;
-  };
-
-  console.log(`${'罰(秒)'.padEnd(10)}${row(['アウト', '安打', 'HR', 'ファウル', '空振り', '平均|方向|'], 10)}`);
-  for (const penalty of [0, 0.02, 0.03, 0.045, 0.06, 0.08]) {
-    let out = 0;
-    let hits = 0;
-    let hr = 0;
-    let foul = 0;
-    let miss = 0;
-    let n = 0;
-    const dirs: number[] = [];
-    for (const m of matchups()) {
-      const speed = speedForPitchSelection(-1, m.pitcher.speed);
-      for (const id of m.off.lineup) {
-        const b = m.off.players[id];
-        const side = batterSideOf(b.batting, m.pitcher);
-        const hit = hitOnce(speed, penalty, b.batting, side);
-        n += 1;
-        if (!hit) {
-          miss += 1;
-          continue;
-        }
-        const play = simulatePlay(hit.launch, hit.contactX, {
-          runnerSpeed: runnerSpeed(b.batting.run),
-        });
-        const o = paOutcomeOf({ timing: 0, course: 0, result: play });
-        dirs.push(Math.abs(play.directionDeg));
-        if (o === null) foul += 1;
-        else if (o === 'out') out += 1;
-        else {
-          hits += 1;
-          if (o === 'homerun') hr += 1;
-        }
-      }
-    }
-    const meanDir = dirs.length ? dirs.reduce((s, d) => s + d, 0) / dirs.length : 0;
-    const mark = penalty === 0.045 ? ' ←現行' : '';
-    console.log(
-      `${penalty.toFixed(3).padEnd(10)}${row(
-        [pct(out / n), pct(hits / n), pct(hr / n), pct(foul / n), pct(miss / n), `${meanDir.toFixed(1)}°`],
-        10,
-      )}${mark}`,
-    );
-  }
-  console.log('   ファウルラインは ±45°＝**引っ張り角がその手前に乗ると、いちばん近い柵（両翼95m）へ向かう**。');
-}
-
-// ============================================================
-// 9. 直し方の帯＝タイミングのずれによる減衰（TIMING_SPEED_PENALTY）を振る
-// ============================================================
-//
-// 8段目が示すのは「**罰（CPUの早振り）1つでは良い帯が無い**」こと＝弱めればHR、強めれば
-// 何も起きない（ファウルか空振り）。**引っ張り角は罰で決まり、飛距離は打球の減衰で
-// 決まる**ので、触るなら後者のほう＝`judgeSwing` の `TIMING_SPEED_PENALTY`。
 //
 // **定数は書き換えずに測れる**：初速はこの係数に対して線形（quality の1つ目の因子）なので、
-// 打球ベクトルを比で伸縮すれば厳密に同値になる（`homerun.ts` の「球速を 2δ 下げるのと
-// 完全に同値」と同じやり方）。
-//
-// **芯（timing=0）の打球は1mmも動かない**（減衰は |timing| に比例する）＝
-// **I-29の「芯を食った当たり」もJJ-57の抗力の帯も動かさずに、外した打球だけを弱められる**。
+// 打球ベクトルを比で伸縮すれば厳密に同値になる。**芯（timing=0）の打球は1mmも動かない**。
+// 標本は**CPU打者が初球の速球を振った打球**（差し込まれる＝負のタイミング）。
 
-console.log('\n=== 9. タイミングのずれによる減衰を振ったら（速球・人間がど真ん中） ===');
+console.log('\n=== 7. タイミングのずれによる減衰を振ったら（CPU打者・初球の速球） ===');
 {
-  const timeToPlane = (f: { z: number; vz: number }): number =>
-    f.vz <= 0 ? Infinity : (CONTACT_PLANE_Z - f.z) / f.vz;
-
-  /** 現行の罰でCPUが速球を打った打球（タイミングのズレ込み）を集める */
   const samples: Array<{
     launch: { vx: number; vy: number; vz: number };
     contactX: number;
@@ -648,75 +582,50 @@ console.log('\n=== 9. タイミングのずれによる減衰を振ったら（�
     relief: number;
     run: number;
   }> = [];
+  const noise = swingNoiseStream(8);
   for (const m of matchups()) {
-    const speed = speedForPitchSelection(-1, m.pitcher.speed);
+    const profile = pitchProfileOf(m.pitcher, 0);
+    const control = controlOf(m.pitcher, 0);
+    const arm = pitchArmOf(m.pitcher.throws);
     for (const id of m.off.lineup) {
       const b = m.off.players[id];
-      const side = batterSideOf(b.batting, m.pitcher);
-      let flight = createPitchFlight(0, speed, 0);
-      let swingT: number | null = null;
-      let swung = false;
-      for (let i = 0; i < 600; i += 1) {
-        const prev = flight;
-        const next = stepPitchFlight(prev, 0, SIM_DT, 0);
-        if (swingT === null && !swung && crossesSwingDecisionPoint(prev, next)) {
-          if (shouldCpuSwing(next, { balls: 0, strikes: 0 }, side, 0)) {
-            swingT = 0;
-            swung = true;
-          }
-        }
-        if (swingT !== null) {
-          const cross = contactPlaneCrossing(prev, next);
-          if (cross) {
-            const st = swingT + cross.frac * SIM_DT;
-            const launch = judgeSwing(
-              { crossX: cross.x, swingTime: st, pitchSpeed: prev.vz },
-              { power: b.batting.power, average: b.batting.average },
-              side,
-              0,
-              0,
-            );
-            if (launch) {
-              samples.push({
-                launch,
-                contactX: cross.x,
-                timing: (st - SWING_IDEAL_SEC) / (SWING_ACTIVE_SEC / 2),
-                relief: 1 - AVG_MISHIT_RELIEF * b.batting.average,
-                run: b.batting.run,
-              });
-              break;
-            }
-            swingT = null;
-          }
-        }
-        flight = next;
-        if (swingT !== null) swingT += SIM_DT;
-        if (next.z >= CATCH_Z) break;
+      for (let r = 0; r < REPS; r += 1) {
+        const p = simulatePitch(
+          profile,
+          control,
+          arm,
+          { balls: 0, strikes: 0 },
+          { power: b.batting.power, average: b.batting.average },
+          batterSideOf(b.batting, m.pitcher),
+          0,
+          0,
+          { noise: noise.next() },
+        );
+        if (!p.launch || p.timing === null) continue;
+        samples.push({
+          launch: p.launch,
+          contactX: p.contactX,
+          timing: p.timing,
+          relief: 1 - AVG_MISHIT_RELIEF * b.batting.average,
+          run: b.batting.run,
+        });
       }
-      // timeToPlane は上の判断関数の中で使われている（読みやすさのために名前だけ残す）
-      void timeToPlane;
     }
   }
-
   console.log(`${'減衰'.padEnd(10)}${row(['平均初速', '平均飛距離', 'HR(ところざわ)', 'HR(かせんじき)', '安打', 'ファウル'], 13)}`);
-  for (const penalty of [0.3, 0.35, 0.4, 0.45, 0.5, 0.6]) {
+  const narrow = BALLPARKS.find((p) => p.name === 'かせんじき') ?? DEFAULT_BALLPARK;
+  for (const penalty of [0.3, 0.35, 0.4, 0.45]) {
     let exitSum = 0;
     let carrySum = 0;
     let hrDefault = 0;
     let hrNarrow = 0;
     let hits = 0;
     let foul = 0;
-    const narrow = BALLPARKS.find((p) => p.name === 'かせんじき') ?? DEFAULT_BALLPARK;
     for (const s of samples) {
-      // 初速は減衰の係数に対して線形＝比で伸縮すれば厳密に同値
       const ratio =
         (1 - penalty * Math.abs(s.timing) * s.relief) /
         (1 - TIMING_SPEED_PENALTY * Math.abs(s.timing) * s.relief);
-      const launch = {
-        vx: s.launch.vx * ratio,
-        vy: s.launch.vy * ratio,
-        vz: s.launch.vz * ratio,
-      };
+      const launch = { vx: s.launch.vx * ratio, vy: s.launch.vy * ratio, vz: s.launch.vz * ratio };
       const opts = { runnerSpeed: runnerSpeed(s.run) };
       const play = simulatePlay(launch, s.contactX, opts);
       const playNarrow = simulatePlay(launch, s.contactX, { ...opts, park: narrow });
@@ -728,7 +637,7 @@ console.log('\n=== 9. タイミングのずれによる減衰を振ったら（�
       if (o === null) foul += 1;
       else if (o !== 'out') hits += 1;
     }
-    const n = samples.length;
+    const n = Math.max(1, samples.length);
     const mark = penalty === TIMING_SPEED_PENALTY ? ' ←現行' : '';
     console.log(
       `${penalty.toFixed(2).padEnd(10)}${row(
@@ -744,27 +653,20 @@ console.log('\n=== 9. タイミングのずれによる減衰を振ったら（�
       )}${mark}`,
     );
   }
-  console.log('   柵までの距離：ところざわ 両翼95m／かせんじき 両翼85m（いちばん狭い）。');
-  console.log('   **芯（timing=0）の打球はどの値でも1mmも動かない**（減衰は |timing| に比例する）。');
+  console.log(`   標本 ${samples.length}本。**芯（timing=0）の打球はどの値でも1mmも動かない**（減衰は |timing| に比例する）。`);
 }
 
 // ============================================================
-// 10. 人間が芯（t=0）で捉えたら＝**テストプレイの「HRが出すぎ」の出どころ**
+// 8. 人間が芯（t=0）で捉えたら（RR-66）
 // ============================================================
-//
-// 1〜9段目は**CPU打者**（速球には早振りの罰が乗る）を測っている。**人間は自分で
-// タイミングを合わせられる**ので、上手いプレイヤーの帰結はこちら＝`judgeSwing` に
-// `SWING_IDEAL_SEC` をそのまま渡した打球。
-//
-// **CPUの初球は必ず速球**（`chooseCpuPitchPlan` は strikes===0 で 'fast'）なので、
-// 「初球を待って芯で振る」は**毎打席かならず来る確定の機会**になる。フェーズRR-66 の
-// 前は、ここが**長打力0.2の打者でも94%が本塁打**だった。
 
-console.log('\n=== 10. 人間が芯（t=0）で捉えたときの帰結 ===');
+console.log('\n=== 8. 人間が芯（t=0）で捉えたときの帰結 ===');
 {
   const perfect = (pitcher: PitcherStats, count: Count, batter: { power: number; average: number }, side: 1 | -1) => {
     const profile = pitchProfileOf(pitcher, 0);
-    const plan = chooseCpuPitchPlan(count, cpuPitcherStyle(profile), controlOf(pitcher, 0));
+    const plan = chooseCpuPitchPlan(count, cpuPitcherStyle(profile), controlOf(pitcher, 0), 0, {
+      bouncingFork: forkBounces(profile.fork),
+    });
     const offset = armReleaseOffsetX(pitchArmOf(pitcher.throws));
     const shape = planCpuPitchShape(plan, profile, undefined, offset);
     let flight = createPitchFlight(releaseXFor(shape.plateX, offset), shape.speed, 0);
@@ -776,7 +678,13 @@ console.log('\n=== 10. 人間が芯（t=0）で捉えたときの帰結 ===');
       const cross = contactPlaneCrossing(prev, next);
       if (cross) {
         const launch = judgeSwing(
-          { crossX: cross.x, swingTime: SWING_IDEAL_SEC, pitchSpeed: prev.vz },
+          {
+            crossX: cross.x,
+            swingTime: SWING_IDEAL_SEC,
+            pitchSpeed: prev.vz,
+            // 打球に乗るのは緩急ぶんだけ（BBB-85）
+            pitcherNeutral: neutralSpeedFor(profile.speed),
+          },
           batter,
           side,
           0,
@@ -830,272 +738,119 @@ console.log('\n=== 10. 人間が芯（t=0）で捉えたときの帰結 ===');
 }
 
 // ============================================================
-// 11. CPU打者の選球と空振り（フェーズSS-67）
+// 9. CPU打者が手を出す幅（SS-67 → AAA-75）
 // ============================================================
 //
-// QQ-65 が計測で見つけた構造＝**CPU打者は三振も四球もしない**（1打席1.51球で必ず
-// 打球になり、見送りは0.00球）を埋めたのが SS-67。ここが採用値の根拠。
-//
-// 触ったのは4つで、**新しい定数は1つも増えていない**：
-// (1) 罰を緩急の両側へ（`cpuSwingLead`）／(2) 追い込まれたら窓の縁まで泳ぐ／
-// (3) 手を出す幅を実際に「甘い球」へ（`ゾーン ∓ 隅の余裕`）／
-// (4) CPU投手はファウルで粘られたら反対の隅へ散らす（`foulsInAtBat`）。
+// AAA-75 で `ゾーン − 隅`（0.40）から **ゾーンいっぱい**（0.45）へ。旧値のままだと
+// 0.40〜0.45 は**振られずにストライクになる帯**＝人間の投手の見逃しストライク取り放題
+// （右の2列＝その帯を使う配球の三振率）。
 
-console.log('\n=== 11. CPU打者の選球と空振り（SS-67。手を出す幅を振る） ===');
+console.log('\n=== 9. CPU打者が手を出す幅（AAA-75。0.40〜0.45 の「振らない帯」を消した） ===');
 {
-  const widths: Array<{ label: string; normal: number }> = [
-    { label: 'ゾーン+隅（SS-67の前は 0.60）', normal: STRIKE_ZONE_HALF_WIDTH + 0.05 },
-    { label: 'ゾーンいっぱい', normal: STRIKE_ZONE_HALF_WIDTH },
-    { label: '**ゾーン-隅（採用）**', normal: SELECTIVE_HALF_WIDTH },
-    { label: 'さらに1つ内', normal: SELECTIVE_HALF_WIDTH - 0.05 },
-    { label: '投手の通常の狙いと同じ', normal: STRIKE_ZONE_HALF_WIDTH * 0.55 },
+  const widths = [
+    { label: 'ゾーン-隅（TT-68）', normal: STRIKE_ZONE_HALF_WIDTH - CORNER_MARGIN },
+    { label: '**ゾーン（採用）**', normal: SELECTIVE_HALF_WIDTH },
+    { label: 'ゾーン+隅', normal: STRIKE_ZONE_HALF_WIDTH + CORNER_MARGIN },
   ];
   console.log(
-    `${'手を出す幅'.padEnd(26)}${['幅', '三振', '四球', '死球', 'インプレー', '球数', '最長'].map((s) => s.padStart(10)).join('')}`,
+    `${'手を出す幅'.padEnd(20)}${row(['幅', '三振', '四球', '死球', '打率', 'HR', '球数', '人:Fb 三振', '人:Fb,Sm'], 10)}`,
   );
   for (const w of widths) {
-    const tally: Record<string, number> = {};
-    let pitches = 0;
-    let n = 0;
-    let longest = 0;
-    for (const m of matchups()) {
-      for (const id of m.off.lineup) {
-        const b = m.off.players[id];
-        const r = simulateAtBat(m.pitcher, b.batting, {
-          swingWidths: { normal: w.normal, twoStrike: TWO_STRIKE_HALF_WIDTH },
-        });
-        tally[r.kind] = (tally[r.kind] ?? 0) + 1;
-        pitches += r.pitches;
-        longest = Math.max(longest, r.pitches);
-        n += 1;
-      }
-    }
+    const swingWidths = { normal: w.normal, twoStrike: TWO_STRIKE_HALF_WIDTH };
+    const t = tally(runStarters({ swingWidths }));
+    const fb = runHuman(['Fb'], { swingWidths });
+    const fbsm = runHuman(['Fb', 'Sm'], { swingWidths });
     console.log(
-      `${w.label.padEnd(26)}${[
-        w.normal.toFixed(3),
-        pct((tally['strikeout'] ?? 0) / n),
-        pct((tally['walk'] ?? 0) / n),
-        pct((tally['hitByPitch'] ?? 0) / n),
-        pct((tally['inPlay'] ?? 0) / n),
-        (pitches / n).toFixed(2),
-        String(longest),
-      ]
-        .map((s) => s.padStart(10))
-        .join('')}`,
+      `${w.label.padEnd(20)}${row(
+        [
+          w.normal.toFixed(3),
+          pct(t.strikeout / t.n),
+          pct(t.walk / t.n),
+          pct(t.hitByPitch / t.n),
+          avgOf(t).toFixed(3),
+          pct(t.homerun / t.n),
+          (t.pitches / t.n).toFixed(2),
+          pct(fb.strikeout / fb.n),
+          pct(fbsm.strikeout / fbsm.n),
+        ],
+        10,
+      )}`,
     );
   }
-  console.log('   **採用（ゾーン-隅）だけが4つの帰結を同時に生む**＝1つ広いと三振も四球も0%に戻り');
-  console.log('   （投手の狙い＝0.40 を全部振ってしまう）、狭いと見送りばかりでインプレーが25%まで落ちる。');
-  console.log('   ※SS-67当時の数字（三振6.3%/四球6.3%）とは違う＝TT-68で投手の通常の狙いが 0.2475→0.40 へ');
-  console.log('   移ったので、**この幅と投手の狙いは同じ1点を挟んで向かい合っている**（幅を動かす意味も変わった）。');
-  console.log('   「最長」は**打席が終わることの回帰**＝SS-67の前は40球（上限）に張り付く打席が5件あった。');
+  console.log('   人:Fb＝ゾーンの縁の内側（0.43）へ速球を投げ続ける／人:Fb,Sm＝それとど真ん中のフォークを交互に。');
 }
 
 // ============================================================
-// 12. CPU投手の通常の球の狙い（フェーズTT-68）
+// 10. CPU投手の通常の球の狙い（TT-68）
 // ============================================================
-//
-// SS-67 が残した宿題＝**三振・四球が実際の野球の帯（22% / 8.5% / 3.9球）に届いていない**
-// （実測 6.3% / 6.3% / 2.20球）。原因は**通常の球**（`balls<3` かつ `strikes<=balls`）の
-// 狙いがゾーンのよく内側（`ゾーン半幅 × 0.55`＝0.2475）にあったことで、**CPU打者が手を
-// 出す幅（0.40）のよく内側**＝必ず振られ、その約半分がそのまま打球になっていた。
-//
-// ## 見るべき境界は2つで、その間が「見逃しストライクの帯」
-//
-// - **0.40（`SELECTIVE_HALF_WIDTH`）**＝ここを越えるとCPU打者は**見送る**
-// - **0.45（`STRIKE_ZONE_HALF_WIDTH`）**＝ここを越えると**ボール**
-//
-// 帯の幅はちょうど `CORNER_MARGIN` 1つぶん。**帰結は連続ではなく階段状に飛ぶ**
-// （制球0.5以上の投手50人は膨らみが0に切り上げられて全員この1点に載るため）。
 
-console.log('\n=== 12. CPU投手の通常の球の狙い（TT-68。ワールドXの絶対値を振る） ===');
+console.log('\n=== 10. CPU投手の通常の球の狙い（TT-68。ワールドXの絶対値を振る） ===');
 {
   const HALF = STRIKE_ZONE_HALF_WIDTH;
-  const targets: Array<{ label: string; x: number }> = [
+  const targets = [
     { label: 'ゾーン×0.55（TT-68の前）', x: HALF * 0.55 },
     { label: 'ゾーン×0.78', x: 0.35 },
-    { label: '1つ手前', x: 0.39 },
     { label: '**ゾーン-隅（採用）**', x: NORMAL_TARGET_X },
-    { label: '1つ外', x: 0.404 },
     { label: 'ゾーンの縁', x: HALF },
     { label: '決め球と同じ隅', x: TWO_STRIKE_HALF_WIDTH },
   ];
   console.log(
-    `${'通常の球の狙い'.padEnd(22)}${['狙いX', '三振', '四球', '死球', 'インプレー', '球数', '2S到達', '3B到達', '最長']
-      .map((s2) => s2.padStart(9))
-      .join('')}`,
+    `${'通常の球の狙い'.padEnd(22)}${row(['狙いX', '三振', '四球', '死球', '打率', 'HR', '球数', '2S到達', '3B到達'], 9)}`,
   );
-  for (const t of targets) {
-    const tally: Record<string, number> = {};
-    let pitches = 0;
-    let n = 0;
-    let longest = 0;
-    let twoStrike = 0;
-    let threeBall = 0;
-    for (const m of matchups()) {
-      for (const id of m.off.lineup) {
-        const b = m.off.players[id];
-        const res = simulateAtBat(m.pitcher, b.batting, { aims: { normalTarget: t.x } });
-        tally[res.kind] = (tally[res.kind] ?? 0) + 1;
-        pitches += res.pitches;
-        longest = Math.max(longest, res.pitches);
-        if (res.maxStrikes >= 2) twoStrike += 1;
-        if (res.maxBalls >= 3) threeBall += 1;
-        n += 1;
-      }
-    }
+  for (const tg of targets) {
+    const rs = runStarters({ aims: { normalTarget: tg.x } });
+    const t = tally(rs);
+    const twoStrike = rs.filter((r) => r.maxStrikes >= 2).length;
+    const threeBall = rs.filter((r) => r.maxBalls >= 3).length;
     console.log(
-      `${t.label.padEnd(22)}${[
-        t.x.toFixed(3),
-        pct((tally['strikeout'] ?? 0) / n),
-        pct((tally['walk'] ?? 0) / n),
-        pct((tally['hitByPitch'] ?? 0) / n),
-        pct((tally['inPlay'] ?? 0) / n),
-        (pitches / n).toFixed(2),
-        pct(twoStrike / n),
-        pct(threeBall / n),
-        String(longest),
-      ]
-        .map((s2) => s2.padStart(9))
-        .join('')}`,
+      `${tg.label.padEnd(22)}${row(
+        [
+          tg.x.toFixed(3),
+          pct(t.strikeout / t.n),
+          pct(t.walk / t.n),
+          pct(t.hitByPitch / t.n),
+          avgOf(t).toFixed(3),
+          pct(t.homerun / t.n),
+          (t.pitches / t.n).toFixed(2),
+          pct(twoStrike / t.n),
+          pct(threeBall / t.n),
+        ],
+        9,
+      )}`,
     );
   }
-  console.log('   実際の野球は 三振22% / 四球8.5% / 1打席3.9球（インプレーは約68%）。');
-  console.log(
-    `   境界：手を出す幅 ${SELECTIVE_HALF_WIDTH.toFixed(2)}（越えると見送る）／ゾーン ${HALF.toFixed(2)}（越えるとボール）。`,
-  );
-  console.log('   **採用（0.40）の帯は 0.3995〜0.4020 の 2.5mm しかない**＝ここが階段の1段。');
-
-  // 名鑑96人の通常の球が、その狙いでどこに落ちるか（振られる／見逃しストライク／ボール）
-  const STAFF = TEAMS.flatMap((t) => t.pitchers.map((r) => pitcherRowPitching(r)));
-  console.log(
-    `\n${'通常の球の狙い'.padEnd(22)}${['振られる', '見逃しS', 'ボール', '最大X'].map((s2) => s2.padStart(11)).join('')}`,
-  );
-  for (const t of targets) {
-    let swung = 0;
-    let called = 0;
-    let ball = 0;
-    let max = 0;
-    for (const st of STAFF) {
-      const spray = Math.max(0, cpuControlSpray(pitcherControl(st.era)));
-      const x = Math.min(t.x + spray, CPU_CONTROL_MAX_TARGET);
-      max = Math.max(max, x);
-      if (x <= SELECTIVE_HALF_WIDTH) swung += 1;
-      else if (x <= HALF) called += 1;
-      else ball += 1;
-    }
-    console.log(
-      `${t.label.padEnd(22)}${[String(swung), String(called), String(ball), max.toFixed(3)]
-        .map((s2) => s2.padStart(11))
-        .join('')}`,
-    );
+  // 名鑑96人の通常の球が、その狙いでどこに落ちるか（振られる／ボール）
+  const STAFF = TEAMS.flatMap((tm) => tm.pitchers.map((r) => pitcherRowPitching(r)));
+  let inZone = 0;
+  let max = 0;
+  for (const st of STAFF) {
+    const x = Math.min(NORMAL_TARGET_X + Math.max(0, cpuControlSpray(pitcherControl(st.era))), CPU_CONTROL_MAX_TARGET);
+    max = Math.max(max, x);
+    if (x <= SELECTIVE_HALF_WIDTH) inZone += 1;
   }
   console.log(
-    `   96人＝名鑑16球団×6人。隅の余裕（${CORNER_MARGIN.toFixed(2)}）が「見逃しSの帯」の幅そのもの。`,
+    `   採用値で名鑑96人の通常の球がゾーンに入るのは ${inZone}人（最大 ${max.toFixed(3)}）＝**階段は無くなった**（AAA-75の前は 0.40 ちょうどに50人が載っていた）。`,
   );
-  console.log('   採用値では制球0.5以上の50人が「振られる」側の縁ちょうどに載る＝そこが階段の段差。');
 }
 
 // ============================================================
-// 13. CPU打者の早振りの罰（フェーズTT-68の打者側）
+// 11. 人間のタイミングのばらつきと有効窓（UU-69）
 // ============================================================
 //
-// SS-67 は「罰を一律に上げる」案を **1打席17球・ファウルの無限打席25%** で否定したが、
-// **その計測は `foulsInAtBat`（ファウルで隅を散らす規則）を入れる前**のものだった。
-// 12段目の狙い（0.40）と組み合わせて測り直す。
+// **有効窓は「押す時刻の許容幅」そのもの**で、打球の質には一切効かない（`timing` が窓で
+// 正規化される）。押す時刻の誤差 `e` に対して接触するのは |e| <= W/2 のときだけで、
+// 正規化タイミングは `e / (W/2)`。**CPU打者のぶれ（AAA-75）の σ=40ms はこの表の
+// σ40 の列そのもの**＝CPUは平均的な人間と同じだけぶれる。
 
-console.log('\n=== 13. CPU打者の早振りの罰（TT-68。12段目の採用値と組み合わせて振る） ===');
+console.log('\n=== 11. 人間のタイミングのばらつきと有効窓（UU-69。CPU打者のσはここのσ40と同じ） ===');
 {
-  console.log(
-    `${'罰(秒)'.padEnd(22)}${['三振', '四球', '死球', 'インプレー', '球数', '得点', 'HR', '最長']
-      .map((s2) => s2.padStart(10))
-      .join('')}`,
-  );
-  const penalties: Array<{ label: string; sec: number }> = [
-    { label: 'SS-67（0.045）', sec: 0.045 },
-    { label: '下限', sec: 0.0455 },
-    { label: '**窓/3（採用）**', sec: CPU_TIMING_PENALTY_SEC },
-    { label: '上限のすぐ外', sec: 0.0475 },
-    { label: 'さらに上', sec: 0.05 },
-    { label: '窓/2（＝2ストライクの罰）', sec: SWING_ACTIVE_SEC / 2 },
-  ];
-  for (const p of penalties) {
-    const tally: Record<string, number> = {};
-    let pitches = 0;
-    let n = 0;
-    let longest = 0;
-    let runs = 0;
-    let hr = 0;
-    for (const m of matchups()) {
-      const lineup: Array<{ out: number; single: number; double: number; triple: number; homerun: number }> = [];
-      for (const id of m.off.lineup) {
-        const b = m.off.players[id];
-        const res = simulateAtBat(m.pitcher, b.batting, { swingPenalty: p.sec });
-        tally[res.kind] = (tally[res.kind] ?? 0) + 1;
-        pitches += res.pitches;
-        longest = Math.max(longest, res.pitches);
-        n += 1;
-        const d = { out: 0, single: 0, double: 0, triple: 0, homerun: 0 };
-        if (res.kind === 'inPlay') d[res.outcome!] = 1;
-        else d.out = 1;
-        lineup.push(d);
-      }
-      const solved = solveLineup(lineup);
-      runs += solved.runs;
-      for (let i = 0; i < lineup.length; i += 1) hr += lineup[i].homerun * solved.pa[i];
-    }
-    console.log(
-      `${p.label.padEnd(22)}${[
-        p.sec.toFixed(4),
-        pct((tally['strikeout'] ?? 0) / n),
-        pct((tally['walk'] ?? 0) / n),
-        pct((tally['hitByPitch'] ?? 0) / n),
-        pct((tally['inPlay'] ?? 0) / n),
-        (pitches / n).toFixed(2),
-        f2(runs / ROSTERS.length),
-        f2(hr / ROSTERS.length),
-      ]
-        .map((s2) => s2.padStart(10))
-        .join('')}${String(longest).padStart(10)}`,
-    );
-  }
-  console.log('   **無限ファウルは起きない**（最長6球）＝SS-67が否定したときの前提（罰1つでは終わらない打席が出る）は');
-  console.log('   `foulsInAtBat` で既に塞がっていた。');
-  console.log('   **上限は「CPU打線の本塁打が消えないこと」**＝0.0475以上では HR 0.00本/試合（弱い当たりしか出ない）。');
-  console.log('   0.050 まで上げると 3段目（人間の3択）の**ど真ん中のフォークが100%ファウル**になる＝');
-  console.log('   SS-67が消した「人間の投手側の支配戦略」が別の形で戻る。採用値では3段目はSS-67と完全に同じ。');
-}
-
-
-// ============================================================
-// 14. 人間のタイミングのばらつきと有効窓（テストプレイの指摘②「空振りがほぼない」）
-// ============================================================
-//
-// 1〜13段目はすべて**CPU打者**か**人間が芯（t=0）で捉えたとき**しか測っていない。
-// だが実際に画面で起きているのは**人間が押すタイミングにばらつきがある**ときの帰結で、
-// そこは一度も測られていなかった（QQ-65 が「t=0 は基準速のときの姿でしかない」と
-// 書いたのと同じ穴の、人間側の分）。
-//
-// ## 測り方（定数を1つも書き換えずに窓を振る）
-//
-// 有効窓 `W` のとき、押す時刻の誤差 `e` に対して
-// **接触するのは |e| <= W/2 のときだけ**で、そのときの正規化タイミングは `e / (W/2)`。
-// `judgeSwing` は正規化タイミングしか見ない（`timing` に畳んでから使う）ので、
-// **同じ正規化タイミングを現行の定数で作って渡せば、窓を変えたのと同じ結果になる**
-// ＝`swingWidths`（SS-67）・`aims`（TT-68）と同じ「定数を書き換えずに振る」作法。
-//
-// ばらつき σ は**人が視覚の合図に対して押すときの標準偏差**（30〜50ms が目安）。
-
-console.log('\n=== 14. 人間のタイミングのばらつきと有効窓（TT-68の後の人間の打席） ===');
-{
-  /** 正規分布の乱数は使わない＝**誤差を等間隔の格子で舐める**（決定的） */
   const ERR_STEPS = 161;
   const gauss = (x: number, sigma: number): number => Math.exp(-(x * x) / (2 * sigma * sigma));
-
-  /** CPUの配球を1球投げて、打撃面を通過するコースと球速を返す（10段目と同じ経路） */
   const pitchAt = (pitcher: PitcherStats, count: Count) => {
     const profile = pitchProfileOf(pitcher, 0);
-    const plan = chooseCpuPitchPlan(count, cpuPitcherStyle(profile), controlOf(pitcher, 0));
+    const plan = chooseCpuPitchPlan(count, cpuPitcherStyle(profile), controlOf(pitcher, 0), 0, {
+      bouncingFork: forkBounces(profile.fork),
+    });
     const offset = armReleaseOffsetX(pitchArmOf(pitcher.throws));
     const shape = planCpuPitchShape(plan, profile, undefined, offset);
     let flight = createPitchFlight(releaseXFor(shape.plateX, offset), shape.speed, 0);
@@ -1105,24 +860,22 @@ console.log('\n=== 14. 人間のタイミングのばらつきと有効窓（TT-
       const prev = flight;
       const next = stepPitchFlight(prev, shape.steerX, SIM_DT, cpuSteerAccelAt(shape, since - SIM_DT, SIM_DT));
       const cross = contactPlaneCrossing(prev, next);
-      if (cross) return { crossX: cross.x, speed: prev.vz };
+      if (cross) return { crossX: cross.x, speed: prev.vz, neutral: neutralSpeedFor(profile.speed) };
       flight = next;
       if (next.z >= CATCH_Z) return null;
     }
     return null;
   };
-
   const COUNTS_H: Array<{ label: string; count: Count }> = [
     { label: '初球の速球(0-0)', count: { balls: 0, strikes: 0 } },
     { label: '3ボールの置き球(3-0)', count: { balls: 3, strikes: 0 } },
   ];
-  const WINDOWS = [0.14, 0.12, 0.11, 0.1, 0.09, 0.08];
+  const WINDOWS = [0.14, 0.12, 0.1, 0.09, 0.08];
   const SIGMAS = [0.03, 0.04, 0.05];
-
   for (const c of COUNTS_H) {
-    console.log(`\n   ── ${c.label}（長打力0.5・ところざわ） ──`);
+    console.log(`\n   ── ${c.label}（名鑑の打線・ところざわ） ──`);
     console.log(
-      `${'有効窓'.padEnd(8)}${['押せる幅', 'σ30 空振り', 'ファウル', '安打', 'HR', 'σ40 空振り', 'ファウル', '安打', 'HR', 'σ50 空振り', 'ファウル', '安打', 'HR']
+      `${'有効窓'.padEnd(8)}${['押せる幅', 'σ30 空振り', '安打', 'HR', 'σ40 空振り', '安打', 'HR', 'σ50 空振り', '安打', 'HR']
         .map((x) => x.padStart(10))
         .join('')}`,
     );
@@ -1132,52 +885,309 @@ console.log('\n=== 14. 人間のタイミングのばらつきと有効窓（TT-
         let wt = 0;
         let whiff = 0;
         let hr = 0;
-        let foul = 0;
         let hits = 0;
         for (const m of matchups()) {
           const p = pitchAt(m.pitcher, c.count);
           if (!p) continue;
           for (const id of m.off.lineup) {
-          const b = m.off.players[id].batting;
-          for (let i = 0; i < ERR_STEPS; i += 1) {
-            // 誤差は ±3σ を等間隔で舐め、正規分布の重みを掛ける（乱数は使わない）
-            const e = (-3 + (6 * i) / (ERR_STEPS - 1)) * sigma;
-            const weight = gauss(e, sigma);
-            wt += weight;
-            if (Math.abs(e) > w / 2) {
-              whiff += weight;
-              continue;
+            const b = m.off.players[id].batting;
+            for (let i = 0; i < ERR_STEPS; i += 1) {
+              const e = (-3 + (6 * i) / (ERR_STEPS - 1)) * sigma;
+              const weight = gauss(e, sigma);
+              wt += weight;
+              if (Math.abs(e) > w / 2) {
+                whiff += weight;
+                continue;
+              }
+              const timing = e / (w / 2);
+              const launch = judgeSwing(
+                {
+                  crossX: p.crossX,
+                  swingTime: SWING_IDEAL_SEC + timing * (SWING_ACTIVE_SEC / 2),
+                  pitchSpeed: p.speed,
+                  pitcherNeutral: p.neutral,
+                },
+                { power: b.power, average: b.average },
+                batterSideOf(b, m.pitcher),
+                0,
+                0,
+              );
+              if (!launch) {
+                whiff += weight;
+                continue;
+              }
+              const play = simulatePlay(launch, p.crossX, { runnerSpeed: runnerSpeed(b.run) });
+              const o = paOutcomeOf({ timing: 0, course: 0, result: play });
+              if (play.outcome.kind === 'homerun') hr += weight;
+              if (o !== null && o !== 'out') hits += weight;
             }
-            const timing = e / (w / 2);
-            const launch = judgeSwing(
-              {
-                crossX: p.crossX,
-                swingTime: SWING_IDEAL_SEC + timing * (SWING_ACTIVE_SEC / 2),
-                pitchSpeed: p.speed,
-              },
-              { power: b.power, average: b.average },
-              batterSideOf(b, m.pitcher),
-              0,
-              0,
-            );
-            if (!launch) {
-              whiff += weight;
-              continue;
-            }
-            const play = simulatePlay(launch, p.crossX, { runnerSpeed: runnerSpeed(b.run) });
-            if (play.outcome.kind === 'homerun') hr += weight;
-            else if (paOutcomeOf({ timing: 0, course: 0, result: play }) === null) foul += weight;
-            else if (paOutcomeOf({ timing: 0, course: 0, result: play }) !== 'out') hits += weight;
-          }
           }
         }
-        cells.push(pct(whiff / wt), pct(foul / wt), pct(hits / wt), pct(hr / wt));
+        cells.push(pct(whiff / wt), pct(hits / wt), pct(hr / wt));
       }
       console.log(`${w.toFixed(2).padEnd(8)}${cells.map((x) => x.padStart(10)).join('')}`);
     }
   }
-  console.log('\n   実際の野球は**振った球の約25%が空振り**（1打席あたりでは三振22%）。');
-  console.log('   「空振り」には**窓を外した**ぶんと**バットが届かなかった**ぶんの両方が入る。');
-  console.log('   **打球の質（HR率・安打率・飛距離）は窓を変えても1mmも動かない**＝動くのは');
-  console.log('   「当たるかどうか」と「当たったときの正規化タイミングの散らばり」だけ。');
+  console.log('\n   実際の野球は**振った球の約25%が空振り**。');
+}
+
+// ============================================================
+// 12. CPU打者のぶれ σ を振る（AAA-75）
+// ============================================================
+//
+// **決定的なCPU打者には、どう規則を作っても必勝の配球が残る**（同じ球には必ず同じ結果）。
+// ぶれを大きくするほど必勝配球は薄まるが、CPU打者そのものは下手になる（空振りが増える）。
+// 右の3列＝人間の決まった配球15通りのうち、**いちばん三振を取れる形**と
+// **いちばん打たれない／打たれる形**。
+
+console.log('\n=== 12. CPU打者のぶれ σ を振る（AAA-75。採用は UU-69 の人間の σ40 と同じ） ===');
+{
+  console.log(
+    `${'σ'.padEnd(12)}${row(['三振', '四球+死球', '打率', 'HR', '球数', '空振/振'], 9)}   人の配球：最大の三振／最低の打率／最高の打率`,
+  );
+  for (const sigma of [0, 0.02, 0.03, CPU_SWING_SIGMA_SEC, 0.05]) {
+    const t = tally(runStarters({ noise: swingNoiseStream(1, sigma) }));
+    const ex = humanExtremes({ noise: swingNoiseStream(7, sigma) }, sigma === 0 ? 1 : HUMAN_REPS);
+    const mark = sigma === CPU_SWING_SIGMA_SEC ? '（採用）' : '';
+    console.log(
+      `${`${(sigma * 1000).toFixed(0)}ms${mark}`.padEnd(12)}${row(
+        [
+          pct(t.strikeout / t.n),
+          pct((t.walk + t.hitByPitch) / t.n),
+          avgOf(t).toFixed(3),
+          pct(t.homerun / t.n),
+          (t.pitches / t.n).toFixed(2),
+          pct(t.misses / Math.max(1, t.swings)),
+        ],
+        9,
+      )}   ${pct(ex.maxK.t.strikeout / ex.maxK.t.n)}(${ex.maxK.label}) / ${avgOf(ex.minAvg.t).toFixed(3)}(${ex.minAvg.label}) / ${avgOf(ex.maxAvg.t).toFixed(3)}(${ex.maxAvg.label})`,
+    );
+  }
+  console.log('   σ=0（決定的）では必ずどこかの配球で三振100%か打率.000が出る＝ぶれを入れた理由そのもの。');
+}
+
+// ============================================================
+// 13. 緩急1段のずれ（CPU_TIMING_PENALTY_SEC）を振る（AAA-75）
+// ============================================================
+//
+// 大きいほど緩急が効く（CPU打者が崩れる）が、**2段（速球↔フォーク）で窓の縁を越える**と
+// 「交互に投げるだけで空振り」が必勝配球になる。採用は窓の1/3＝2段で窓の2/3（縁の手前）。
+
+console.log('\n=== 13. 緩急1段のずれを振る（AAA-75。採用は窓の1/3＝TT-68の梯子の1段） ===');
+{
+  console.log(
+    `${'1段のずれ'.padEnd(14)}${row(['三振', '四球+死球', '打率', 'HR', '球数', '空振/振'], 9)}   人の配球：最大の三振／最低の打率／最高の打率`,
+  );
+  for (const [label, step] of [
+    ['窓の1/6', SWING_ACTIVE_SEC / 6],
+    ['窓の1/4', SWING_ACTIVE_SEC / 4],
+    ['**窓の1/3（採用）**', CPU_TIMING_PENALTY_SEC],
+    ['窓の1/2', SWING_ACTIVE_SEC / 2],
+  ] as const) {
+    const t = tally(runStarters({ paceStepSec: step }));
+    const ex = humanExtremes({ paceStepSec: step }, 4);
+    console.log(
+      `${label.padEnd(14)}${row(
+        [
+          pct(t.strikeout / t.n),
+          pct((t.walk + t.hitByPitch) / t.n),
+          avgOf(t).toFixed(3),
+          pct(t.homerun / t.n),
+          (t.pitches / t.n).toFixed(2),
+          pct(t.misses / Math.max(1, t.swings)),
+        ],
+        9,
+      )}   ${pct(ex.maxK.t.strikeout / ex.maxK.t.n)}(${ex.maxK.label}) / ${avgOf(ex.minAvg.t).toFixed(3)}(${ex.minAvg.label}) / ${avgOf(ex.maxAvg.t).toFixed(3)}(${ex.maxAvg.label})`,
+    );
+  }
+}
+
+// ============================================================
+// 14. リフレッシュレートによらないこと（AAA-75の不具合）
+// ============================================================
+//
+// **AAA-75の前、CPUのスイングは「判断したフレームの先頭から振り始めた」扱いだった**
+// （最大1フレーム早い）。遅れの量がフレームの長さそのものなので、**画面のリフレッシュ
+// レートで結果が変わった**。サブフレームで振り出すようにしたので、いまはどの刻みでも
+// 同じになる（残る差は投球の飛行の積分の誤差だけ）。「旧」は振り出しの補正を外した行。
+
+console.log('\n=== 14. リフレッシュレートによらないこと（同じぶれの系列で回す） ===');
+{
+  console.log(`${'刻み'.padEnd(18)}${row(['三振', '四球', '打率', 'HR', '球数'], 9)}`);
+  for (const [label, hz, legacy] of [
+    ['60Hz', 60, false],
+    ['120Hz', 120, false],
+    ['144Hz', 144, false],
+    ['240Hz', 240, false],
+    ['旧・60Hz', 60, true],
+    ['旧・144Hz', 144, true],
+  ] as const) {
+    const t = tally(runStarters({ dt: 1 / hz, legacyFrameStart: legacy }, 6, 11));
+    console.log(
+      `${label.padEnd(18)}${row(
+        [pct(t.strikeout / t.n), pct(t.walk / t.n), avgOf(t).toFixed(3), pct(t.homerun / t.n), (t.pitches / t.n).toFixed(2)],
+        9,
+      )}`,
+    );
+  }
+}
+
+// ============================================================
+// 15. 人間の決まった配球（AAA-75。必勝の形が無いか）
+// ============================================================
+//
+// 人間の投手が**同じ形の配球を投げ続けたら**CPU打線144人がどうなるか。1文字目＝緩急
+// （F速球 / N基準速 / Sフォーク）、2文字目＝コース（m真ん中 / c隅0.40 / bゾーンの縁の内側0.43 /
+// oボール0.60。すべて外角）。**AAA-75の前はど真ん中の速球だけで三振86%・安打0**だった。
+
+console.log(`\n=== 15. 人間の決まった配球（CPU打線144人×${HUMAN_REPS}回） ===`);
+{
+  const ex = humanExtremes();
+  console.log(`${'配球'.padEnd(12)}${row(['三振', '打率', 'HR', '四球', '球数', '空振/振'], 9)}`);
+  for (const r of ex.rows) {
+    const t = r.t;
+    console.log(
+      `${r.label.padEnd(12)}${row(
+        [
+          pct(t.strikeout / t.n),
+          avgOf(t).toFixed(3),
+          pct(t.homerun / t.n),
+          pct(t.walk / t.n),
+          (t.pitches / t.n).toFixed(2),
+          pct(t.misses / Math.max(1, t.swings)),
+        ],
+        9,
+      )}`,
+    );
+  }
+  console.log(
+    `   最大の三振 ${pct(ex.maxK.t.strikeout / ex.maxK.t.n)}（${ex.maxK.label}）／最低の打率 ${avgOf(ex.minAvg.t).toFixed(3)}（${ex.minAvg.label}）／最高の打率 ${avgOf(ex.maxAvg.t).toFixed(3)}（${ex.maxAvg.label}）`,
+  );
+  console.log('   ＝**同じ速さを続けると打たれ、速さを変えると崩せる**。どの決まった形も、毎打席は勝てない。');
+}
+
+// ============================================================
+// 16. CPU守備の追い方と、打球への反応（フェーズBBB-83）
+// ============================================================
+//
+// BBB-82 までのCPU守備は**いま球にいちばん近い野手を球へ向ける**だけで、打った瞬間に動き出して
+// いた。一斉移動は全員が同じ向きへ動くので、内野を抜けたゴロや内野の後ろに落ちた当たりを
+// 投手・遊撃手が後ろから追い、外野手は球から遠ざかるほうへ下がった＝**単打のはずの当たりが
+// 二塁打・三塁打になっていた**。BBB-83 は「いちばん早く球に触れる野手が、球と出会う点へ
+// 先回りする」（`planCpuChase`）＋「打球への反応 0.25秒」（`CPU_FIELD_REACTION_SEC`）。
+
+/** 打席の帰結に、打線ごとの得点期待（四死球＝アウト／＝単打）を添える */
+function league(opts: AtBatOptions, reps: number) {
+  const noise = swingNoiseStream(1, CPU_SWING_SIGMA_SEC);
+  const all: AtBatResult[] = [];
+  const byPower: Array<{ power: number; res: AtBatResult }> = [];
+  let lo = 0;
+  let hi = 0;
+  for (const m of matchups()) {
+    const asOut: PaDistribution[] = [];
+    const asSingle: PaDistribution[] = [];
+    for (const id of m.off.lineup) {
+      const bat = m.off.players[id].batting;
+      const a: PaDistribution = { out: 0, single: 0, double: 0, triple: 0, homerun: 0 };
+      const b: PaDistribution = { out: 0, single: 0, double: 0, triple: 0, homerun: 0 };
+      for (let r = 0; r < reps; r += 1) {
+        const res = simulateAtBat(m.pitcher, bat, { ...opts, noise });
+        all.push(res);
+        byPower.push({ power: bat.power, res });
+        if (res.kind === 'inPlay') {
+          a[res.outcome!] += 1 / reps;
+          b[res.outcome!] += 1 / reps;
+        } else {
+          a.out += 1 / reps;
+          b[res.kind === 'strikeout' ? 'out' : 'single'] += 1 / reps;
+        }
+      }
+      asOut.push(a);
+      asSingle.push(b);
+    }
+    lo += solveLineup(asOut).runs;
+    hi += solveLineup(asSingle).runs;
+  }
+  return { t: tally(all), lo: lo / ROSTERS.length, hi: hi / ROSTERS.length, byPower };
+}
+
+const LEAGUE_REPS = 24;
+const leagueRow = (label: string, r: ReturnType<typeof league>): string => {
+  const t = r.t;
+  return `${label.padEnd(30)}${row(
+    [avgOf(t).toFixed(3), pct(t.single / t.n), pct(t.double / t.n), pct(t.triple / t.n), pct(t.homerun / t.n)],
+    10,
+  )}${row([`${f2(r.lo)}〜${f2(r.hi)}`], 14)}`;
+};
+
+console.log(`\n=== 16. CPU守備の追い方と反応（BBB-83。先発16人×打線9人×${LEAGUE_REPS}回） ===`);
+{
+  console.log(`${'守備'.padEnd(30)}${row(['打率', '単打', '二塁打', '三塁打', 'HR'], 10)}${row(['得点/試合'], 14)}`);
+  const cases: Array<[string, AtBatOptions]> = [
+    ['追いかける・反応0（BBB-82まで）', { chase: 'follow', reactionSec: 0 }],
+    ['先回り・反応0', { chase: 'intercept', reactionSec: 0 }],
+    ['先回り・反応0.20', { chase: 'intercept', reactionSec: 0.2 }],
+    [`先回り・反応${CPU_FIELD_REACTION_SEC}（採用）`, {}],
+    ['先回り・反応0.30', { chase: 'intercept', reactionSec: 0.3 }],
+    ['先回り・反応0.50', { chase: 'intercept', reactionSec: 0.5 }],
+  ];
+  for (const [label, opts] of cases) console.log(leagueRow(label, league(opts, LEAGUE_REPS)));
+  // 参考：外野の定位置を原作の実測（中堅 82〜86m）の中ほどへ（×1.05＝中堅 84m。採っていない）
+  const deep = Object.fromEntries(
+    (['LF', 'CF', 'RF'] as const).map((id) => [
+      id,
+      { x: FIELDER_HOME_POSITIONS[id].x * 1.05, z: FIELDER_HOME_POSITIONS[id].z * 1.05 },
+    ]),
+  );
+  console.log(leagueRow('（参考）採用＋外野を5%深く', league({ home: deep }, LEAGUE_REPS)));
+  console.log('   実際の野球は 打率.250 / 単打14.5% / 二塁打4.5% / 三塁打0.4% / HR3.0% / 約4.5点。');
+  console.log('   ＝**先回りだけだと打率が大きく下がる**（BBB-82 の水準は守備の穴に支えられていた）。');
+  console.log('     反応の遅れを入れると、得点の水準は BBB-82 とほぼ同じまま、二塁打・三塁打が単打へ移る。');
+}
+
+// ============================================================
+// 17. 投手の立ち位置を読んで構える打者（BBB-83で見つかった穴 → BBB-84で塞いだ）
+// ============================================================
+//
+// BBB-83 まで、CPU投手の内外角は**ボール数＋ファウル数の偶奇**で決まり、投手がプレートの
+// どちら側に立つかにも必ず出ていた＝**人間の打者は投げる前に内外角が分かり、打席の中で寄れる**
+// （O-36。移動は 0.13秒で端まで届く）。しかも**寄っている打者に内角のボール球をそのまま当てて
+// いた**ので、読まずに寄り切るだけでも点が取れた。BBB-84 で**内外角は別系列から引き、立ち位置は
+// 外れる手がかり**になった（打者の外角側に立ったときだけ、`CPU_CROSS_CHANCE` の割合で内角の
+// ストライクへ逆を突く）。あわせて CPU投手は踏み込んでいる打者の体へ投げず、投げた後に踏み込んで
+// 当たった球は死球にならない。タイミングのぶれはCPU打者と同じ（σ40ms＝人間の値）。
+// 打ち方・規則ごとの帰結は `npm run balance:tell`。
+
+console.log(`\n=== 17. 投手の立ち位置を読んで構える打者（BBB-83 → BBB-84。同じ対戦×${LEAGUE_REPS}回） ===`);
+{
+  console.log(
+    `${'規則／構え方'.padEnd(30)}${row(['打率', '単打', '二塁打', '三塁打', 'HR'], 10)}${row(['得点/試合'], 14)}${row(['HR:力.6〜.8', '力.8〜'], 12)}`,
+  );
+  const clampLean = (x: number): number => Math.max(-BATTER_STANCE_RANGE, Math.min(BATTER_STANCE_RANGE, x));
+  const hrOf = (r: ReturnType<typeof league>, lo: number, hi: number): string => {
+    const rows = r.byPower.filter((x) => x.power >= lo && x.power < hi);
+    return pct(rows.filter((x) => x.res.outcome === 'homerun').length / Math.max(1, rows.length));
+  };
+  // BBB-83 まで：偶奇の規則＝立ち位置は必ず本当の側（読みは外れない）・寄っている打者にも当てる
+  const old: AtBatOptions = { sides: null, avoidCrowder: false, noAwardIfSteppedIn: false };
+  const cases: Array<[string, AtBatOptions]> = [
+    ['BBB-83まで／CPUの規則', { ...old }],
+    ['BBB-83まで／読んで寄り切る', { ...old, stanceFor: (_l, planned) => clampLean(planned) }],
+    ['BBB-83まで／いつも寄り切る', { ...old, stanceFor: () => -BATTER_STANCE_RANGE }],
+    // BBB-84：立つ側を引く＝外角側に立った球は3回に1回、内角のストライクへ来る。寄っている打者には当てない
+    ['BBB-84／CPUの規則', {}],
+    ['BBB-84／中央のまま', { stanceFor: () => 0 }],
+    ['BBB-84／立ち位置を信じる', { stanceFor: (_l, _p, tell) => clampLean(tell.shown) }],
+    ['BBB-84／いつも寄り切る', { stanceFor: () => -BATTER_STANCE_RANGE }],
+  ];
+  for (const [label, opts] of cases) {
+    const r = league(opts, LEAGUE_REPS);
+    console.log(`${leagueRow(label, r)}${row([hrOf(r, 0.6, 0.8), hrOf(r, 0.8, 1.01)], 12)}`);
+  }
+  console.log('   ＝BBB-83 までは、読んで寄り切る打者の打率が1割以上・本塁打が3倍以上（強打者は3打席に1本）。');
+  console.log('     読まずに寄り切るだけでも、内角のボール球が体に当たって一塁をもらえた（得点の上限の列）。');
+  console.log('     BBB-84 で立ち位置は外れる手がかりになり、寄っている打者には当てなくなった');
+  console.log('     ＝読まずに寄り切る打者が、立ち位置を信じる打者を上回らなくなった（打率ははっきり下）。');
+  console.log('     寄ること自体の得（中央のままより点が入る）は残っている＝打球の角度の作りの側の話');
+  console.log('     （得点は四死球をアウト〜単打へ寄せた幅。押し出しとして数えた値は `npm run balance:tell`）。');
 }

@@ -39,8 +39,11 @@ import {
   substituteBatterAt,
   substitutePitcherAt,
   withHotBatters,
+  BOUNCING_FORK_LABEL,
+  pitcherForkBouncesOf,
   type TeamRoster,
 } from '../src/core/roster';
+import { FORK_BOUNCE_MIN_RATING } from '../src/core/pitch';
 import { LUCKY_INNING } from '../src/core/condition';
 import { DEFAULT_SEED } from '../src/core/rng';
 
@@ -238,6 +241,20 @@ describe('投手カード（フェーズD-18）', () => {
       `防御率${formatEra(reliever.pitching!.era)} 救援 残り${BULLPEN_SIZE - 1}`,
     );
     expect(lines[2]).toBe('スタミナ ■■■■■■■■■■');
+  });
+
+  it('ワンバウンドするフォークを持つ投手にだけ「落ちるフォーク」の行が出る（フェーズBBB-79）', () => {
+    const roster = createTeamRoster(HOME_TEAM);
+    // 先発（Fが境目より小さい）には行そのものが出ない＝平常時のカードの高さは動かない
+    expect(pitcherForkBouncesOf(roster, roster.pitcher)).toBe(false);
+    expect(pitcherCardText(roster)).not.toContain(BOUNCING_FORK_LABEL);
+    // Fの大きい投手に代わると出る（見逃せばボールになる球＝打つ側にも投げる側にも要る材料）
+    const { roster: next } = substitutePitcherAt(roster, 0);
+    expect(next.players[next.pitcher].pitching!.fork).toBeGreaterThanOrEqual(FORK_BOUNCE_MIN_RATING);
+    expect(pitcherCardText(next).split('\n')).toContain(BOUNCING_FORK_LABEL);
+    // 疲れて変化量が落ちれば落ちなくなる＝行も消える（実際の球と同じ式から出す）
+    const max = maxPitchesFor(next.players[next.pitcher].pitching!.stamina);
+    expect(pitcherCardText(throwPitches(next, max))).not.toContain(BOUNCING_FORK_LABEL);
   });
 
   it('投球能力を持たない選手がマウンドにいても表示で止まらない（保険）', () => {

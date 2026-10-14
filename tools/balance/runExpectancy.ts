@@ -37,7 +37,14 @@ import { type SweepSample, sweep } from './sweep';
 /** 打席の帰結。ファウルは打席に数えないので現れない */
 export type PaOutcome = 'out' | HitType;
 
-export type PaDistribution = Record<PaOutcome, number>;
+/**
+ * 打席の帰結の分布。`walk`（フェーズBBB-84）は**四球・死球の確率**で、渡すと塁が詰まっている
+ * 走者だけを押し出す進塁として数える（`rules.ts` の `forceAdvanceRunners`＝試合の四球・死球・
+ * 敬遠と同じ規則）。それまでは四死球をアウトか単打のどちらかへ寄せて幅で読むしかなかった
+ * （`atBatDistribution` の `walkAs`）。**省略＝0＝従来と完全に同じ**（一様な格子の分布は
+ * フェアの打球だけが分母なので、もともと四死球を含まない）。
+ */
+export type PaDistribution = Record<PaOutcome, number> & { walk?: number };
 
 export const PA_OUTCOMES: readonly PaOutcome[] = [
   'out',
@@ -57,7 +64,8 @@ export function paOutcomeOf(sample: SweepSample): PaOutcome | null {
     case 'groundout':
       return 'out';
     case 'beatThrow':
-      return 'single';
+      // 一塁を踏んでそのまま先の塁へ行った打者走者（フェーズBBB-77）
+      return o.bases === 3 ? 'triple' : o.bases === 2 ? 'double' : 'single';
     case 'homerun':
       return 'homerun';
     case 'groundRuleDouble':
@@ -90,6 +98,8 @@ export interface DistributionOptions {
    * `sweep` の既定＝`SPEED_NEUTRAL` なので、V-43以前の計測と完全に同じ結果になる。
    */
   pitchSpeed?: number;
+  /** その球を投げた投手の基準速（`SweepOptions.pitcherNeutral`。フェーズBBB-85） */
+  pitcherNeutral?: number;
   /**
    * 投手の疲労 0..1（フェーズV-43で足した）。**打球初速に最大 `EXIT_FATIGUE_BONUS`
    * ぶんの球威が乗る**（B-11）＝疲れた投手は打たれ方の分布そのものが悪くなる。
@@ -112,6 +122,7 @@ export function distributionFor(power: number, opts: DistributionOptions = {}): 
     runnerSpeed: opts.run === undefined ? undefined : runnerSpeed(opts.run),
     steps: opts.steps ?? 10,
     pitchSpeed: opts.pitchSpeed,
+    pitcherNeutral: opts.pitcherNeutral,
     pitcherFatigue: opts.pitcherFatigue,
     timing: opts.timing,
   });
@@ -172,6 +183,11 @@ export function paValue(
     }
     const { runners, runs } = advanceOnHitRunners(runnersOfState(state), 'B', outcome);
     value += p * (runs + table[outs][stateOfRunners(runners)]);
+  }
+  const walk = dist.walk ?? 0;
+  if (walk > 0) {
+    const { runners, runs } = forceAdvanceRunners(runnersOfState(state), 'B');
+    value += walk * (runs + table[outs][stateOfRunners(runners)]);
   }
   return value;
 }
@@ -248,6 +264,11 @@ export function paScoreProb(
     const { runners, runs } = advanceOnHitRunners(runnersOfState(state), 'B', outcome);
     value += p * (runs > 0 ? 1 : table[outs][stateOfRunners(runners)]);
   }
+  const walk = dist.walk ?? 0;
+  if (walk > 0) {
+    const { runners, runs } = forceAdvanceRunners(runnersOfState(state), 'B');
+    value += walk * (runs > 0 ? 1 : table[outs][stateOfRunners(runners)]);
+  }
   return value;
 }
 
@@ -297,6 +318,18 @@ const HIT_TRANSITION: Array<Partial<Record<HitType, { state: number; runs: numbe
 
 const HIT_KINDS = ['single', 'double', 'triple', 'homerun'] as const;
 
+/**
+ * 塁状況 → 四球・死球で押し出された後の塁状況と入る点（フェーズBBB-84。`PaDistribution.walk`）。
+ * 安打と違って**詰まっている走者だけが進む**。
+ */
+const WALK_TRANSITION: Array<{ state: number; runs: number }> = Array.from(
+  { length: BASE_STATE_COUNT },
+  (_, state) => {
+    const { runners, runs } = forceAdvanceRunners(runnersOfState(state), 'B');
+    return { state: stateOfRunners(runners), runs };
+  },
+);
+
 export interface InningResult {
   /** そのイニングに入る点の期待値 */
   runs: number;
@@ -339,6 +372,13 @@ export function solveInning(lineup: readonly PaDistribution[], leadoff: number):
           runs += q * t.runs;
           nxt[outs * BASE_STATE_COUNT + t.state] += q;
           alive += q;
+        }
+        const walk = p * (dist.walk ?? 0);
+        if (walk > 0) {
+          const t = WALK_TRANSITION[state];
+          runs += walk * t.runs;
+          nxt[outs * BASE_STATE_COUNT + t.state] += walk;
+          alive += walk;
         }
         if (outs < 2) alive += out;
       }

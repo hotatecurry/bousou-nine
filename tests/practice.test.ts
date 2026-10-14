@@ -19,6 +19,7 @@ import {
   practiceHumanSide,
 } from '../src/debug/practice';
 import { DEFAULT_BALLPARK } from '../src/core/ballpark';
+import { outerWallDistance } from '../src/core/stands';
 import { stepBattedBall } from '../src/core/batting';
 import { gameMachine } from '../src/core/gameMachine';
 import { TEAMS } from '../src/core/teams';
@@ -93,13 +94,25 @@ describe('ノック（フェーズPP-64。守備モードの打球）', () => {
     expect(cycleKnock(setup, 'runners').runners).toBe(1);
   });
 
-  it('どの方向もフェアゾーンに収まる（ファウルの練習にならない）', () => {
+  it('ファウルの2方向以外はフェアゾーンに収まる', () => {
     for (let d = 0; d < KNOCK_DIRECTIONS.length; d += 1) {
+      if (KNOCK_DIRECTIONS[d].label.includes('ファウル')) continue;
       expect(Math.abs(KNOCK_DIRECTIONS[d].deg)).toBeLessThan(45);
       for (let k = 0; k < KNOCK_KINDS.length; k += 1) {
         const result = fly({ direction: d, kind: k, runners: 0 });
         expect(Math.abs(result.landingDeg)).toBeLessThan(45);
       }
+    }
+  });
+
+  it('ファウルの2方向（BBB-79）：フライはファウル地域の、壁の内側（捕れる場所）に落ちる', () => {
+    const fouls = KNOCK_DIRECTIONS.map((d, i) => ({ ...d, i })).filter((d) => d.label.includes('ファウル'));
+    expect(fouls.map((d) => Math.sign(d.deg)).sort()).toEqual([-1, 1]);
+    const flyKind = KNOCK_KINDS.findIndex((k) => k.label === 'フライ');
+    for (const d of fouls) {
+      const result = fly({ direction: d.i, kind: flyKind, runners: 0 });
+      expect(Math.abs(result.landingDeg)).toBeGreaterThan(45);
+      expect(result.distance).toBeLessThan(outerWallDistance(DEFAULT_BALLPARK, result.landingDeg));
     }
   });
 

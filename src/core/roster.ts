@@ -74,6 +74,7 @@ import {
   fatiguedBreak,
   fatiguedControl,
   fatiguedSpeed,
+  forkBounces,
 } from './pitch';
 
 export type PlayerId = string;
@@ -1461,6 +1462,29 @@ export function pitcherQualityOf(roster: TeamRoster, playerId: PlayerId): number
  */
 export function pitcherStuffOf(roster: TeamRoster, playerId: PlayerId): PitcherStuff {
   return pitcherStuff(effectivePitching(roster, playerId), fatigueOf(roster, playerId));
+}
+
+/**
+ * 画面に出す「ワンバウンドするフォークを持つ」の印（フェーズBBB-79）。HUDの投手カード・
+ * 采配メニューの継投・先発を選ぶ画面が**同じ文言**を使う＝画面をまたいでも同じものを指す。
+ */
+export const BOUNCING_FORK_LABEL = '落ちるフォーク';
+
+/**
+ * その投手のフォークは**いま**ワンバウンドするか（フェーズBBB-79）。Fの大きい投手だけで、
+ * **疲れて変化量が落ちれば落ちなくなる**（B-11の `fatiguedBreak` を通した値で決まる）。
+ *
+ * 実際に投げる球（main.ts の `currentPitchProfile` → `releasePitchFlight`）と**同じ式**
+ * ＝画面の印と、実際に跳ねるかどうかが食い違わない。見逃せばボールになる球なので、
+ * 打つ側にも投げる側にも要る材料（既存の「意思決定材料は隠さない」方針）。
+ */
+export function pitcherForkBounces(stats: PitcherStats | undefined, fatigue: number): boolean {
+  return stats !== undefined && forkBounces(fatiguedBreak(stats.fork, fatigue));
+}
+
+/** ロスターの値で引く `pitcherForkBounces`（スキル込みの F・いまの疲労） */
+export function pitcherForkBouncesOf(roster: TeamRoster, playerId: PlayerId): boolean {
+  return pitcherForkBounces(effectivePitching(roster, playerId), fatigueOf(roster, playerId));
 }
 
 /**

@@ -282,6 +282,8 @@ const PLANS: readonly { label: string; order: readonly number[] }[] = [
 ];
 
 console.log(row(['ウチテ', ...Array.from({ length: RUN_GAMES }, (_, i) => `${i + 1}シアイメ`), 'ゴウケイ失点'], 11));
+/** 打ち手ごとの合計失点（下の結論の文に、いま測った値をそのまま出す） */
+const planTotals = new Map<string, number>();
 for (const plan of PLANS) {
   // 持ち越しは投球数の形で持つ（実装と同じ）
   const carried = STAFF.map(() => 0);
@@ -304,13 +306,14 @@ for (const plan of PLANS) {
     }
   }
   console.log(row([plan.label, ...perGame, f2(total)], 11));
+  planTotals.set(plan.label, total);
 }
 console.log(
   '\n  → **エース連投がいちばん損**（ランを通した失点がもっとも多い）＝ユーザー判断どおり\n' +
     '    「毎試合エース」が支配戦略でなくなる。ここがこのフェーズの成立条件そのもの。\n',
 );
 console.log(
-  '  → そして**4人ローテが最適でもない**：3人ローテのほうが良い（37.64 vs 40.00）。\n' +
+  `  → そして**4人ローテが最適でもない**：3人ローテのほうが良い（${f2(planTotals.get('3人ローテ')!)} vs ${f2(planTotals.get('4人ローテ')!)}）。\n` +
     '    4人目は名鑑でいちばんスタミナが小さい（容量87球＝110球の試合では終盤に落ちる）ので、\n' +
     '    「1試合空けただけ（残量0.80）の good な投手」のほうが「無傷の weak な投手」より\n' +
     '    強い＝**休ませる価値と投手の質が釣り合う**（条件cを満たす回復率にした狙いどおり）。\n' +

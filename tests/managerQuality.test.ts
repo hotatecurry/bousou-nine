@@ -25,9 +25,11 @@ import {
   ratingBar,
   substitutePitcherAt,
   withCarriedFatigue,
+  BOUNCING_FORK_LABEL,
 } from '../src/core/roster';
 import { describePitcherEntry } from '../src/ui/managerMenu';
-import { teamById } from '../src/core/teams';
+import { pitcherRowPitching, teamById } from '../src/core/teams';
+import { forkBounces } from '../src/core/pitch';
 
 const TEAM = teamById('foresters');
 /** 投手陣の i 人目のID（名鑑の並び順＝C-15の約束） */
@@ -116,6 +118,18 @@ describe('采配メニューの継投（describePitcherEntry）', () => {
     const positions = TEAM.pitchers.map((_, i) => describePitcherEntry(roster, pid(i)).indexOf('●'));
     // 名鑑には2〜4文字の名前が混在しうるので、ここが揃わなければ `padName` が効いていない
     expect(new Set(positions).size).toBe(1);
+  });
+
+  it('ワンバウンドするフォークを持つ投手には「落ちるフォーク」の印が付く（フェーズBBB-79）', () => {
+    const roster = createTeamRoster(TEAM);
+    const marked = TEAM.pitchers.map((_, i) => describePitcherEntry(roster, pid(i)).endsWith(BOUNCING_FORK_LABEL));
+    // 印は「Fが境目以上」の投手とちょうど一致する（HUDの投手カード・実際の球と同じ式）
+    expect(marked).toEqual(TEAM.pitchers.map((row) => forkBounces(pitcherRowPitching(row).fork)));
+    expect(marked.some(Boolean)).toBe(true);
+    expect(marked.every(Boolean)).toBe(false);
+    // 疲れ切れば落ちなくなる＝印も消える
+    const i = marked.indexOf(true);
+    expect(describePitcherEntry(exhausted(pid(i)), pid(i))).not.toContain(BOUNCING_FORK_LABEL);
   });
 
   it('CPUが比べている3つがそのまま出る（表示と判断が食い違わない）', () => {

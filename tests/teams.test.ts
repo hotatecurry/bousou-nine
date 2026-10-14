@@ -23,6 +23,7 @@ import {
   DEFAULT_AWAY_TEAM_ID,
   DEFAULT_HOME_TEAM_ID,
 } from '../src/core/teams';
+import { REFERENCE_PITCHER_NEUTRAL, neutralSpeedFor } from '../src/core/pitch';
 import {
   BENCH_SIZE,
   BULLPEN_SIZE,
@@ -321,5 +322,29 @@ describe('16球団のバランス（フェーズB-12）', () => {
       (row) => pitcherRowPitching(row).throws === 'L',
     );
     expect(lefties.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('球速の効き方の基準にする投手（フェーズBBB-85）', () => {
+  /**
+   * 投手の球速は「基準の投手からどれだけ速いか」として効く（打球の強さには乗らない／CPU打者の
+   * 誤差には比で乗る）。**基準は名鑑の投手の平均**＝平均の投手の球は BBB-85 の前と同じになる。
+   * 名鑑の球速を大きく動かしたら、ここが落ちて `REFERENCE_PITCHER_NEUTRAL` を見直すことになる。
+   */
+  it('REFERENCE_PITCHER_NEUTRAL は名鑑96人の球速の平均の投手の基準速（±0.3m/s）', () => {
+    const speeds = TEAMS.flatMap((t) => teamById(t.id).pitchers.map((row) => pitcherRowPitching(row).speed));
+    expect(speeds.length).toBe(TEAMS.length * PITCHING_STAFF_SIZE);
+    const mean = speeds.reduce((a, b) => a + b, 0) / speeds.length;
+    expect(Math.abs(neutralSpeedFor(mean) - REFERENCE_PITCHER_NEUTRAL)).toBeLessThan(0.3);
+  });
+
+  it('名鑑の投手は基準の両側にいる（誰にとっても得、誰にとっても損、にならない）', () => {
+    const neutrals = TEAMS.flatMap((t) =>
+      teamById(t.id).pitchers.map((row) => neutralSpeedFor(pitcherRowPitching(row).speed)),
+    );
+    const faster = neutrals.filter((n) => n > REFERENCE_PITCHER_NEUTRAL).length;
+    const slower = neutrals.filter((n) => n < REFERENCE_PITCHER_NEUTRAL).length;
+    expect(faster).toBeGreaterThan(neutrals.length * 0.3);
+    expect(slower).toBeGreaterThan(neutrals.length * 0.3);
   });
 });

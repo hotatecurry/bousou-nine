@@ -11,12 +11,13 @@
  * そこで**球速には触れず、R/L と同じ「曲がりの強さ」の経路**に載せ直した。
  *
  * ここで固定するのは3つ。
- * 1. **F=0.5 は従来の `STEER_ACCEL` ちょうど**（B-8以来の基準線）
+ * 1. **F=0.5 は `STEER_ACCEL` ちょうど**（B-8以来の基準線。BBB-77 で全体が `BREAK_STRENGTH` 倍＝3割になった）
  * 2. **フォークを選んだときだけ F、それ以外は R/L**（役割が混ざっていない）
  * 3. **球速には一切効かない**（否定された設計へ戻っていないことの歯止め）
  */
 import { describe, expect, it } from 'vitest';
 import {
+  BREAK_STRENGTH,
   NEUTRAL_RATING,
   SPEED_FAST,
   SPEED_NEUTRAL,
@@ -35,9 +36,11 @@ const NEUTRAL = 0 as const;
 const FAST = -1 as const;
 
 describe('steerAccelForSelection：Fはフォークを選んだときだけ効く', () => {
-  it('基準値0.5 で従来の STEER_ACCEL（=14）ちょうど', () => {
+  it('基準値0.5 で STEER_ACCEL（＝従来の14 × BREAK_STRENGTH）ちょうど', () => {
     const base = STEER_ACCEL_MIN + STEER_ACCEL_SPAN * NEUTRAL_RATING;
-    expect(base).toBe(14);
+    // BBB-77（「球があまりにも左右に曲がりやすすぎる」）で全体を3割にした。下限と幅も同じ割合なので
+    // 名鑑の変化量どうしの比は変わらない
+    expect(base).toBeCloseTo(14 * BREAK_STRENGTH, 12);
     for (const y of [SLOW, NEUTRAL, FAST]) {
       expect(steerAccelForSelection(y, NEUTRAL_RATING, NEUTRAL_RATING)).toBe(base);
     }
@@ -125,8 +128,9 @@ describe('名鑑のFが実際にフォークの曲がりの差になる（死ん
     const accels = pitchers.map((p) => steerAccelForSelection(SLOW, p.breakRight, p.fork));
     const spread = Math.max(...accels) - Math.min(...accels);
     // 接続前はフォークもR/Lで曲がっていたので、Fの散らばりは1mmも出ていなかった。
-    // 値そのものではなく「実際に差が出ていること」を帯で守る。
-    expect(spread).toBeGreaterThan(3);
+    // 値そのものではなく「実際に差が出ていること」を帯で守る（BBB-77 で曲がり全体が3割に
+    // なったので、帯も同じ割合で縮める＝基準の加速度に対する散らばりの比は変わらない）。
+    expect(spread).toBeGreaterThan(3 * BREAK_STRENGTH);
   });
 
   it('フォークの曲がりとカーブ/シュートの曲がりが別の投手で最大になる（役割が重なっていない）', () => {

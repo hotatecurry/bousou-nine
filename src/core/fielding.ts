@@ -39,7 +39,9 @@
  */
 import type { BaseRunners, Bases, RunnerId } from './rules';
 import { PITCHER_PLATE_Z } from './pitch';
-import { type BattedBall, stepBattedBall } from './batting';
+import { type BattedBall, isFairPosition, stepBattedBall } from './batting';
+import { type Ballpark, DEFAULT_BALLPARK } from './ballpark';
+import { clampToPark, outerWallDistance } from './stands';
 
 export interface Vec2 {
   x: number;
@@ -114,8 +116,36 @@ export function runnerSpeed(run: number): number {
   const r = Math.max(0, Math.min(1, run));
   return RUNNER_SPEED_MIN + (RUNNER_SPEED_MAX - RUNNER_SPEED_MIN) * r;
 }
-/** 操作野手の移動速度 m/s */
-export const FIELDER_SPEED = 8.5;
+/**
+ * 野手の移動速度 m/s。**原作の実測（6.0）より少し速い 7.0**（フェーズBBB-85。2026-10-14
+ * ユーザー判断）。テストプレイ「守備の移動スピードが、ちょっと遅すぎる」「CPUが長打を出しすぎる」。
+ *
+ * 原作と同じ 6.0m/s でも、こちらの画面は原作より広く映す（横 約68m。原作は約44m）ので、
+ * **画面の上では原作の65%の速さ**でしか動いていなかった。7.0 で 76%。計測（人間が散らして
+ * 投げ、普通に追う守備）：CPU打線の長打 18→12%/打席・打率 .292→.232。
+ * **平均的な走者（7.5）よりは遅いまま**、いちばん遅い走者（6.8）よりは少し速い＝ボールを持って
+ * 追いかけても、ほとんどの走者には追いつけない（投げて刺す守備、は変わらない）。
+ * CPU守備は打球への反応を遅らせて釣り合いを取る（`CPU_FIELD_REACTION_SEC`）。
+ *
+ * 以下は BBB-82 の記録（原作の実測。2026-10-10 ユーザー判断：原作どおり 6.0）。
+ *
+ * 原作の守備画面（`famisuta.mp4` の1プレー）を1コマずつ測った：走者は本塁→一塁を 3.68秒
+ * ＝**7.4m/s**（こちらの基準速 7.5 とほぼ同じ）、野手は右へ 0.571ドット/フレーム・下へ
+ * 0.286ドット/フレーム＝どちらの向きも**約5.8〜6.0m/s**（画面は横 5.7〜5.9ドット/m・縦はその半分）。
+ * 斜めは両方が 0.70倍＝**斜めでも同じ速さ**（`groupMoveDirection`＝BBB-81 が直した形は原作と同じ）。
+ * ＝**原作の野手は走者より遅い**（走者の0.8倍）。
+ *
+ * それまでの 8.5m/s は「どんな俊足でも野手に追いつかれうる（挟殺が成立する）」という
+ * こちらの設計の前提（B-8）から置いた値で、原作にもとづいていなかった。その速さのせいで
+ * **深い外野フライも外野の間の打球も追いつかれ、CPU打線の打率が .086** まで落ちていた
+ * （BBB-77 がフェンス手前の見えない壁を外して表に出た）。6.0 にすると**打率 .226・得点は
+ * 1試合 2.2〜4.9点**（実際の野球は .250・4.5点）＝BBB-77 が「原作の守備を測ってから」として
+ * 残した「攻撃を戻す」の答え。
+ *
+ * **追いかけて触る守備ではなく、投げて刺す守備になる**：ボールを持って走っても走者には
+ * 追いつけない（ランダンは「その塁へ先に着く」か、止まっている走者に寄るときの手）。
+ */
+export const FIELDER_SPEED = 7.0;
 /** 送球速度 m/s */
 export const THROW_SPEED = 34;
 /** 捕球が成立する野手とボールの距離 */
@@ -429,6 +459,390 @@ export function predictLandingAt(
 
 export function predictLanding(ball: BattedBall, dtStep = 1 / 60, maxSeconds = 6): Vec2 {
   return predictLandingAt(ball, dtStep, maxSeconds).point;
+}
+
+// ---- CPU守備の追い方（フェーズBBB-83） ----
+//
+// BBB-82 までのCPU守備は**いま球にいちばん近い野手を、球（落ちる前は着地点）へ向ける**だけだった
+// （`'follow'`）。一斉移動（説明書p20）は全員が同じ向きへ動くので、内野を抜けたゴロや内野の後ろに
+// 落ちた当たりでは**投手や遊撃手が後ろから追いかけ、外野手は同じ向き＝球から遠ざかるほうへ下がった**。
+// 球が止まってから投手が拾うまで7秒前後かかり、**単打のはずの当たりが二塁打・三塁打になっていた**
+// （`npm run balance:plate`：CPU打線の単打 7.5%・二塁打 10.7%/打席）。
+//
+// 直し方は実際の野球と同じ＝**いちばん早く球に触れる野手が、球と出会う点へ先回りする**
+// （`'intercept'`）。球のこの先の通り道（`predictBallPath`）は打球の物理が決定的なので
+// 打った瞬間に分かる。人間が同じ操作（十字キーで向きを決める）でできる範囲を超えない。
+
+/** CPU守備の追い方。`'intercept'`＝先回り（BBB-83）／`'follow'`＝いちばん近い野手を球へ（BBB-82まで） */
+export type CpuChaseMode = 'intercept' | 'follow';
+
+/**
+ * 打球発生直後、捕球判定を無効にする時間（シーンと計測が共有する。それぞれが同じ値を
+ * 別々に持っていたのを BBB-83 でここへ寄せた）。全野手が捕球の候補なので、本塁のすぐ後ろの
+ * 捕手（接触点から約2.5m＝捕球半径の内側）が打った瞬間の球を「捕って」しまうのを防ぐ。
+ */
+export const CATCH_MIN_PLAY_SEC = 0.3;
+
+/**
+ * CPU守備が打球に反応して動き出すまでの秒数（フェーズBBB-83）。それまでCPUの野手は**打った
+ * その瞬間から**落下点へ走り出していた＝人間にはできない速さ。値は**既にあるCPUの反応**
+ * （`chicchaiScene.ts` の `CPU_POSSESSED_REACTION_SEC`＝確保してから送球するまで／乱闘のCPUが
+ * 相手を見る遅れ）と同じ 0.25秒＝新しい数値は持ち込んでいない。塁カバーの4人は待たずに塁へ入る
+ * （人間の守備でも自動で入る）。
+ *
+ * **先回りとこの反応はセット**（`npm run balance:plate` の16段目）：先回りだけだとCPU打線の打率は
+ * .225→.190 まで下がる（BBB-82 の水準は、投手が外野まで球を追いかける・捕れるフライの手前で
+ * 跳んで固まる、といった守備の穴に支えられていた）。0.25秒の反応を入れると**得点の水準は
+ * BBB-82 とほぼ同じ**（2.3〜5.3点/試合）まま、**単打 7.5→11.4%・二塁打 10.7→8.6%・三塁打 0.3→0%**
+ * と内訳だけが変わる。
+ *
+ * **フェーズBBB-85で 0.25→0.45**（野手の足 6.0→7.0 とセット）。野手が速くなったぶんだけ
+ * CPU守備が強くなると、こちらが打つときの安打が減る（反応 0.25 のままだと、立ち位置を読む
+ * 人間の打者で 7.5→5.7点/試合）。**遅れて動き出して速く走る**形にして、人間が打つときの水準を
+ * 保つ（0.45 で 7.8点。0.35 で 6.7・0.55 で 8.1。`npm run balance:speed` の6段目）。同じ打球を
+ * 新旧の守備で回し直すと、安打の割合は同じ（38.9→38.3%）で、ライナーが落ちやすく・フライは
+ * 捕られやすくなる。「確保→送球の反応と同じ値」ではなくなった。
+ * 人間の守備には掛からない（人間は自分の反応で動く）。
+ */
+export const CPU_FIELD_REACTION_SEC = 0.45;
+
+/** 打球のこの先の通り道の1点（`predictBallPath`） */
+export interface BallPathSample {
+  /** 渡した打球の時点からの秒数 */
+  sec: number;
+  x: number;
+  y: number;
+  z: number;
+  /** 一度でも地面に着いたか（着く前の球はスタンドの上では捕れない＝`isCatchableFly`） */
+  landed: boolean;
+}
+
+/**
+ * 打球のこの先の通り道（影のシミュレーション。`predictLandingAt` と同じく実際のボールには
+ * 触らない）。球が止まるか、球場の外へ出るか、**ファウル地域に落ちる**（そこでファウル＝
+ * プレーが終わる）か、`maxSeconds` で終わる。**最後の点は「それ以降ずっとそこにある」**として
+ * 使う（止まった球。ファウルなら落ちた所＝捕れなくても落下点へ向かう）。
+ */
+export function predictBallPath(
+  ball: BattedBall,
+  park: Ballpark = DEFAULT_BALLPARK,
+  dtStep = 1 / 60,
+  maxSeconds = 12,
+): BallPathSample[] {
+  const path: BallPathSample[] = [];
+  let b = ball;
+  let t = 0;
+  for (;;) {
+    path.push({ sec: t, x: b.x, y: b.y, z: b.z, landed: b.landing !== null });
+    if (t >= maxSeconds || b.over !== null || b.resting) break;
+    if (b.landing !== null && !isFairPosition(b.landing.x, b.landing.z)) break;
+    b = stepBattedBall(b, dtStep, park);
+    t += dtStep;
+  }
+  return path;
+}
+
+/**
+ * 先回りの見込みに使う捕球半径の余裕 m。捕球半径（`CATCH_RADIUS`）ちょうどの縁を狙うと、
+ * 球が半径の中にいるのは一瞬＝フレームの切れ目しだいで素通りする。0.2m 内側を狙えば、
+ * 球は半径の中を 2m 通る（60m/s の球でも 60Hz で2フレーム）。
+ */
+export const CPU_CHASE_REACH_MARGIN = 0.2;
+
+/** 先回りの計画（`planCpuChase`）：追う役と、球と出会う点と、その時刻 */
+export interface ChasePlan {
+  chaser: FielderId;
+  point: Vec2;
+  /** 通り道の時計（`BallPathSample.sec`）での時刻 */
+  sec: number;
+  /** その点で球を待てる余裕（m。球が来るまでに余って走れる距離。負にはならない） */
+  slack: number;
+  /**
+   * どう捕るつもりか：`'fly'`＝落ちる前に、走って手の届く所で捕る／`'dive'`＝落ちる前に、
+   * 跳び込めば届く所で捕る／`'leap'`＝落ちる前に、跳べば届く高さで捕る（どちらもファインプレイ。
+   * 投手はできない）／`'ground'`＝落ちた後の球と出会う。
+   */
+  kind: 'fly' | 'dive' | 'leap' | 'ground';
+}
+
+const CHASE_KIND_RANK: Record<ChasePlan['kind'], number> = { fly: 0, dive: 1, leap: 1, ground: 2 };
+
+/**
+ * **いちばん早く球に触れる野手**と、その野手が球と出会う点（決定的・乱数不使用。BBB-83）。
+ *
+ * 野手ごとに、通り道の上で「そこへ着くのが球より遅くない点」を探す（まっすぐ全速で向かうのが
+ * いちばん早いので、届くかどうかは距離と時間の比較だけで決まる）。
+ *
+ * **落ちる前に捕れるなら必ずそちら**（アウトになるのはノーバウンドの捕球だけ）：
+ * ①走って手の届く所（`CATCH_RADIUS`・`CATCH_MAX_HEIGHT`）で捕れる野手 → ②ファインプレイなら届く
+ * 野手（跳び込めば届く＝`FINE_PLAY_DIVE_RADIUS`／跳べば届く高さ＝`FINE_PLAY_JUMP_HEIGHT`。投手は
+ * できない）→ ③誰も間に合わなければ、落ちた後の球といちばん早く出会える野手。通り道の上で
+ * 誰も出会えなければ、球が止まる所へいちばん早く着く野手。
+ *
+ * **狙う点**：落ちる前に捕るなら、届く点のうち**いちばん余裕のある点**（＝落下点に間に合うなら
+ * 落下点のそば。捕り損ねても球は足元に落ちる）。落ちた後の球なら、届く点のうち**いちばん手前**
+ * （早く拾うほど走者が進めない）。
+ *
+ * @param nowSec 通り道の時計でのいま（打球発生からの秒数）
+ * @param pool 追う役の候補（動ける野手。既定は一斉移動の5人）
+ * @param holdSec 野手が動き出すまでの残り秒数（打球への反応。既定0＝もう動ける）
+ * @param bonusOf 野手ごとの捕球半径の上乗せ（守備範囲のスキル。`nearestCatchableFielder` と同じ）
+ */
+export function planCpuChase(
+  path: readonly BallPathSample[],
+  nowSec: number,
+  positions: Readonly<Record<FielderId, Vec2>>,
+  pool: readonly FielderId[] = CONTROLLABLE_FIELDERS,
+  park: Ballpark = DEFAULT_BALLPARK,
+  holdSec = 0,
+  bonusOf?: CatchRadiusBonus,
+): ChasePlan | null {
+  if (path.length === 0 || pool.length === 0) return null;
+  const last = path[path.length - 1];
+  // いまより先の最初の点（等間隔なので割り算で引ける）
+  const step = path.length > 1 ? path[1].sec - path[0].sec : 1;
+  const from = Math.min(
+    path.length - 1,
+    Math.max(0, Math.ceil((nowSec - path[0].sec) / step - 1e-9)),
+  );
+  /** 野手が走り出せる時刻 */
+  const goSec = nowSec + Math.max(0, holdSec);
+  let best: ChasePlan | null = null;
+  // 落ちる前に捕る計画どうしは**余裕の大きいほう**（確かに捕れるほう）、落ちた後の球と出会う
+  // 計画どうしは**早いほう**を採る
+  const better = (a: ChasePlan, b: ChasePlan | null): boolean =>
+    b === null ||
+    CHASE_KIND_RANK[a.kind] < CHASE_KIND_RANK[b.kind] ||
+    (CHASE_KIND_RANK[a.kind] === CHASE_KIND_RANK[b.kind] &&
+      (a.kind === 'ground' ? a.sec < b.sec : a.slack > b.slack));
+  for (const id of pool) {
+    const p = positions[id];
+    const bonus = Math.max(0, bonusOf?.(id) ?? 0);
+    const reach = CATCH_RADIUS + bonus - CPU_CHASE_REACH_MARGIN;
+    const canLeap = (FINE_PLAY_ELIGIBLE as readonly FielderId[]).includes(id);
+    /** この野手が落ちる前に捕れる点のうち、いちばん余裕のある点（走って手で／ファインプレイで） */
+    let fly: ChasePlan | null = null;
+    let stretch: ChasePlan | null = null;
+    let plan: ChasePlan | null = null;
+    // どの捕り方でも届かない点は飛ばす：1点進むごとに「足りない距離」が縮むのは、球の進み
+    // （水平の速さは抵抗・バウンドで減る一方なので、いまの1点ぶんが上限）と野手の走りのぶんまで
+    const widest = Math.max(CATCH_RADIUS, FINE_PLAY_DIVE_RADIUS) + bonus;
+    for (let i = from; i < path.length; ) {
+      const s = path[i];
+      const room = FIELDER_SPEED * Math.max(0, s.sec - goSec);
+      const dist = Math.hypot(s.x - p.x, s.z - p.z);
+      const short = dist - widest - room;
+      if (short > 0) {
+        const next = path[i + 1];
+        const stride = next ? Math.hypot(next.x - s.x, next.z - s.z) + FIELDER_SPEED * step : 0;
+        i += stride > 0 ? Math.max(1, Math.floor(short / stride)) : 1;
+        continue;
+      }
+      i += 1;
+      // 打った直後は誰も捕れない（`CATCH_MIN_PLAY_SEC`）
+      if (s.sec < CATCH_MIN_PLAY_SEC) continue;
+      if (s.landed) {
+        // 落ちる前に捕れるなら、落ちた後の点は見ない
+        if (fly !== null || stretch !== null) break;
+        if (s.y > CATCH_MAX_HEIGHT) continue;
+        // これより早く出会える野手がもういる（落ちた後の点は時刻順なので打ち切れる）
+        if (best !== null && (best.kind !== 'ground' || s.sec >= best.sec)) break;
+        if (dist - reach > room) continue;
+        plan = { chaser: id, point: { x: s.x, z: s.z }, sec: s.sec, slack: room - (dist - reach), kind: 'ground' };
+        break;
+      }
+      // ---- 落ちる前（アウトになるのはここだけ）。余裕は取らない＝届くかもしれないなら必ず狙う。
+      // **いちばん余裕のある点**を狙う：手前の点（いちばん早く届く点）を狙うと、わずかに
+      // 遅れただけで球に抜かれて後ろから追うことになる。落下点に間に合うなら余裕が
+      // いちばん大きいのは落下点の手前＝捕り損ねても球は足元に落ちる
+      if (s.y > (canLeap ? FINE_PLAY_JUMP_HEIGHT : CATCH_MAX_HEIGHT)) continue;
+      if (!isCatchableFly(park, s.x, s.z)) continue;
+      const point = { x: s.x, z: s.z };
+      if (s.y <= CATCH_MAX_HEIGHT) {
+        const slack = room - (dist - CATCH_RADIUS - bonus);
+        if (slack >= 0) {
+          if (fly === null || slack >= fly.slack) fly = { chaser: id, point, sec: s.sec, slack, kind: 'fly' };
+          continue;
+        }
+        // 跳び込めば届く（ダイビング。跳ぶ前の位置から `FINE_PLAY_DIVE_RADIUS`）
+        const diveSlack = room - (dist - FINE_PLAY_DIVE_RADIUS - bonus);
+        if (canLeap && diveSlack >= 0 && (stretch === null || diveSlack >= stretch.slack)) {
+          stretch = { chaser: id, point, sec: s.sec, slack: diveSlack, kind: 'dive' };
+        }
+      } else {
+        // 跳べば届く高さ（ジャンプ）
+        const slack = room - (dist - CATCH_RADIUS - bonus);
+        if (slack >= 0 && (stretch === null || slack >= stretch.slack)) {
+          stretch = { chaser: id, point, sec: s.sec, slack, kind: 'leap' };
+        }
+      }
+    }
+    plan = fly ?? stretch ?? plan;
+    if (plan === null && (best === null || best.kind === 'ground')) {
+      // 通り道の上では出会えない＝球が止まる所へ向かう
+      const need = Math.max(0, Math.hypot(last.x - p.x, last.z - p.z) - reach);
+      plan = {
+        chaser: id,
+        point: { x: last.x, z: last.z },
+        sec: Math.max(last.sec, goSec) + need / FIELDER_SPEED,
+        slack: 0,
+        kind: 'ground',
+      };
+    }
+    if (plan !== null && better(plan, best)) best = plan;
+  }
+  return best;
+}
+
+/**
+ * CPU守備の一斉移動の向き（単位ベクトル。動かないときは零ベクトル）。**シーン・見込み
+ * （`predictSecureAt`）・計測（`tools/balance/sim.ts`）が同じ1本を通る**。
+ *
+ * @param target 球（落ちる前は着地点）。`path` が無いとき（`'follow'`）と、こぼれ球のように
+ *   通り道を持たない場面で使う
+ * @param path 打球の通り道（`'intercept'`）。null なら `'follow'`
+ */
+export function cpuChaseDirection(
+  positions: Readonly<Record<FielderId, Vec2>>,
+  target: Vec2,
+  path: readonly BallPathSample[] | null,
+  nowSec: number,
+  pool: readonly FielderId[] = CONTROLLABLE_FIELDERS,
+  park: Ballpark = DEFAULT_BALLPARK,
+  epsilon = 1e-6,
+  holdSec = 0,
+  bonusOf?: CatchRadiusBonus,
+): Vec2 {
+  return cpuChase(positions, target, path, nowSec, pool, park, epsilon, holdSec, bonusOf).dir;
+}
+
+/** `cpuChaseDirection` に、先回りの計画（`'follow'` では null）を添えたもの */
+export function cpuChase(
+  positions: Readonly<Record<FielderId, Vec2>>,
+  target: Vec2,
+  path: readonly BallPathSample[] | null,
+  nowSec: number,
+  pool: readonly FielderId[] = CONTROLLABLE_FIELDERS,
+  park: Ballpark = DEFAULT_BALLPARK,
+  epsilon = 1e-6,
+  holdSec = 0,
+  bonusOf?: CatchRadiusBonus,
+): { dir: Vec2; plan: ChasePlan | null } {
+  if (pool.length === 0) return { dir: { x: 0, z: 0 }, plan: null };
+  const plan =
+    path !== null ? planCpuChase(path, nowSec, positions, pool, park, holdSec, bonusOf) : null;
+  // 動き出す前（打球への反応の間）は向きを持たない
+  if (holdSec > 0) return { dir: { x: 0, z: 0 }, plan };
+  let from: Vec2;
+  let to: Vec2;
+  if (plan !== null) {
+    from = positions[plan.chaser];
+    to = plan.point;
+  } else {
+    const movable = Object.fromEntries(pool.map((id) => [id, positions[id]])) as Record<FielderId, Vec2>;
+    from = positions[nearestFielder(target, movable)];
+    to = target;
+  }
+  const d = distance(from, to);
+  return { dir: d > epsilon ? { x: (to.x - from.x) / d, z: (to.z - from.z) / d } : { x: 0, z: 0 }, plan };
+}
+
+/**
+ * 打球を**CPU守備が実際に拾う**地点と時刻の見込み（フェーズBBB-77）。
+ *
+ * `predictLandingAt` は着地の時刻をそのまま「守備がボールを持つ時刻」としていた（X-45）が、
+ * 着地した球は転がるので、**実際に拾うのは中央値で2.55秒遅い**（`npm run balance:stretch`
+ * の3段目）。打者走者が一塁を踏んで先の塁へ行けるかはほぼこの差で決まり、着地の時刻で
+ * 見積もると CPU は一度も二塁を狙わなかった（同1・2段目）。
+ *
+ * 球の物理（`stepBattedBall`）と CPU守備の動き（塁カバー4人は塁へ／残りは目標に
+ * いちばん近い野手の向きへ一斉に＝`chicchaiScene.ts` の一斉移動）を**影で回す**＝使う情報は
+ * 守備が追いかける先と同じで、攻撃側だけが知っていることは無い。ファインプレイと
+ * ノーバウンドの捕球は見込まない（捕られた打球は先の塁どころではない）。
+ */
+export function predictSecureAt(
+  ball: BattedBall,
+  park: Ballpark = DEFAULT_BALLPARK,
+  dtStep = 1 / 60,
+  maxSeconds = 12,
+  /**
+   * 野手の出発位置（フェーズBBB-78）。省略時は守備位置（＝打球の瞬間の見込み）。
+   * プレーの途中から見込むときは**いまの野手の位置**を渡す（`shouldCpuRoundBase` の `loose`）。
+   */
+  start: Readonly<Record<FielderId, Vec2>> = FIELDER_HOME_POSITIONS,
+  /**
+   * 守備の追い方（フェーズBBB-83）。**見込みは相手の守備の動きを写す**＝CPU守備なら
+   * `'intercept'`（先回り＝`planCpuChase`）、人間の守備なら `'follow'`（いちばん近い野手を
+   * 球へ向ける＝BBB-82 までのCPU守備と同じ動き）。既定は `'follow'`。
+   */
+  chase: CpuChaseMode = 'follow',
+  /** 一斉移動の野手が動き出すまでの秒数（打球への反応。既定0）。打球の瞬間からの見込みに渡す */
+  reactionSec = 0,
+): LandingPrediction {
+  const landing = predictLandingAt(ball, dtStep).point;
+  const path = chase === 'intercept' ? predictBallPath(ball, park, dtStep, maxSeconds) : null;
+  const pos = Object.fromEntries(
+    (Object.keys(FIELDER_HOME_POSITIONS) as FielderId[]).map((id) => [id, { ...start[id] }]),
+  ) as Record<FielderId, Vec2>;
+  let b = ball;
+  let t = 0;
+  while (t < maxSeconds && b.over === null) {
+    for (const [id, base] of Object.entries(BASE_COVER_ASSIGNMENTS) as Array<[FielderId, BaseKey]>) {
+      const p = pos[id];
+      const to = BASE_POSITIONS[base];
+      const d = distance(p, to);
+      if (d > 1e-6) {
+        const step = Math.min(FIELDER_SPEED * dtStep, d);
+        p.x += ((to.x - p.x) / d) * step;
+        p.z += ((to.z - p.z) / d) * step;
+      }
+    }
+    const dir = cpuChaseDirection(
+      pos,
+      b.landing !== null ? { x: b.x, z: b.z } : landing,
+      path,
+      t,
+      CONTROLLABLE_FIELDERS,
+      park,
+      1e-6,
+      Math.max(0, reactionSec - t),
+    );
+    for (const id of CONTROLLABLE_FIELDERS) {
+      pos[id].x += dir.x * FIELDER_SPEED * dtStep;
+      pos[id].z += dir.z * FIELDER_SPEED * dtStep;
+      clampToPark(park, pos[id]);
+    }
+    // 先回り（CPU守備）の見込みは**落ちる前に捕る**ところまで写す：捕れる飛球を狙って走った野手は
+    // 落ちた後の球を追う位置にいないので、捕球を見込まないと「抜けた」ことになってしまう。
+    // `'follow'`（人間の守備の見込み。BBB-77）は従来どおり落ちた後だけを見る
+    const air = path !== null && t >= CATCH_MIN_PLAY_SEC && isCatchableFly(park, b.x, b.z);
+    const ground = b.landing !== null && (path === null || t >= CATCH_MIN_PLAY_SEC);
+    if (ground || (b.landing === null && air)) {
+      const catcher = nearestCatchableFielder(pos, { x: b.x, z: b.z }, b.y);
+      if (catcher !== null) return { point: { ...pos[catcher] }, sec: t };
+    }
+    b = stepBattedBall(b, dtStep, park);
+    t += dtStep;
+  }
+  return { point: { x: b.x, z: b.z }, sec: t };
+}
+
+/**
+ * 飛球（まだ一度も地面に着いていない打球）を**捕れる場所**か（フェーズBBB-79）。
+ *
+ * 実際の野球（説明書p32「実際の野球のルールに、できるだけ合わせてあります」）と同じく、
+ * **ファウル地域でもノーバウンドで捕ればアウト**（ファウルフライ）。それまでは v1 の割り切りで
+ * フェアの上の飛球しか捕らなかった＝テストプレイ「ライト方向のファウルフライの落下点に
+ * CPUの野手がいたのに、捕らずにファウルになった」。
+ *
+ * 捕れないのは**スタンドに入った球**だけ＝外周の壁（`outerWallDistance`：外野はフェンス、
+ * ファウル地域は柵）より外。打球の物理はファウル地域の柵を知らない（球は柵を抜けて
+ * スタンドの下の地面に落ちる）ので、壁の外の球を捕らせると「客席に入った球を捕る」に
+ * なってしまう。フェアの球はフェンスの内側にいる間は必ず壁の内側なので、**フェアの飛球の
+ * 捕球はこれまでとまったく同じ**。
+ */
+export function isCatchableFly(park: Ballpark, x: number, z: number): boolean {
+  return Math.hypot(x, z) < outerWallDistance(park, (Math.atan2(x, -z) * 180) / Math.PI);
 }
 
 /**
@@ -1096,6 +1510,32 @@ export function chooseCpuHoldRelease(
 export const FLY_CATCH_RELEASE_SEC = 1.5;
 
 /**
+ * **地面の打球を拾ってから、送球できるようになるまでの時間**（持ち替え。秒。フェーズBBB-82）。
+ *
+ * フライの捕球（`FLY_CATCH_RELEASE_SEC`）・盗塁の捕手（`STEAL_CATCH_RELEASE_SEC`）には
+ * 持ち替えがあるのに、**ゴロ・転がる球を拾ったときだけは拾った瞬間に投げられた**
+ * （外野の奥からでも本塁へ3秒弱＝「人間の目には還れそう」でも走者は止まるしかなかった）。
+ * 2026-10-10 ユーザー判断「送球は映像なしで遅くする」を、**飛ぶ速さ（`THROW_SPEED`）ではなく
+ * ここで**入れた：
+ *
+ * - **飛ぶ速さを下げる案は計測が退けた**：盗塁・けん制・犠飛の境界（どれも `THROW_SPEED` の
+ *   関数で、それぞれ実機で合わせてある）が全部動くうえ、打率はほとんど動かず（.224→.227）、
+ *   増えるのは三塁打（実機の計測：34→28m/s で 1〜3本→6〜7本/54本）だった。
+ * - **0.35秒は BBB-81 の「人間の守備に見込む反応の遅れ」と同じ値**（ドロップキックの警告の
+ *   「人が反応して、塁の方向を入れて K を押すのに要る時間」）。BBB-81 はそれを**CPU走者の
+ *   見込みにだけ**足していた。持ち替えを入れたうえでその見込みも残すと二重に数えることになり、
+ *   拾う前から塁を決めてすぐ投げる守備に走者が刺された（実機の計測：4回/90プレー）ので、
+ *   **見込みのほうをやめて、守備そのものの時間にした**。人間は持ち替えの
+ *   間に塁を決められ（押した送球は予約される）、CPU守備の反応（0.25秒）もこの中に収まる＝
+ *   **攻守どちらが人間でも同じ時間で投げる**。CPU走者は従来どおり「完璧な守備に勝てるとき
+ *   だけ」走り、それで刺されない（同じ計測で 0回）。
+ * - 内野ゴロのアウトはほぼ動かない（78.9%→78.7%）。
+ *
+ * 塁で送球を受けた野手の投げ継ぎには掛からない（併殺の送球は従来どおり）。
+ */
+export const PICKUP_RELEASE_SEC = 0.35;
+
+/**
  * 従来のCPUのタッチアップの境界（本塁からの捕球深度 m）。**フェーズS-40で走力を
  * 見る時間の比較（下記）に置き換えたが、基準速の走者ではこの深さと一致する**
  * ＝平均的な走者のタッチアップの手触り（A-2で実機調整した犠牲フライの分岐点）は不変。
@@ -1212,8 +1652,25 @@ export function cpuExtraBaseSlack(opts: {
 }): number {
   const to = BASE_POSITIONS[advancedBase(opts.from)];
   const runSec = distance(BASE_POSITIONS[opts.from], to) / Math.max(0.1, opts.speed);
-  const defenseSec = opts.secureSec + distance(opts.securePoint, to) / THROW_SPEED;
+  const defenseSec = opts.secureSec + PICKUP_RELEASE_SEC + distance(opts.securePoint, to) / THROW_SPEED;
   return runSec - defenseSec;
+}
+
+/**
+ * 人間の守備の「全員が同じ方向へ一斉移動」（説明書p20）の向き。十字キーの入力（x: 右が正／
+ * y: 上が正）を、フィールドの向き（上＝外野＝-Z）の**単位ベクトル**にして返す。
+ *
+ * **斜めでも速さは同じ**（フェーズBBB-81）。それまでシーン側は上下・左右の入力をそのまま
+ * 足していたので、**斜めに動かすと野手が 1.41倍（12m/s）で走っていた**。野手の足 8.5m/s は
+ * この守備モデルの前提（走力の上限 8.2m/s より少しだけ速い＝挟殺が成立する。CLAUDE.md⑥）で、
+ * CPU守備（落下点へまっすぐ走る）も、CPU走者の見込み（`predictSecureAt`）も、計測の土台も
+ * 8.5m/s で動いている＝**人間の守備だけが見込みより速かった**。実機の計測では、
+ * 「間に合う」と正しく見て走ったCPU走者が、その速さのぶんで刺されていた（90プレーで3回→0回）。
+ */
+export function groupMoveDirection(padX: number, padY: number): Vec2 {
+  const len = Math.hypot(padX, padY);
+  if (len === 0) return { x: 0, z: 0 };
+  return { x: padX / len, z: -padY / len };
 }
 
 /**
@@ -1369,13 +1826,36 @@ export const CPU_LEAD_UNDER_SEC = 0.09;
 export const CPU_LEAD_AGGRESSIVE = 5.2;
 export const CPU_LEAD_CAUTIOUS = 3.6;
 
+/**
+ * ## フェーズBBB-81：刺される深さまで出るのは「次の球で走るつもりの走者」だけ（`stealing`）
+ *
+ * テストプレイ「けん制した時に、別にランナーが進もうとしていないのに普通にアウトになったり
+ * していて、そこは明らかに不自然」。上の規則（一・二塁の走者は**全員**、刺される深さまで
+ * 出る）は「投手側にタイミングの遊びを作る」ためのものだったが、守備の側から見ると
+ * **走者が出るたびに、2秒待って投げるだけでアウトが1つ取れた**（走る気の無い鈍足でも）。
+ * II-56・JJ-57 が人間の走者について決めたこと（**押さなければけん制は必ずセーフ／
+ * 走ろうとした走者だけがけん制される**）の、CPU走者の側の対。
+ *
+ * - **走るつもりの走者**（`stealing`＝その時点の `chooseCpuSteals` の答え。R-39＝俊足だけ）は
+ *   従来どおり刺される境界を `CPU_LEAD_OVER_SEC` 踏み越す＝**けん制が効く**。深いリードは
+ *   そのまま盗塁のスタート位置になる（L-32）ので、リスクとリターンが同じ1つの動きの上にある。
+ * - **走るつもりの無い走者**は、三塁走者と同じく境界の `CPU_LEAD_UNDER_SEC` 手前で止まる＝
+ *   **どのタイミングで投げても必ずセーフ**。
+ *
+ * 「走るつもりか」は新しい状態を持たない＝呼び出し側が `chooseCpuSteals`（次の球で実際に
+ * 走るかを決める関数そのもの）の答えを渡すだけなので、**深く出た走者は次の球で本当に走る**。
+ * 守備側は走力のバー（FF-53）と出た深さから読める。`stealing` を渡さない呼び出しは
+ * 従来（踏み越す）と同じ値を返す（計測 `balance:identity` の5段目の基準線）。
+ */
 export function cpuLeadDistance(
   from: 'first' | 'second' | 'third',
   speed: number = RUNNER_SPEED,
   pitcherPos: Vec2 = FIELDER_HOME_POSITIONS.P,
+  stealing = true,
 ): number {
   const boundary = pickoffOutLead(from, pitcherPos, speed);
-  const margin = (from === 'third' ? -CPU_LEAD_UNDER_SEC : CPU_LEAD_OVER_SEC) * Math.max(0.1, speed);
+  const over = from !== 'third' && stealing;
+  const margin = (over ? CPU_LEAD_OVER_SEC : -CPU_LEAD_UNDER_SEC) * Math.max(0.1, speed);
   // 人間の上限を超えて出ることはない（同じ画面に並ぶので、CPUだけ深く出られると読めない）
   return Math.max(0, Math.min(MAX_LEAD, boundary + margin));
 }
@@ -1658,6 +2138,189 @@ export interface RunnerCommand {
   kind: 'send' | 'resume' | 'hold';
   /** 対象の走者（`send` は仕掛ける走者の塁、`resume`/`hold` は走行中の走者の起点） */
   from: ForcedFrom[];
+  /**
+   * `send` のとき、**いま向かっている塁を踏んでそのまま次の塁へ**向かう走者の起点
+   * （フェーズBBB-77。`chooseStretchRunners`）。空なら従来どおりの `send`。
+   */
+  stretch?: ForcedFrom[];
+}
+
+// ---- 塁を踏んでそのまま次の塁へ（フェーズBBB-77。説明書p16「+で進塁する塁を指定しB」） ----
+//
+// それまで**野手が拾った打球では、打者走者は一塁で、押し出された走者は1つ先の塁で必ず
+// 止まっていた**（`finalizePlay` の「欲張り進塁は対象外」）。二塁打・三塁打は**誰も拾えない
+// まま止まった打球を距離で分類する**経路（`fallbackHit`）からしか出ず、しかもその大半は
+// **野手がフェンスまで行けない不具合（98mの見えない壁）**が作っていた。壁を外すと
+// CPU打線の長打は 6.4% → 0% になった（`npm run balance:plate`）。
+//
+// そこで**走者が「いま向かっている塁を踏んで、止まらずに次の塁へ」行けるようにする**
+// （2026-10-07 ユーザー判断：人間は十字キー＋J、CPUは打球の瞬間に判断）。
+// - **最初の塁まではフォースのまま**（踏む前に送球されれば従来どおり刺される＝内野ゴロで
+//   押しても得にならない）。**踏んだ先の区間はタッチプレー**（その先へ押し出す走者はいない）。
+// - 先の塁に**留まる走者がいれば行けない**（前の走者も一緒に先へ行くなら空く）。
+
+/** 先の塁へ向かえるかを決めるのに要る、走者1人ぶんの情報（`chooseStretchRunners` 用） */
+export interface StretchCandidate {
+  /** その走者の起点（打者走者は 'batter'）＝識別子 */
+  from: ForcedFrom;
+  /** このままなら最後にいる塁（走っているなら向かっている塁、塁上ならその塁） */
+  to: BaseKey;
+  /** いまフォースで走っている（打者走者と、打者に押し出された走者） */
+  forced: boolean;
+  /** いま先の塁へ向かえる状態か（刺された・帰塁中・止まっている・行き過ぎ・転倒を除いた残り） */
+  canStretch: boolean;
+}
+
+/** 塁の並び（本塁に近いほど大きい）。前の走者から順に見るのに使う */
+function baseRank(base: BaseKey): number {
+  return base === 'home' ? 4 : base === 'third' ? 3 : base === 'second' ? 2 : 1;
+}
+
+/**
+ * J で**いま向かっている塁を踏んでそのまま次の塁へ**向かう走者（フェーズBBB-77）。
+ *
+ * - **塁を指定したとき**は、次の塁がその塁になる走者1人だけ（`chooseSendRunners` と同じ
+ *   「その塁へ進む走者」）。
+ * - **指定しないとき**は、**フォースで走っている走者全員**（打者走者と押し出された走者）。
+ *   自分で仕掛けた走者（盗塁・進塁・タッチアップ）は含めない＝その走者への無指定の J は
+ *   従来どおり「止まる」（フェーズN-34）のまま。
+ *
+ * 次の塁に**留まる走者がいれば行けない**。前の走者から順に見るので、前の走者も一緒に
+ * 先へ行けばその塁は空く（一・二塁の長打で全員が1つずつ余分に進める）。
+ */
+export function chooseStretchRunners(
+  candidates: readonly StretchCandidate[],
+  destination: BaseKey | null,
+): ForcedFrom[] {
+  const order = [...candidates].sort((a, b) => baseRank(b.to) - baseRank(a.to));
+  const taken = new Set<BaseKey>();
+  const chosen: ForcedFrom[] = [];
+  for (const c of order) {
+    if (c.to === 'home') continue; // もう還っている
+    const next = advancedBase(c.to);
+    const wants =
+      c.canStretch && (destination === null ? c.forced : next === destination);
+    if (wants && (next === 'home' || !taken.has(next))) {
+      chosen.push(c.from);
+      if (next !== 'home') taken.add(next);
+      continue;
+    }
+    taken.add(c.to);
+  }
+  return chosen;
+}
+
+/** CPUが先の塁を狙うかを決めるのに要る、走者1人ぶんの情報（`chooseCpuStretches` 用） */
+export interface CpuStretchCandidate extends StretchCandidate {
+  /** いまいる位置（打球の瞬間＝打者走者は本塁、塁上の走者はリードを取った位置） */
+  start: Vec2;
+  /** その走者の足 m/s */
+  speed: number;
+}
+
+/**
+ * CPU攻撃側が**塁を踏んでそのまま次の塁へ**行くか（フェーズBBB-77。決定的・乱数不使用）。
+ * 返すのは走者ごとの**余分に進む塁の数**（0＝いま向かっている塁で止まる）。
+ *
+ * 物差しは X-45（`chooseCpuExtraBases`）とまったく同じ＝**打球の瞬間に、着地点の予測から
+ * 見積もった守備の時間**（確保までの秒＋そこから目標の塁への送球）と、走者がそこへ着く
+ * 時間を比べ、**完璧な送球に対して `CPU_TAG_UP_MARGIN_SEC`（0.14秒）以上の余白**が
+ * あるときだけ行く（新しい自由変数は無い）。1つ先が行けたらもう1つ先も同じ物差しで見る
+ * （三塁打・一塁走者の生還）。
+ *
+ * **前の走者から順に見る**＝前の走者が止まる塁へは後ろの走者は行かない
+ * （`chooseCpuTagUp`・`chooseCpuExtraBases` の連鎖と同じ）。
+ */
+export function chooseCpuStretches(
+  candidates: readonly CpuStretchCandidate[],
+  opts: { securePoint: Vec2; secureSec: number; margin?: number },
+): Map<ForcedFrom, number> {
+  const margin = opts.margin ?? CPU_TAG_UP_MARGIN_SEC;
+  const order = [...candidates].sort((a, b) => baseRank(b.to) - baseRank(a.to));
+  const taken = new Set<BaseKey>();
+  const result = new Map<ForcedFrom, number>();
+  for (const c of order) {
+    let at = c.to;
+    let extra = 0;
+    if (c.canStretch && at !== 'home') {
+      let run = distance(c.start, BASE_POSITIONS[at]);
+      while (at !== 'home') {
+        const next = advancedBase(at);
+        if (next !== 'home' && taken.has(next)) break;
+        const leg = distance(BASE_POSITIONS[at], BASE_POSITIONS[next]);
+        const runSec = (run + leg) / Math.max(0.1, c.speed);
+        const defenseSec =
+          opts.secureSec + PICKUP_RELEASE_SEC + distance(opts.securePoint, BASE_POSITIONS[next]) / THROW_SPEED;
+        if (runSec - defenseSec > -margin) break;
+        run += leg;
+        at = next;
+        extra += 1;
+      }
+    }
+    result.set(c.from, extra);
+    if (at !== 'home') taken.add(at);
+  }
+  return result;
+}
+
+/**
+ * 守備のボールがいまどうなっているか（フェーズBBB-78。CPU走者が「いま塁を回るか」を決める材料）。
+ *
+ * - `held`：野手が持っている（`delaySec`＝まだ投げられない残り。ふつうは0）
+ * - `throw`：送球が飛んでいる（受けるのは `target` の塁の野手）
+ * - `loose`：誰も持っていない＝地面を転がっている・止まっている（`secure`＝**いまの野手の
+ *   位置から、守備が最善に追って拾う**までの見込み＝`predictSecureAt` に今の位置を渡したもの）
+ */
+export type DefenseBallState =
+  | { kind: 'held'; carrier: Vec2; delaySec: number }
+  | { kind: 'throw'; target: BaseKey; remainingSec: number }
+  | { kind: 'loose'; secure: LandingPrediction };
+
+/** 守備がボールを `base` へ届けるまでの見込み秒（いまから。送球は `THROW_SPEED`） */
+export function defenseSecToBase(state: DefenseBallState, base: BaseKey): number {
+  const to = BASE_POSITIONS[base];
+  switch (state.kind) {
+    case 'held':
+      return state.delaySec + distance(state.carrier, to) / THROW_SPEED;
+    case 'throw':
+      return state.remainingSec + distance(BASE_POSITIONS[state.target], to) / THROW_SPEED;
+    case 'loose':
+      return state.secure.sec + PICKUP_RELEASE_SEC + distance(state.secure.point, to) / THROW_SPEED;
+  }
+}
+
+/**
+ * CPU走者が、**いま踏んだ（またはいま立っている）塁から次の塁へ行くか**（フェーズBBB-78。
+ * 決定的・乱数不使用）。実際の野球の三塁コーチの「回せ／止まれ」にあたる。
+ *
+ * テストプレイ「（こちらが守備のとき）2塁ランナーが明らかにホームに進塁できる状況なのに、
+ * 3塁まで進んでストップした」。それまでCPU走者がどこまで行くかは**打球の瞬間**にしか
+ * 決めず（X-45・BBB-77）、その見込みは**CPU守備の最善の動き**（打った瞬間に落下点へ
+ * 走り出す）を前提にしていた。人間の守備はそれより遅いので、三塁を踏んだ時点でボールが
+ * まだ外野を転がっていても、打球の瞬間の判断のまま止まっていた（踏んだ塁で当て直すのは
+ * 「止める」側＝BBB-77の `shouldCpuHoldUpAtBase` だけだった）。
+ *
+ * 物差しは X-45・BBB-77 とまったく同じ＝**守備がボールを次の塁へ届けるまでの見込み
+ * （`defenseSecToBase`）より、走者が `CPU_TAG_UP_MARGIN_SEC` 以上早く着くなら行く**
+ * （新しい自由変数は無い）。違うのは**見込みを「いま」の状況から出す**ことだけ＝ボールを
+ * 持っていれば送球の時間、飛んでいれば残りと投げ継ぎ、転がっていれば**いまの野手の位置から
+ * 最善に追って拾う時間**。守備が最善に動いた場合の見込みなので、**人間の守備が遅れた
+ * ぶんだけ走者が得をし、守備が最善なら打球の瞬間の判断と同じ結論になる**（攻撃側だけが
+ * 知っている情報は無い）。
+ */
+export function shouldCpuRoundBase(opts: {
+  /** 走者のいまの位置（踏んだ瞬間なら、ほぼその塁） */
+  runner: Vec2;
+  /** いま踏んだ（立っている）塁 */
+  base: 'first' | 'second' | 'third';
+  speed: number;
+  defense: DefenseBallState;
+  margin?: number;
+}): boolean {
+  const margin = opts.margin ?? CPU_TAG_UP_MARGIN_SEC;
+  const next = advancedBase(opts.base);
+  const runSec = distance(opts.runner, BASE_POSITIONS[next]) / Math.max(0.1, opts.speed);
+  return runSec - defenseSecToBase(opts.defense, next) <= -margin;
 }
 
 /**
@@ -1680,9 +2343,18 @@ export function chooseRunnerCommand(
   sendable: ReadonlyArray<'first' | 'second' | 'third'>,
   running: readonly RunningLeg[],
   destination: BaseKey | null,
+  /**
+   * 塁を踏んでそのまま次の塁へ向かえる走者（フェーズBBB-77。`chooseStretchRunners`）。
+   * **「走れ」の側に入る**＝これがいる間は J は止まる指示にならない（N-34の順番のまま）。
+   * 省略時は空＝BBB-77より前とまったく同じ。
+   */
+  stretchable: readonly StretchCandidate[] = [],
 ): RunnerCommand | null {
   const send = chooseSendRunners(sendable, destination);
-  if (send.length > 0) return { kind: 'send', from: send };
+  const stretch = chooseStretchRunners(stretchable, destination);
+  if (send.length > 0 || stretch.length > 0) {
+    return stretch.length > 0 ? { kind: 'send', from: send, stretch } : { kind: 'send', from: send };
+  }
   const matching = running.filter((leg) => destination === null || leg.to === destination);
   const resume = matching.filter((leg) => leg.holding);
   if (resume.length > 0) return { kind: 'resume', from: resume.map((leg) => leg.from) };

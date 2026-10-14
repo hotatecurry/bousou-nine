@@ -129,13 +129,21 @@ export function practiceFoeLoadout(setup: BrawlPracticeSetup): FighterLoadout {
 // 打ち出しは `createBattedBall`＝**打撃とまったく同じ純粋関数**を通す（デバッグ専用の
 // 打球を作らない）ので、飛行・バウンド・フェンス・守備の帰結は本番と完全に同じ。
 
-/** ノックの方向（度。0=中堅／負=左翼側／正=右翼側。±45°がファウルライン） */
+/**
+ * ノックの方向（度。0=中堅／負=左翼側／正=右翼側。±45°がファウルライン）。
+ *
+ * **最後の2つはファウル地域**（フェーズBBB-79）。ファウルフライも捕ればアウトになったので
+ * （`isCatchableFly`）、ライン際の外へ上がるフライを追って捕る練習・確認ができる。
+ * フライで打てば外野手が追いつける距離・壁の内側に落ちる（`tests/practice.test.ts`）。
+ */
 export const KNOCK_DIRECTIONS: readonly { label: string; deg: number }[] = [
   { label: 'サード', deg: -40 },
   { label: '左中間', deg: -20 },
   { label: 'センター', deg: 0 },
   { label: '右中間', deg: 20 },
   { label: 'ファースト', deg: 40 },
+  { label: '一塁側ファウル', deg: 52 },
+  { label: '三塁側ファウル', deg: -52 },
 ];
 
 /**

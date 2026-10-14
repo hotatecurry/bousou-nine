@@ -34,7 +34,14 @@ import {
 } from '../../src/core/pitch';
 import type { Ballpark } from '../../src/core/ballpark';
 import type { FielderId } from '../../src/core/fielding';
-import { type PlayOutcome, type PlayResult, isExtraBase, isHit, simulatePlay } from './sim';
+import {
+  type PlayOptions,
+  type PlayOutcome,
+  type PlayResult,
+  isExtraBase,
+  isHit,
+  simulatePlay,
+} from './sim';
 
 /** 格子の1点（タイミング・コースは -1..+1 の正規化値） */
 export interface SwingPoint {
@@ -69,6 +76,12 @@ export interface SweepOptions {
   batter?: BattingProfile;
   side?: BatterSide;
   pitchSpeed?: number;
+  /**
+   * その球を投げた投手の基準速（`neutralSpeedFor`。フェーズBBB-85）。**投手ごとの球速
+   * （SPD）で `pitchSpeed` を決めたときは必ず渡す**＝打球に乗るのは緩急ぶんだけ（実機と同じ）。
+   * 省略＝投手を持たない素の球（球速がそのまま乗る。緩急だけを比べる格子はこちら）。
+   */
+  pitcherNeutral?: number;
   pitcherFatigue?: number;
   catchBonus?: (id: FielderId) => number;
   runnerSpeed?: number;
@@ -81,6 +94,13 @@ export interface SweepOptions {
    * ＝そこを見るための入口。
    */
   timing?: number;
+  /**
+   * 守備の追い方と、打球への反応（`sim.ts` の `PlayOptions`。フェーズBBB-83）。省略時は
+   * 実機のCPU守備（先回り＋反応）。**人間の守備を相手にする規則**（CPU走者の余分な進塁＝X-45）を
+   * 測るときは `'follow'`・反応0（＝CPU走者が人間の守備に見込む動き）を渡す。
+   */
+  chase?: PlayOptions['chase'];
+  reactionSec?: number;
 }
 
 export interface SweepSample extends SwingPoint {
@@ -101,7 +121,7 @@ export function sweep(opts: SweepOptions = {}): SweepSample[] {
       const course = j / steps;
       const crossX = crossXFor(course, side);
       const launch = judgeSwing(
-        { crossX, swingTime: swingTimeFor(timing), pitchSpeed },
+        { crossX, swingTime: swingTimeFor(timing), pitchSpeed, pitcherNeutral: opts.pitcherNeutral },
         opts.batter ?? NEUTRAL_BATTER,
         side,
         opts.pitcherFatigue ?? 0,
@@ -116,6 +136,8 @@ export function sweep(opts: SweepOptions = {}): SweepSample[] {
           park: opts.park,
           catchBonus: opts.catchBonus,
           runnerSpeed: opts.runnerSpeed,
+          chase: opts.chase,
+          reactionSec: opts.reactionSec,
         }),
       });
     }

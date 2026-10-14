@@ -14,21 +14,31 @@ import {
   DEKKAI_CAMERA_POS,
   DEKKAI_EDGE_MARGIN,
   DEKKAI_FOV_DEG,
+  DEKKAI_PITCH_SIZE_FAR,
+  DEKKAI_PITCH_SIZE_NEAR,
+  DEKKAI_PITCH_SIZE_SWITCH,
   DEKKAI_RUNNER_HALF_WIDTH,
-  DEKKAI_TRAIL_FRAME_SEC,
+  DEKKAI_SHADOW_ASPECT,
   FOCUS_LIMIT,
   cameraDistance,
   cameraOffset,
   clampFocus,
-  dekkaiBallLook,
   dekkaiBallScale,
   dekkaiFovFor,
-  dekkaiScreenMotionAxis,
+  dekkaiPitchLook,
+  dekkaiScreenRise,
   dekkaiViewDepth,
   edgeMarker,
   followFocus,
-  pitchArcPath,
+  pitchLineHeight,
+  CHANGEUP_DROP_BOTTOM,
+  CHANGEUP_DROP_TOP,
+  FORK_BOUNCE_CENTER_Y,
+  FORK_BOUNCE_Z,
+  changeupEndHeight,
+  pitchDrawnHeight,
 } from '../src/core/camera';
+import { CONTACT_PLANE_Z } from '../src/core/batting';
 import { BALLPARKS, deepestFence } from '../src/core/ballpark';
 import { BASE_AXIS, CATCH_RADIUS } from '../src/core/fielding';
 import {
@@ -36,18 +46,24 @@ import {
   CATCH_Z,
   NEUTRAL_PITCH_ARM,
   PITCHER_PLATE_Z,
-  PLATE_Z,
   RELEASE_Z,
   SPEED_FAST_DELTA,
   SPEED_SLOW_DELTA,
   STRIKE_ZONE_HALF_WIDTH,
   armReleaseHeight,
+  createPitchFlight,
   neutralSpeedFor,
-  pitchFastness,
-  pitchSlowness,
+  pitchClockRate,
+  stepPitchFlight,
+  PLATE_Z as PLATE_Z_PITCH,
+  SPEED_NEUTRAL as SPEED_NEUTRAL_PITCH,
+  SPEED_SLOW as SPEED_SLOW_PITCH,
+  pitchStallFor,
 } from '../src/core/pitch';
-import { TEAMS, pitcherRowPitching } from '../src/core/teams';
 import { GROUND_RADIUS } from '../src/scenes/field';
+
+/** 上手投げのリリースの高さ（MM-60。フォークの落ち方のテストで使う） */
+const RELEASE_HEIGHT_OVER = armReleaseHeight(NEUTRAL_PITCH_ARM);
 
 const DEG = Math.PI / 180;
 const WIDE = 16 / 9;
@@ -192,143 +208,94 @@ describe('ボールの見かけの大きさ（フェーズNN-61。`npm run balan
   });
 });
 
-describe('投球の見え方：弧と残像（フェーズPP-63。`npm run balance:flight` で測った帯）', () => {
-  const dekkaiPpm = (d: number, screenH = 720) =>
-    screenH / (2 * d * Math.tan((dekkaiFovFor(16 / 9) / 2) * DEG));
-  const span = CATCH_Z - RELEASE_Z;
+describe('投球の見え方：原作準拠（フェーズBBB-76。`npm run balance:flight`）', () => {
   const over = armReleaseHeight(NEUTRAL_PITCH_ARM);
-  /** 基準の投手（SPD0.5）の緩急3段階 */
   const neutral = neutralSpeedFor();
   const fork = neutral - SPEED_SLOW_DELTA;
   const fast = neutral + SPEED_FAST_DELTA;
-  /** 弧を含んだ高さ（呼び出し側＝dekkaiScene と同じ渡し方） */
-  const heightAt = (z: number, vz: number, from = over) =>
-    pitchArcPath(z, vz, from, pitchSlowness(vz, neutral)).y;
-  /** その z を通るときの見た目（残像込み） */
-  const lookAt = (z: number, vz: number) => {
-    const path = pitchArcPath(z, vz, over, pitchSlowness(vz, neutral));
-    return dekkaiBallLook(
-      { x: 0, y: path.y, z },
-      { x: 0, y: path.slope * vz, z: vz },
-      pitchFastness(vz, neutral),
-    );
+  const lookAt = (z: number, vz = neutral, x = 0, vx = 0) => dekkaiPitchLook({ x, z, vx, vz }, over);
+  /** 1280x720 の画面で、リリースから打撃面まで1フレームごとに描く球の縦の位置（px。下が正） */
+  const drawnTrack = (speed: number): number[] => {
+    const px = 720 / (2 * Math.tan((dekkaiFovFor(16 / 9) / 2) * DEG));
+    let flight = createPitchFlight(0, speed, 0, pitchClockRate(speed, neutral));
+    const ys: number[] = [];
+    while (flight.z < CONTACT_PLANE_Z) {
+      ys.push(-dekkaiScreenRise(lookAt(flight.z, speed).center) * px);
+      flight = stepPitchFlight(flight, 0, 1 / 60);
+    }
+    return ys;
   };
 
-  it('どの球速・どの腕でも、球はリリースの高さから出てミットの高さで終わる', () => {
-    // 旧実装は直線から引き算していたので、いちばん遅い球は本塁の2.4m手前で y<0 に入り
-    // NN-61 が置いた地面の下限で止まっていた（＝ミットの下を通って到着していた）。
+  it('通り道はリリースの高さからミットの高さへの直線（PP-63の弧はやめた＝原作の球は弧を描かない）', () => {
     for (const slot of ['over', 'side', 'under'] as const) {
       const from = armReleaseHeight({ side: 1, slot });
-      for (const vz of [16, fork, neutral, fast, 48]) {
-        expect(heightAt(RELEASE_Z, vz, from)).toBeCloseTo(from, 9);
-        expect(heightAt(CATCH_Z, vz, from)).toBeCloseTo(CATCH_HEIGHT, 9);
-      }
+      expect(pitchLineHeight(RELEASE_Z, from)).toBeCloseTo(from, 9);
+      expect(pitchLineHeight(CATCH_Z, from)).toBeCloseTo(CATCH_HEIGHT, 9);
+      const mid = (RELEASE_Z + CATCH_Z) / 2;
+      expect(pitchLineHeight(mid, from)).toBeCloseTo((from + CATCH_HEIGHT) / 2, 9);
     }
   });
 
-  it('球は地面より上を通る＝地面の下限は構造的に要らない', () => {
-    for (const vz of [16, fork, neutral, fast]) {
-      for (let z = RELEASE_Z; z <= CATCH_Z; z += 0.05) {
-        expect(heightAt(z, vz)).toBeGreaterThan(BALL_RADIUS);
-      }
+  it('球は画面を一定の速さで下りてくる（原作の影は毎フレーム同じドット数ずつ進む）', () => {
+    for (const speed of [fork, neutral, fast]) {
+      const ys = drawnTrack(speed);
+      const steps = ys.slice(1).map((y, i) => y - ys[i]);
+      const lo = Math.min(...steps);
+      const hi = Math.max(...steps);
+      expect(lo).toBeGreaterThan(0);
+      // 1フレームの刻みのばらつきは 3% 未満（3Dのままだと手元で数倍に加速する）
+      expect((hi - lo) / hi).toBeLessThan(0.03);
     }
   });
 
-  it('基準速以上の球は弧なし＝PP-63の前と完全に同じ直線（基準線を動かさない）', () => {
-    for (const vz of [neutral, neutral + 1, fast, 48]) {
-      for (let z = RELEASE_Z; z <= CATCH_Z; z += 0.05) {
-        const straight = over + (CATCH_HEIGHT - over) * ((z - RELEASE_Z) / span);
-        expect(heightAt(z, vz)).toBeCloseTo(straight, 9);
-      }
+  it('描く球はリリースと打撃面で本当の場所と一致する（手から出て、バットのところで当たる）', () => {
+    const atRelease = lookAt(RELEASE_Z);
+    expect(atRelease.center.z).toBeCloseTo(RELEASE_Z, 9);
+    expect(atRelease.center.y).toBeCloseTo(over, 9);
+    const atContact = lookAt(CONTACT_PLANE_Z);
+    expect(atContact.center.z).toBeCloseTo(CONTACT_PLANE_Z, 9);
+    expect(atContact.center.y).toBeCloseTo(pitchLineHeight(CONTACT_PLANE_Z, over), 9);
+    expect(lookAt(CATCH_Z).center.z).toBeCloseTo(CATCH_Z, 9);
+  });
+
+  it('途中は本当の場所より先（本塁寄り）へ描く＝等速に見せるため。先へ行くのは途中だけ', () => {
+    for (const z of [-15, -10, -5, -1]) {
+      expect(lookAt(z).center.z).toBeGreaterThan(z);
     }
   });
 
-  it('遅い球は「スイングを決める時点」にはもう下っている（P-37と同じ基準）', () => {
-    // 頂点を過ぎていること＝見てから振る打者に「上へ変化した」と読ませない。
-    for (const vz of [16, fork]) {
-      const tPlate = (PLATE_Z - RELEASE_Z) / vz;
-      const zDecide = RELEASE_Z + vz * (tPlate - 0.25);
-      const path = pitchArcPath(zDecide, vz, over, pitchSlowness(vz, neutral));
-      expect(path.slope).toBeLessThan(0);
-      // しかも落差が球の直径より大きい＝画面で読める（720p で 52px 以上）
-      const dropPx =
-        (heightAt(zDecide, vz) - heightAt(PLATE_Z, vz)) *
-        dekkaiPpm(dekkaiViewDepth(DEKKAI_BALL_ANCHOR));
-      expect(dropPx).toBeGreaterThan(2 * BALL_RADIUS * DEKKAI_BALL_SCALE * dekkaiPpm(dekkaiViewDepth(DEKKAI_BALL_ANCHOR)));
-    }
+  it('曲がる球も通り道の上に乗る（横はいまの速度のまま、描く奥行きまで外挿する）', () => {
+    const z = -9;
+    const look = lookAt(z, neutral, 0.1, 0.8);
+    expect(look.center.x).toBeCloseTo(0.1 + (0.8 * (look.center.z - z)) / neutral, 9);
   });
 
-  it('名鑑96人のフォークは、打者の手元でリリースより高くならない（超過は3cm未満）', () => {
-    // 弧は飛行時間の2乗で効くので、球速の遅い投手ほど大きく膨らむ。実際の重力（9.8）で
-    // 名鑑の下端（SPD0.35）でも超過は 21mm＝720pで2px＝画面では読めない大きさに収まる。
-    let worst = 0;
-    for (const team of TEAMS) {
-      for (const r of team.pitchers) {
-        const p = pitcherRowPitching(r);
-        const n = neutralSpeedFor(p.speed);
-        const vz = n - SPEED_SLOW_DELTA;
-        const y = pitchArcPath(PLATE_Z, vz, over, pitchSlowness(vz, n)).y;
-        worst = Math.max(worst, y - over);
-      }
-    }
-    expect(worst).toBeLessThan(0.03);
+  it('球の絵は途中で1回だけ大きくなる（原作の 4×4 → 6×6 ドット）', () => {
+    expect(DEKKAI_PITCH_SIZE_NEAR / DEKKAI_PITCH_SIZE_FAR).toBeCloseTo(1.5, 9);
+    expect(DEKKAI_PITCH_SIZE_SWITCH).toBeCloseTo(13 / 23, 9);
+    const span = CATCH_Z - RELEASE_Z;
+    const before = lookAt(RELEASE_Z + span * (DEKKAI_PITCH_SIZE_SWITCH - 0.01));
+    const after = lookAt(RELEASE_Z + span * (DEKKAI_PITCH_SIZE_SWITCH + 0.01));
+    expect(before.scale / dekkaiBallScale(before.center)).toBeCloseTo(DEKKAI_PITCH_SIZE_FAR, 9);
+    expect(after.scale / dekkaiBallScale(after.center)).toBeCloseTo(DEKKAI_PITCH_SIZE_NEAR, 9);
   });
 
-  it('残像は画面上の進行方向（＝視線に垂直）へ伸びる。ワールドZではない', () => {
-    const axis = dekkaiScreenMotionAxis({ x: 0, y: -1, z: 40 });
-    expect(axis).not.toBeNull();
-    // 視線に垂直＝奥行きを1mmも動かさない向き（旧実装のZ方向は9割が視線に沿っていた）
-    const zero = dekkaiViewDepth({ x: 0, y: 0, z: 0 });
-    const along = dekkaiViewDepth(axis!) - zero;
-    expect(Math.abs(along)).toBeLessThan(1e-9);
-    // このカメラでは球の動きはほぼ画面の縦＝下向き
-    expect(axis!.y).toBeLessThan(-0.9);
+  it('手元の球は原作と同じく本塁の幅のおよそ1/4（1280x720 で 18px）', () => {
+    const look = lookAt(CONTACT_PLANE_Z);
+    const ppm = 720 / (2 * dekkaiViewDepth(look.center) * Math.tan((dekkaiFovFor(16 / 9) / 2) * DEG));
+    const px = 2 * BALL_RADIUS * look.scale * ppm;
+    expect(px).toBeGreaterThan(16);
+    expect(px).toBeLessThan(20);
   });
 
-  it('残像は後ろへ伸びる（先端は実際の位置＝見た目が判定より先に行かない）', () => {
-    const look = lookAt(PLATE_Z, fast);
-    expect(look.trail).toBeGreaterThan(0);
-    const axis = look.axis!;
-    const drawnRadius = BALL_RADIUS * look.scale;
-    // 伸びた球の前端（中心＋半径×(1+trail)）が、伸ばす前の前端と同じところにある
-    const front = look.center.y + axis.y * drawnRadius * (1 + look.trail);
-    const truth = heightAt(PLATE_Z, fast) + axis.y * drawnRadius;
-    expect(front).toBeCloseTo(truth, 9);
-  });
-
-  it('基準速以下の球には残像が出ない（こちらも基準線を動かさない）', () => {
-    for (const vz of [16, fork, neutral]) {
-      const look = lookAt(PLATE_Z, vz);
-      expect(look.trail).toBe(0);
-      expect(look.axis).toBeNull();
-      expect(look.center).toEqual({ x: 0, y: heightAt(PLATE_Z, vz), z: PLATE_Z });
-    }
-  });
-
-  it('残像の長さは「1フレームで画面上に動く距離」＝新しい数値を持ち込まない', () => {
-    const look = lookAt(PLATE_Z, fast);
-    const path = pitchArcPath(PLATE_Z, fast, over, pitchSlowness(fast, neutral));
-    const vel = { x: 0, y: path.slope * fast, z: fast };
-    const axis = dekkaiScreenMotionAxis(vel)!;
-    const screenSpeed = vel.x * axis.x + vel.y * axis.y + vel.z * axis.z;
-    const drawnDiameter = 2 * BALL_RADIUS * look.scale;
-    expect(look.trail).toBeCloseTo(
-      (pitchFastness(fast, neutral) * screenSpeed * DEKKAI_TRAIL_FRAME_SEC) / drawnDiameter,
-      9,
-    );
-    // 近づくほど画面上の動きが速くなるので残像も伸びる
-    expect(lookAt(PLATE_Z, fast).trail).toBeGreaterThan(lookAt(RELEASE_Z + 1, fast).trail);
-  });
-
-  it('見かけの大きさ（NN-61）は1つも動いていない', () => {
-    // 弧で球が視線から外れても、拡大率は奥行きから決まるので飛行中ずっと同じ大きさ。
-    const diameterAt = (z: number, vz: number) => {
-      const look = lookAt(z, vz);
-      const p = { x: 0, y: heightAt(z, vz), z };
-      return 2 * BALL_RADIUS * look.scale * dekkaiPpm(dekkaiViewDepth(p));
-    };
-    for (const z of [RELEASE_Z, -12, -6, PLATE_Z, CATCH_Z]) {
-      expect(diameterAt(z, fork)).toBeCloseTo(diameterAt(PLATE_Z, fork), 6);
+  it('影は球の真下の地面にあり、縦横比はどこでも原作の影と同じ（地面の円を伸ばして揃える）', () => {
+    for (const z of [RELEASE_Z, -8, CONTACT_PLANE_Z]) {
+      const look = lookAt(z);
+      expect(look.shadow.x).toBeCloseTo(look.center.x, 9);
+      expect(look.shadow.z).toBeCloseTo(look.center.z, 9);
+      // 奥行きの伸ばし × 見下ろす角度の正弦 ＝ 縦横比
+      const sinLook = DEKKAI_CAMERA_POS.y / Math.hypot(DEKKAI_CAMERA_POS.y, look.shadow.z - DEKKAI_CAMERA_POS.z);
+      expect(look.shadow.depthStretch * sinLook).toBeCloseTo(DEKKAI_SHADOW_ASPECT, 9);
     }
   });
 });
@@ -553,5 +520,53 @@ describe('でっかいモードの画角は窓の形から（フェーズZZ-74�
 
   it('細い窓ほど広く映す（横幅が一・三塁ぶん以上あることを優先する）', () => {
     expect(dekkaiFovFor(4 / 3)).toBeGreaterThan(dekkaiFovFor(16 / 9));
+  });
+});
+
+describe('フォークの落ち方（フェーズBBB-79：Fの大きい投手だけワンバウンド）', () => {
+  const over = RELEASE_HEIGHT_OVER;
+  const bounce = pitchStallFor(SPEED_SLOW_PITCH, SPEED_NEUTRAL_PITCH, 0.8)!;
+  const changeup = (fork: number) => pitchStallFor(SPEED_SLOW_PITCH, SPEED_NEUTRAL_PITCH, fork)!;
+  // 描く奥行きは本当の位置とほぼ同じ（打撃面から先は一致する）ので、ここでは同じ z で見る
+  const h = (z: number, stall = bounce) => pitchDrawnHeight(z, z, over, stall);
+
+  it('地面に着くのは失速の後・判定の本塁通過（PLATE_Z）より手前＝跳ねてから本塁を通る', () => {
+    expect(FORK_BOUNCE_Z).toBeGreaterThan(bounce.fromZ);
+    expect(FORK_BOUNCE_Z).toBeLessThan(PLATE_Z_PITCH);
+  });
+
+  it('ワンバウンドするフォークは本塁の前で地面に着き（球の下端が地面）、跳ねてミットへ上がる', () => {
+    expect(h(FORK_BOUNCE_Z)).toBeCloseTo(FORK_BOUNCE_CENTER_Y, 9);
+    // 着く手前は下がり続け、着いた後は上がり続ける
+    let prev = Infinity;
+    for (let z = bounce.fromZ; z <= FORK_BOUNCE_Z; z += 0.05) {
+      expect(h(z)).toBeLessThanOrEqual(prev + 1e-9);
+      prev = h(z);
+    }
+    prev = -Infinity;
+    for (let z = FORK_BOUNCE_Z; z <= CATCH_Z; z += 0.05) {
+      expect(h(z)).toBeGreaterThanOrEqual(prev - 1e-9);
+      prev = h(z);
+    }
+    expect(h(CATCH_Z)).toBeCloseTo(CATCH_HEIGHT, 9);
+    // 着いた瞬間の中心の高さ＝本塁で描く球の半径（下端がちょうど地面）
+    expect(FORK_BOUNCE_CENTER_Y).toBeCloseTo(BALL_RADIUS * DEKKAI_BALL_SCALE * DEKKAI_PITCH_SIZE_NEAR, 12);
+  });
+
+  it('チェンジアップ（Fが境目より小さい）は膝の高さより上で止まり、地面には着かない', () => {
+    for (const fork of [0, 0.38, 0.54, 0.69]) {
+      const end = changeupEndHeight(fork);
+      expect(end).toBeGreaterThanOrEqual(CHANGEUP_DROP_BOTTOM);
+      expect(end).toBeLessThanOrEqual(CHANGEUP_DROP_TOP);
+      expect(h(CONTACT_PLANE_Z, changeup(fork))).toBeCloseTo(end, 9);
+      expect(h(CATCH_Z, changeup(fork))).toBeCloseTo(end, 9);
+    }
+    // F が大きいほど深く落ちる
+    expect(changeupEndHeight(0.6)).toBeLessThan(changeupEndHeight(0.4));
+  });
+
+  it('失速の前・フォークでない球は通り道の直線のまま（これまでと1mmも変わらない）', () => {
+    expect(h(bounce.fromZ - 1)).toBeCloseTo(pitchLineHeight(bounce.fromZ - 1, over), 12);
+    expect(pitchDrawnHeight(0, 0, over)).toBeCloseTo(pitchLineHeight(0, over), 12);
   });
 });

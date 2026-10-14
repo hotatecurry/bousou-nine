@@ -94,7 +94,7 @@ import {
   pitcherRowBatting,
   pitcherRowPitching,
 } from '../../src/core/teams';
-import { CPU_POSSESSED_REACTION_SEC, simulatePlay } from './sim';
+import { PICKUP_THROW_DELAY_SEC, simulatePlay } from './sim';
 import {
   type PaDistribution,
   type RunExpectancy,
@@ -163,11 +163,11 @@ interface Leg {
 
 /**
  * その走者をその塁への送球1本で刺せるか。**`sim.ts` の `throwOut` と同じ式**
- * （リリース＝確保＋反応、同着は走者有利、走者は既に着いていたら刺せない）。
+ * （リリース＝確保＋持ち替え（BBB-82）、同着は走者有利、走者は既に着いていたら刺せない）。
  */
 function retires(f: FieldedBunt, leg: Leg, speed: number, covered = 0): boolean {
   const path = distance(BASE_POSITIONS[leg.from], BASE_POSITIONS[leg.to]) - covered;
-  const release = f.sec + CPU_POSSESSED_REACTION_SEC;
+  const release = f.sec + PICKUP_THROW_DELAY_SEC;
   if (release >= (path - BASE_ARRIVE_RADIUS) / speed) return false;
   return release + distance(f.pos, BASE_POSITIONS[leg.to]) / THROW_SPEED < path / speed;
 }
@@ -648,8 +648,12 @@ interface HitCase {
   finalDistance: number;
 }
 
+// **守備は「CPU走者が人間の守備に見込む動き」で回す**（フェーズBBB-83）：この規則が実機で使われるのは
+// CPUが攻撃＝人間が守るときだけで、CPU走者の見込みはその守備を「いちばん近い野手を球へ向ける・
+// 反応0」として写している（`predictSecureAt` の `'follow'`）。CPU守備（先回り）を相手に測ると、
+// 画面では起きない組み合わせを数えることになる。
 const hitCases: HitCase[] = [];
-for (const s of sweep({ batter: NEUTRAL })) {
+for (const s of sweep({ batter: NEUTRAL, chase: 'follow', reactionSec: 0 })) {
   const kind = s.result.outcome.kind;
   if (kind !== 'beatThrow' && kind !== 'hit' && kind !== 'groundRuleDouble') continue;
   const crossX = crossXFor(s.course);
@@ -673,7 +677,8 @@ function actualSlack(c: HitCase, from: 'first' | 'second' | 'third', speed: numb
   const to = BASE_POSITIONS[advancedBase(from)];
   const runSec = distance(BASE_POSITIONS[from], to) / speed;
   if (c.actual === undefined) return Number.NEGATIVE_INFINITY;
-  return runSec - (c.actual.sec + distance(c.actual.pos, to) / THROW_SPEED);
+  // 拾ってから持ち替え（BBB-82）を待って投げる＝`sim.ts` の throwOut・`tests/balance.test.ts` と同じ式
+  return runSec - (c.actual.sec + PICKUP_THROW_DELAY_SEC + distance(c.actual.pos, to) / THROW_SPEED);
 }
 
 /** 規則（`cpuExtraBaseSlack`）が見る余裕＝着地点の予測から出す見込み */

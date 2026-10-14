@@ -15,7 +15,7 @@
  * 1つ動かすたびに落ちて「テストを直すためにテストを書き換える」になる。ここが守るのは
  * 「どちらが大きいか」「どのくらいの範囲か」という設計の意図のほう。
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { BALLPARKS, DEFAULT_BALLPARK, type Ballpark } from '../src/core/ballpark';
 import {
   EXIT_PITCH_CARRY,
@@ -33,10 +33,12 @@ import { HOT_MODIFIER } from '../src/core/condition';
 import {
   CPU_PINCH_HIT_GAP,
   CPU_PINCH_RUN_BAT_LOSS,
+  CPU_SWING_SIGMA_SEC,
   CPU_TIMING_PENALTY_SEC,
   SELECTIVE_HALF_WIDTH,
   chooseCpuStance,
   cpuSwingLead,
+  cpuTimingScale,
 } from '../src/core/cpuBatter';
 import {
   BASE_PATH,
@@ -48,6 +50,7 @@ import {
   CPU_TAG_UP_MIN_DEPTH,
   FIELDER_HOME_POSITIONS,
   FIELDER_SPEED,
+  PICKUP_RELEASE_SEC,
   MAX_LEAD,
   RUNNER_SPEED,
   RUNNER_SPEED_MAX,
@@ -82,6 +85,7 @@ import {
 } from '../src/core/cpuPitcher';
 import {
   ARM_SLOT_RAD,
+  BREAK_STRENGTH,
   BATTER_STANCE_RANGE,
   LEFT_BATTER_SIDE,
   NEUTRAL_RATING,
@@ -98,6 +102,7 @@ import {
   fatiguedControl,
   fatiguedSpeed,
   judgePitch,
+  neutralSpeedFor,
   speedForPitchSelection,
 } from '../src/core/pitch';
 import {
@@ -147,8 +152,14 @@ import {
   pitcherRowBatting,
   pitcherRowPitching,
 } from '../src/core/teams';
-import { CPU_POSSESSED_REACTION_SEC, SIM_DT, simulatePlay } from '../tools/balance/sim';
-import { simulateAtBat } from '../tools/balance/atbat';
+import { PICKUP_THROW_DELAY_SEC, simulatePlay } from '../tools/balance/sim';
+import {
+  type AtBatOptions,
+  type AtBatResult,
+  atBatDistribution,
+  simulateAtBat,
+  swingNoiseStream,
+} from '../tools/balance/atbat';
 import {
   type SweepSummary,
   crossXFor,
@@ -167,7 +178,20 @@ import {
 } from '../tools/balance/runExpectancy';
 
 /** テストは粗めの格子で回す（帯を見るには十分で、全体を1秒以内に保てる） */
+// このファイルは同期の重い計測が続く（全体で1分半）。テストの合間にイベントループを1周
+// させないと、ワーカーが進み具合を親へ報告できないまま60秒を越えて
+// 「[vitest-worker]: Timeout calling "onTaskUpdate"」で落ちる（テストは全部通っているのに
+// `npm test` が失敗する。フェーズBBB-83で計測が重くなって表に出た）。
+afterEach(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+
 const STEPS = 6;
+/**
+ * 打者・走者・球速どうしの**小さな差**を比べる帯で使う細かい格子（フェーズBBB-83）。
+ * `STEPS` の粗い格子（169点）では、境目の打球が1〜2本入れ替わるだけで大小が裏返る
+ * （CPU守備を先回りにした BBB-83 で、好調・走力・敬遠・配球の費用の4つが同時に裏返った。
+ * 441点で測れば4つとも元の向きのまま＝崩れたのは格子の粗さのほう）。
+ */
+const FINE_STEPS = 10;
 
 const hitter = (power: number, average = 0.5) => ({ power, average });
 
@@ -177,17 +201,22 @@ function measure(opts: {
   power: number;
   average?: number;
   pitchSpeed?: number;
+  /** その球を投げた投手の基準速（投手ごとの球速で `pitchSpeed` を決めたときに渡す。BBB-85） */
+  pitcherNeutral?: number;
   catchBonus?: (id: FielderId) => number;
   runnerSpeed?: number;
+  /** 格子の細かさ（既定 `STEPS`。小さな差を比べる帯は `FINE_STEPS`） */
+  steps?: number;
 }): SweepSummary {
   return summarize(
     sweep({
       park: opts.park ?? DEFAULT_BALLPARK,
       batter: hitter(opts.power, opts.average),
       pitchSpeed: opts.pitchSpeed,
+      pitcherNeutral: opts.pitcherNeutral,
       catchBonus: opts.catchBonus,
       runnerSpeed: opts.runnerSpeed,
-      steps: STEPS,
+      steps: opts.steps ?? STEPS,
     }),
   );
 }
@@ -239,46 +268,49 @@ describe('打球の帰結：長打力・球速・球場（C-14の未確認事項
     expect(fast.homerunRate).toBeGreaterThan(neutral.homerunRate);
   });
 
-  it('CPU打者は速球を本塁打にできない（過去に潰した「CPUの速球HR連発」の回帰防止）', () => {
-    // CPU打者は `cpuSwingLead` の1点でしか振らないので、**その1点の帰結**が
-    // そのままCPUの打球になる。速球には早振りのペナルティが乗る＝弱い当たりになる、
-    // というのが cpuBatter.ts の設計意図そのもの。
-    //
-    // **QQ-65：ここは「1点だけ」を見ていたので穴があった**。実機のスイングは lead
-    // ちょうどではなく **lead 〜 lead+1フレーム** に散る（`batting.update` が
-    // `pitching.update` の後で swingT を進めるため）し、名鑑の速球は 47.5m/s まである。
-    // その帯を舐めると、旧値（減衰0.30）では両翼の柵へ届いていた（`npm run balance:plate`）。
-    const worstCarry = (
-      batter: { power: number; average: number },
-      pitchSpeed: number,
-    ): { carry: number; homerun: boolean } => {
-      let carry = 0;
-      let homerun = false;
-      for (let frac = 0; frac <= 1.0001; frac += 0.05) {
-        const launch = judgeSwing(
-          { crossX: 0, swingTime: cpuSwingLead(pitchSpeed) + frac * SIM_DT, pitchSpeed },
-          batter,
-        );
-        if (!launch) continue;
-        const play = simulatePlay(launch, 0, { park: DEFAULT_BALLPARK });
-        carry = Math.max(carry, play.carry);
-        if (play.outcome.kind === 'homerun') homerun = true;
-      }
-      return { carry, homerun };
+  it('CPU打者は初球の速球を芯では捉えない（過去に潰した「CPUの速球HR連発」の回帰防止）', () => {
+    // 「CPUの速球HR連発」は、CPU打者が**どの球でも芯（t=0）で振っていた**ことが原因だった。
+    // フェーズAAA-75以降、CPU打者は**直前のストライクの速さ**に合わせる＝**初球は投手の
+    // 基準速を待っている**ので、初球の速球は緩急1段ぶん差し込まれる（ここはぶれ無しの狙い。
+    // ぶれ込みの分布は `npm run balance:plate` の2・3段目）。
+    // 緩急のずれは投手の球速の比で大きくなる（BBB-85。`cpuTimingScale`）
+    const firstPitch = (spd: number) =>
+      cpuSwingLead(
+        speedForPitchSelection(-1, spd),
+        neutralSpeedFor(spd),
+        null,
+        0,
+        undefined,
+        cpuTimingScale(neutralSpeedFor(spd)),
+      );
+    const repeated = (spd: number) =>
+      cpuSwingLead(speedForPitchSelection(-1, spd), neutralSpeedFor(spd), speedForPitchSelection(-1, spd));
+    /** 実際に投げた球＝投げた投手の基準速を持つ（打球に乗るのは緩急ぶんだけ。BBB-85） */
+    const hrOf = (lead: number, spd: number, batter: { power: number; average: number }) => {
+      const launch = judgeSwing(
+        {
+          crossX: 0,
+          swingTime: lead,
+          pitchSpeed: speedForPitchSelection(-1, spd),
+          pitcherNeutral: neutralSpeedFor(spd),
+        },
+        batter,
+      );
+      if (!launch) return { homerun: false, directionDeg: 0 };
+      const play = simulatePlay(launch, 0, { park: DEFAULT_BALLPARK });
+      return { homerun: play.outcome.kind === 'homerun', directionDeg: play.directionDeg };
     };
-    // 名鑑でいちばん速い投手の速球（＝いちばん飛ぶ球）でも、平均的な打者は越えられない
-    const fastest = speedForPitchSelection(-1, 0.96);
-    expect(worstCarry(hitter(0.5), fastest).homerun).toBe(false);
-    expect(worstCarry(hitter(0.5), SPEED_FAST).homerun).toBe(false);
-    // **強打者は越えうる**＝速球を置きにいくリスクそのものは消えていない
-    expect(worstCarry(hitter(0.8, 0.7), fastest).homerun).toBe(true);
-    // 早振りのぶん、実際に引っ張り方向へ飛んでいる（ペナルティが効いている証拠）
-    const launch = judgeSwing(
-      { crossX: 0, swingTime: cpuSwingLead(SPEED_FAST), pitchSpeed: SPEED_FAST },
-      hitter(0.5),
-    );
-    expect(launch).not.toBeNull();
-    expect(simulatePlay(launch!, 0, { park: DEFAULT_BALLPARK }).directionDeg).toBeLessThan(-20);
+    // 名鑑でいちばん速い投手の速球でも、初球なら平均的な打者は越えられない
+    const fastest = 0.96;
+    expect(hrOf(firstPitch(fastest), fastest, hitter(0.5)).homerun).toBe(false);
+    expect(hrOf(firstPitch(0.5), 0.5, hitter(0.5)).homerun).toBe(false);
+    // 差し込まれた打球は逆方向（右打者なら右翼側＝+X）へ飛ぶ
+    expect(hrOf(firstPitch(0.5), 0.5, hitter(0.5)).directionDeg).toBeGreaterThan(20);
+    // **同じ速球を続けた2球目は芯**＝強打者なら越える（緩急を付けない投手への罰）。
+    // 誰の速球でも同じだけ飛ぶ（BBB-85：投手の球速は打球の強さに乗らない）
+    for (const spd of [0.35, fastest]) {
+      expect(hrOf(repeated(spd), spd, hitter(0.8, 0.7)).homerun).toBe(true);
+    }
   });
 
   it('芯（タイミング0・コース0）の打球はタイミングの減衰に一切依存しない（QQ-65の不変条件）', () => {
@@ -302,22 +334,25 @@ describe('打球の帰結：長打力・球速・球場（C-14の未確認事項
     }
   });
 
-  it('CPU打者は基準速ならジャストミートする（速球以外にペナルティは無い）', () => {
-    const timing = (cpuSwingLead(SPEED_NEUTRAL) - SWING_IDEAL_SEC) / (SWING_ACTIVE_SEC / 2);
-    expect(timing).toBeCloseTo(0);
+  it('CPU打者は待っていた速さの球ならジャストミートする（初球は投手の基準速）', () => {
+    const timingOf = (lead: number) => (lead - SWING_IDEAL_SEC) / (SWING_ACTIVE_SEC / 2);
+    expect(timingOf(cpuSwingLead(SPEED_NEUTRAL, SPEED_NEUTRAL))).toBeCloseTo(0);
+    expect(timingOf(cpuSwingLead(SPEED_FAST, SPEED_NEUTRAL, SPEED_FAST))).toBeCloseTo(0);
+    expect(timingOf(cpuSwingLead(SPEED_SLOW, SPEED_NEUTRAL, SPEED_SLOW))).toBeCloseTo(0);
   });
 });
 
 describe('好調＝ゼッコーチョー／ラッキー7（D-19の未確認事項「+0.2 という幅が妥当か」）', () => {
   it('好調の打者は本塁打も安打も明確に増える（「今日はこの打者が来ている」が分かる幅）', () => {
-    const plain = measure({ power: 0.5, average: 0.5 });
+    const plain = measure({ power: 0.5, average: 0.5, steps: FINE_STEPS });
     const hot = measure({
       power: 0.5 + (HOT_MODIFIER.power ?? 0),
       average: 0.5 + (HOT_MODIFIER.average ?? 0),
+      steps: FINE_STEPS,
     });
     expect(hot.homerunRate).toBeGreaterThan(plain.homerunRate);
     expect(hot.hitRate).toBeGreaterThan(plain.hitRate);
-  });
+  }, 20000);
 
   it('好調でも「長打力の高い打者」を超えはしない（補正であって別物にはならない）', () => {
     const hot = measure({
@@ -342,18 +377,22 @@ describe('守備範囲スキル（F-26-7の未確認事項「内野の間を抜�
   it('全員に配れば効きは大きくなる（＝効いていないわけではない）', () => {
     const base = measure({ power: 0.5 });
     const all = measure({ power: 0.5, catchBonus: () => 4.3 });
-    expect(base.hitRate - all.hitRate).toBeGreaterThan(0.05);
+    // **安打の半分以上が消える**。BBB-79 でファウルフライも捕れるようになり、捕られた
+    // ファウルフライが分母（インプレー）に入ったので、差を「何ポイント」で測ると分母の
+    // 変化に引きずられる（安打は 9→3本で変わらないのに 5.x→4.7ポイントになった）。
+    // 割合で見れば分母に左右されない。
+    expect(all.hitRate).toBeLessThan(base.hitRate * 0.5);
   });
 });
 
 describe('走力とバイク（B-8の設計不変条件とF-26-3の未確認事項）', () => {
   it('走力が上がるほど内野安打が増える（RUNが全走者に効いている）', () => {
-    const slow = measure({ power: 0.5, runnerSpeed: RUNNER_SPEED_MIN });
-    const mid = measure({ power: 0.5, runnerSpeed: RUNNER_SPEED });
-    const fast = measure({ power: 0.5, runnerSpeed: RUNNER_SPEED_MAX });
+    const slow = measure({ power: 0.5, runnerSpeed: RUNNER_SPEED_MIN, steps: FINE_STEPS });
+    const mid = measure({ power: 0.5, runnerSpeed: RUNNER_SPEED, steps: FINE_STEPS });
+    const fast = measure({ power: 0.5, runnerSpeed: RUNNER_SPEED_MAX, steps: FINE_STEPS });
     expect(mid.beatThrow).toBeGreaterThanOrEqual(slow.beatThrow);
     expect(fast.beatThrow).toBeGreaterThan(mid.beatThrow);
-  });
+  }, 20000);
 
   it('バイクの2倍速はゴロを実際に内野安打へ変える（乗る価値がある）', () => {
     const walk = measure({ power: 0.5, runnerSpeed: RUNNER_SPEED });
@@ -402,22 +441,36 @@ describe('打席内の立ち位置（O-36。`npm run balance:stance` で測っ�
     return total === 0 ? null : hits / total;
   }
 
-  it('寄れば外角の球が打てるようになる（リターンが実際にある）', () => {
-    const outside = -0.45; // 外角いっぱいのストライク
-    expect(hitRateAt(-BATTER_STANCE_RANGE, outside)!).toBeGreaterThan(hitRateAt(0, outside)!);
+  it('寄れば外角寄りの球が打てるようになる（リターンが実際にある）', () => {
+    // **フェーズBBB-77で外角いっぱい（-0.45）から外角寄り（-0.2）へ見る場所を移した**：
+    // フェンス手前の見えない壁（野手は本塁から98mより奥へ行けなかった）を外したら、外角
+    // いっぱいの打球（逆方向への大飛球）は**どの立ち位置でも捕られる**ようになった（0%）。
+    // 寄れば芯が外へ動く、という形そのものは外角寄りでそのまま出る（中央 0% → 寄る 8%）。
+    // **フェーズBBB-82で見る場所を -0.3 へ**：野手の足を原作の 6.0m/s にしたら、-0.2 は中央でも
+    // 寄っても同じ帯（47%）に入った。その1つ外（-0.3）は 中央 16% → 寄る 47%、外角いっぱい
+    // （-0.45）も 中央 0% → 寄る 11% と、寄るリターンがそのまま出る。
+    for (const outer of [-0.3, -0.45]) {
+      expect(hitRateAt(-BATTER_STANCE_RANGE, outer)!).toBeGreaterThan(hitRateAt(0, outer)!);
+    }
   });
 
-  it('寄れば内角の球は打てなくなる（同じ操作の上に代償がある）', () => {
-    const inside = 0.45; // 内角いっぱいのストライク
-    expect(hitRateAt(-BATTER_STANCE_RANGE, inside)!).toBeLessThan(hitRateAt(0, inside)!);
+  it('寄れば内角寄りの球は打てなくなる（同じ操作の上に代償がある）', () => {
+    // **フェーズBBB-82で見る場所を内角寄り（+0.15）へ**：野手の足を原作の 6.0m/s にしたら、
+    // 内角いっぱい（+0.45）は「詰まった当たりが野手の前に落ちる」ので、寄ったほうがかえって
+    // 安打になる（中央 22% → 寄る 37%。どれも単打）。代償が出るのはその内側＝中央なら
+    // いちばん打てる内角寄り（71%）が、寄ると詰まって 24% まで落ちる。
+    const inside = 0.15;
+    expect(hitRateAt(-BATTER_STANCE_RANGE, inside)!).toBeLessThan(hitRateAt(0, inside)! * 0.6);
   });
 
-  it('どこに立っても支配的にはならない（ゾーン全体では打席中央が最良）', () => {
-    // 立ち位置は「読みが当たれば得、外れれば損」＝一様なコース分布では動かないのが最良。
+  it('どこに立っても支配的にはならない（ゾーン全体では中央との差が5pt未満か、中央より悪い）', () => {
+    // 立ち位置は「読みが当たれば得、外れれば損」＝一様なコース分布ではどこも得をしないのが正しい。
     // これが崩れると「常に寄る」が正解になり、選択そのものが消える。
     // **コースの格子を17点に細かくする**（フェーズRR-66）：9点だと丸めの粗さで
-    // 中央と寄りが 14.8% vs 15.7% と逆転して見えることがある（細かい格子＝
-    // 17点／タイミング12・20分割ではどれも中央が最良）。
+    // 中央と寄りが 14.8% vs 15.7% と逆転して見えることがある。
+    // **フェーズBBB-77（フェンス手前の見えない壁を外した）で「中央が最良」から「寄ると中央が
+    // ほぼ同率」へ動いた**（寄る 9.2〜9.8% / 中央 8.7〜9.5% / 離れる 7.5〜8.2%。格子の細かさで
+    // 前後する）＝寄るのは得にも損にもならない。帯は「中央を1pt以上上回る立ち位置が無い」。
     const zoneAverage = (stance: number): number => {
       let sum = 0;
       let n = 0;
@@ -429,10 +482,14 @@ describe('打席内の立ち位置（O-36。`npm run balance:stance` で測っ�
       }
       return sum / n;
     };
+    // **フェーズBBB-82（野手の足を原作の 6.0m/s に）で、寄るほうが安打率で3pt前後高くなった**
+    // （寄る 35.7% / 中央 32.1% / 離れる 31.4%）＝詰まった当たりが遅い野手の前に落ちるぶん。
+    // ただし増えるのは単打で、**1打球あたりの塁打は 0.545 / 0.525 / 0.528 とほぼ同じ**＝
+    // 支配的と言える差ではない。帯は「中央を5pt以上上回る立ち位置が無い」。
     const center = zoneAverage(0);
-    expect(center).toBeGreaterThanOrEqual(zoneAverage(-BATTER_STANCE_RANGE));
-    expect(center).toBeGreaterThanOrEqual(zoneAverage(BATTER_STANCE_RANGE));
-  });
+    expect(zoneAverage(-BATTER_STANCE_RANGE) - center).toBeLessThan(0.05);
+    expect(zoneAverage(BATTER_STANCE_RANGE) - center).toBeLessThan(0.05);
+  }, 20000);
 
   it('CPU打者には「配球を散らす」が有効になる（同じコースへ続けると狙われる）', () => {
     // CPUは直前の球のコースへ芯を合わせる（chooseCpuStance）ので、
@@ -465,11 +522,14 @@ describe('CPU投手の変化球（P-37。`npm run balance:cpubreak` で測った
   const widths = (plan: ReturnType<typeof chooseCpuPitchPlan>) =>
     profiles.map((p) => planCpuPitchShape(plan, p).breakWidth);
 
-  it('名鑑96人の曲がりはゾーン半幅の1〜2倍に収まる（見えるが荒唐無稽ではない）', () => {
-    // 実測：フォーク 0.48〜0.89m ／ 速球 0.25〜0.44m（ゾーン半幅 0.45m）
+  it('名鑑96人の曲がりはゾーン半幅の「1〜2倍 × BREAK_STRENGTH」に収まる（見えるが荒唐無稽ではない）', () => {
+    // P-37 の実測：フォーク 0.48〜0.89m ／ 速球 0.25〜0.44m（ゾーン半幅 0.45m）。
+    // **BBB-77 で曲がり全体を3割にした**（「球があまりにも左右に曲がりやすすぎる」→ 自分の球も
+    // CPUの球も3割、ユーザー判断）ので、いまは フォーク 0.14〜0.27m ／ 速球 0.07〜0.13m。
+    // 帯も同じ割合で縮める（名鑑の変化量どうしの比は変わらない）。
     const fork = widths(forkPlan);
-    expect(Math.min(...fork)).toBeGreaterThan(STRIKE_ZONE_HALF_WIDTH * 0.8);
-    expect(Math.max(...fork)).toBeLessThan(STRIKE_ZONE_HALF_WIDTH * 2.5);
+    expect(Math.min(...fork)).toBeGreaterThan(STRIKE_ZONE_HALF_WIDTH * 0.8 * BREAK_STRENGTH);
+    expect(Math.max(...fork)).toBeLessThan(STRIKE_ZONE_HALF_WIDTH * 2.5 * BREAK_STRENGTH);
   });
 
   it('遅い球ほど大きく曲がる（横移動は飛行時間の2乗で効く＝O-35の計測どおり）', () => {
@@ -478,19 +538,33 @@ describe('CPU投手の変化球（P-37。`npm run balance:cpubreak` で測った
     for (let i = 0; i < profiles.length; i += 1) expect(fork[i]).toBeGreaterThan(fast[i]);
   });
 
-  it('曲がりの差は「投げる前に分かる」を消す大きさ（打席内の可動幅より大きい）', () => {
+  it('BBB-77で3割にした代償：速球の曲がりは打席内の可動幅より小さい（投げる前の手がかりが P-37 より読める）', () => {
     // P-37より前はリリース位置＝本塁通過位置だった＝打者は投げる前に答えを見ていた。
-    // 曲がり幅がそのまま「嘘の量」になるので、打者が寄れる幅（±0.2m）を超えている
-    // ことが「リリース位置だけを見て構える」が成り立たない条件になる。
-    for (const w of widths(fastPlan)) expect(w).toBeGreaterThan(BATTER_STANCE_RANGE);
+    // P-37 は曲がり幅を「嘘の量」と見て、打者が寄れる幅より大きい（＝立ち位置だけを見て構えても
+    // 外れる）ことを条件にしていた。**BBB-77（曲がり3割。ユーザー判断）でこれは速球について
+    // 成り立たなくなった**＝投手の立ち位置からコースが P-37 のときより読める。
+    // **狙うコースは1つも変わっていない**（P-37 の逆算）ので、I-29 以来の打たれ方は動かない。
+    // フォークはまだ半分近くの投手で可動幅を越える（緩い球ほど大きく曲がる）。
+    for (const w of widths(fastPlan)) expect(w).toBeLessThan(BATTER_STANCE_RANGE);
+    expect(Math.max(...widths(forkPlan))).toBeGreaterThan(BATTER_STANCE_RANGE);
   });
 });
 
 describe('敬遠（Q-38。`npm run balance:walk` で測った帯）', () => {
   // 得点期待の土台は計測ツールと同じものを使う（`tools/balance/runExpectancy.ts`）。
-  // テストは粗い格子（STEPS）で回すので絶対値はツールの出力と一致しないが、
-  // **ここが守るのは大小関係のほう**（このファイル全体の方針）。
-  const dist = (power: number) => distributionFor(power, { steps: STEPS });
+  // テストは粗い格子で回すので絶対値はツールの出力と一致しないが、
+  // **ここが守るのは大小関係のほう**（このファイル全体の方針）。打者どうしの差は小さいので
+  // `FINE_STEPS` で測る（`STEPS` では長打力 0.5 と 0.75 の損得が 0.003点差で裏返る）。
+  const distMemo = new Map<number, ReturnType<typeof distributionFor>>();
+  const dist = (power: number) => {
+    // 同じ打者の分布を何度も引くので使い回す（決定的＝同じ値）
+    let d = distMemo.get(power);
+    if (!d) {
+      d = distributionFor(power, { steps: FINE_STEPS });
+      distMemo.set(power, d);
+    }
+    return d;
+  };
   const average = dist(0.5);
   const table = solveRunExpectancy(average);
   /** 「勝負したときの失点期待 − 敬遠したときの失点期待」。正なら敬遠が得 */
@@ -515,6 +589,9 @@ describe('敬遠（Q-38。`npm run balance:walk` で測った帯）', () => {
     }
   });
 
+  // BBB-77（フェンス手前の見えない壁を外した）から BBB-81 までは、一様な格子の打線がほとんど
+  // 点を取れず、この帯は誤差に埋もれて崩れていた（`it.fails`）。**野手の足を原作の 6.0m/s に
+  // した BBB-82 で攻撃が戻り、そのまま通るようになった。**
   it('走者なしの敬遠は損（1本で点が入らないので歩かせる値打ちが無い）', () => {
     // CPUの規則が「得点圏に走者がいること」を求める根拠。
     expect(gain(CPU_INTENTIONAL_WALK_POWER_THRESHOLD, 1, EMPTY)).toBeLessThan(0);
@@ -607,6 +684,8 @@ describe('CPUの采配と球団の個性（R-39。`npm run balance:lineup` で�
     expect(pa[0] - pa[8]).toBeLessThan(1);
   });
 
+  // BBB-79 では崩れていた（`it.fails`）。野手の足を原作の 6.0m/s にした BBB-82 で攻撃が戻り、
+  // 上位4つの差 0.01点・1番と9番の差 0.04〜0.07点（格子の細かさで前後する）に戻った。
   it('強打者をどの打順に置いても得点期待はほとんど動かない（上位4つは横並び）', () => {
     const top = [0, 1, 2, 3].map((slot) => runsWithAt(slot, STRONG));
     const spread = Math.max(...top) - Math.min(...top);
@@ -615,11 +694,19 @@ describe('CPUの采配と球団の個性（R-39。`npm run balance:lineup` で�
     expect(runsWithAt(0, STRONG) - runsWithAt(8, STRONG)).toBeGreaterThan(spread * 2);
   });
 
-  it('最弱の打者（投手）は9番が最良＝原作の既定と一致する', () => {
+  it('最弱の打者（投手）をどの打順に置いても得点期待はほとんど動かない＝9番固定で損をしない', () => {
+    // **フェーズBBB-82（野手の足を原作の 6.0m/s に）で「9番が最良」から「どこでもほぼ同じ」へ**。
+    // 一様な格子では、長打力の無い打者の外した当たりが遅い野手の前に落ちて**出塁だけはする**
+    // （投手：単打 19%・二塁打以上 12%／平均の打者：単打 14%・二塁打以上 15%）ので、打席の多い
+    // 上位へ置いても損がほとんど出ない。打順による差は 0.005〜0.03点（格子の細かさで最良の
+    // 打順が 9番にも1番にもなる＝誤差の大きさ）＝**9番に固定して失うものは無い**、という
+    // R-39 の結論（CPUの打順に規則を持たせない）はそのまま。
+    // なお**実際の打席**（`balance:plate`）では投手の打率は .10 前後で、差ははっきり出る＝
+    // この一様な格子は打者どうしの比較には向かない（`atBatDistribution` の説明を参照）。
     const runs = Array.from({ length: 9 }, (_, slot) => runsWithAt(slot, WEAK));
-    expect(runs.indexOf(Math.max(...runs))).toBe(8);
-    // 単調に「後ろへ回すほど良い」ので、9番固定に例外が要らない
-    expect(runs[8]).toBeGreaterThan(runs[4]);
+    const best = Math.max(...runs);
+    expect(best - runs[8]).toBeLessThan(0.02);
+    expect(best - Math.min(...runs)).toBeLessThan(0.05);
   });
 
   // ---- 盗塁：走力を見る根拠（損益分岐と、走力が動かす守備の余裕） ----
@@ -634,15 +721,25 @@ describe('CPUの采配と球団の個性（R-39。`npm run balance:lineup` で�
     const breakEven = (from: number, to: number, outs: number) =>
       (table[outs][from] - table[outs + 1][EMPTY]) /
       (table[outs][to] - table[outs + 1][EMPTY]);
-    const second = breakEven(FIRST, SECOND, 1);
-    expect(second).toBeGreaterThan(0.6);
-    // QQ-65 で「外した打球」の減衰を強めた（0.30→0.35）ぶん、長打が減って**アウト1つの
-    // 費用が相対的に上がった**＝損益分岐は 0.805 → 0.916 へ動いた。R-39 の規則
-    // （守備に残る余裕 0.10秒以下＝完璧な送球でしか刺せない走者だけが走る）は
+    // **フェーズBBB-82（野手の足を原作の 6.0m/s に）で 0.65〜0.73**（1死 0.65 / 0死 0.72）＝
+    // 実際の野球の損益分岐（7割前後）とほぼ同じ帯になった。履歴：R-39 0.73 → QQ-65 0.92
+    // （長打が減ってアウト1つの費用が上がった）→ BBB-77 0.22（見えない壁を外して打線が
+    // ほとんど点を取れなくなり、この帯は `it.fails` で残していた）→ BBB-82 で攻撃が戻った。
+    // R-39 の規則（守備に残る余裕 0.10秒以下＝完璧な送球でしか刺せない走者だけが走る）は
     // **もともと成功率がほぼ1の場面しか通さない**ので、規則そのものは動かない。
-    expect(second).toBeLessThan(0.95);
-    // 三盗のほうが損益分岐は低い（三塁は還りやすい）＝一律のしきい値は三盗に対して保守的
-    expect(breakEven(SECOND, THIRD, 1)).toBeLessThan(second);
+    // **フェーズBBB-85（野手の足 7.0m/s・CPU守備の反応 0.45秒）で 0.54〜0.62**（1死 0.54 / 0死 0.62）：
+    // 外野の間を抜ける長打が減って単打が増えた＝一塁の走者が安打1本では還りにくくなり、
+    // 二塁へ進む値打ちが上がった。「半分以上は成功しないと損」という結論は変わらない。
+    for (const outs of [0, 1]) {
+      const second = breakEven(FIRST, SECOND, outs);
+      expect(second).toBeGreaterThan(0.5);
+      expect(second).toBeLessThan(0.85);
+      // **三盗のほうが高い成功率を要る**（0.75〜0.81）＝実際の野球と同じ向き。BBB-82 の前は
+      // 逆だった（「三塁は還りやすい」ぶん三盗が得）。野手が遅くなって**二塁の走者は安打1本で
+      // たいてい還れる**ので、三塁へ進む上積みが小さくなった＝標準のリードではどの走力でも
+      // 三盗が成立しない（R-39）ことと向きがそろった。
+      expect(breakEven(SECOND, THIRD, outs)).toBeGreaterThan(second);
+    }
   });
 
   it('走力は「守備に残る余裕」を動かし、平均の走者はしきい値の外にいる', () => {
@@ -697,23 +794,35 @@ describe('球団の個性の残り（S-40。`npm run balance:identity` で測っ
 
   // ---- 配球（1〜3段目） ----
 
-  it('当てられたときの費用だけでは持ち味を決められない（速球はどの投手でも一番高い）', () => {
+  it('当てられたときの費用だけでは持ち味を決められない（いちばん安いのは中庸の球）', () => {
     // 1段目の再現。費用だけで選ばせるとどの投手も速球を投げなくなる＝持ち味が消える。
     // だから決め球は「当てさせない力」（時間の短さ／曲がり）の側から決めている。
     // **名鑑の実際の幅（SPD 0.35〜0.96）で見る**（フェーズRR-66）：RR-66で打球初速の
     // 基準を下げたので、**名鑑に存在しないSPD0の投手**ではフォークが遅すぎて
     // 前へ落ちる当たりが増え（21.0%）、速球（16.1%）を上回る。名鑑の中では従来どおり
     // 速球がいちばん高い。
+    // **BBB-85 から、打球に乗るのは緩急ぶんだけ**＝当てられたときの質は、どの投手でも同じになる
+    // （投手の基準速を一緒に渡す）。持ち味を費用から決められない、という結論はそのまま。
     for (const spd of [0.35, 0.5, 0.96]) {
       const at = (y: -1 | 0 | 1) =>
-        measure({ power: 0.5, pitchSpeed: speedForPitchSelection(y, spd) }).hitRate;
+        measure({
+          power: 0.5,
+          pitchSpeed: speedForPitchSelection(y, spd),
+          pitcherNeutral: neutralSpeedFor(spd),
+          steps: FINE_STEPS,
+        }).hitRate;
       const [fast, neutral, slow] = [at(-1), at(0), at(1)];
+      // 速球は基準速より必ず高い＝費用で選べば速球は選ばれない（どの投手も持ち味が消える）
       expect(fast).toBeGreaterThan(neutral);
-      expect(fast).toBeGreaterThan(slow);
-      // いちばん安い球は速球よりはっきり安い（＝費用で選べば速球は選ばれない）
-      expect(Math.min(neutral, slow)).toBeLessThan(fast * 0.8);
+      expect(neutral).toBeLessThan(fast * 0.95);
+      // **フェーズBBB-82（野手の足を原作の 6.0m/s に）から、遅い球も安くない**：当てられた
+      // 弱い当たりが野手の前に落ちる（SPD0.5 で 速球33%／基準29%／フォーク39%）。それまでは
+      // 速球がいちばん高かった。「いちばん安いのは中庸」＝費用の側はU字のままで、どの型の
+      // 持ち味（速球・フォーク）も費用からは選ばれない、という結論は変わらない。
+      // 速い投手（SPD0.96）だけは遅い球がいちばん安い（29%）＝遅い球は投手を選ぶ。
+      if (spd <= 0.5) expect(slow).toBeGreaterThan(neutral);
     }
-  });
+  }, 30000);
 
   it('速球の値打ちは時間の短さ、フォークの値打ちは曲がり（2段目）', () => {
     const power = { speed: 1, fork: 0.3, breakLeft: 0.3, breakRight: 0.3 };
@@ -916,8 +1025,11 @@ describe('疲労の持ち越し（V-43。`npm run balance:rotation` で測った
     solveRunExpectancy(distributionFor(0.5, { average: 0.5, pitcherFatigue: fatigue }))[0][0];
 
   it('疲労は打たれ方を実際に悪くする（＝持ち越しが代償になる条件）', () => {
-    // ここが成り立たないと V-43 の設計（疲れを代償にする）が空振りする
-    expect(runsAt(1)).toBeGreaterThan(runsAt(0) * 2);
+    // ここが成り立たないと V-43 の設計（疲れを代償にする）が空振りする。
+    // **BBB-85 までこの計測は疲労の費用を大きく見ていた**：球威の上乗せ（+5m/s）だけを足し、
+    // 疲労で球速が落ちるぶん打球が弱くなる（-2.1m/s）を数えていなかった（実機の差し引きは
+    // +2.9）。BBB-85 で上乗せそのものが +2.9 になり、計測も実機と同じ値を見る＝2倍強 → 1.9倍。
+    expect(runsAt(1)).toBeGreaterThan(runsAt(0) * 1.5);
   });
 
   it('疲労は単調に効く（途中で得になる領域が無い＝「わざと疲れる」が起きない）', () => {
@@ -925,7 +1037,7 @@ describe('疲労の持ち越し（V-43。`npm run balance:rotation` で測った
     for (let i = 1; i < steps.length; i += 1) {
       expect(steps[i]).toBeGreaterThan(steps[i - 1]);
     }
-  });
+  }, 20000);
 
   it('連投したエースは、1試合空けた同じ投手より必ず損', () => {
     // 完投（残量0）→ 次の試合は REST_RECOVERY、2試合後は 2×REST_RECOVERY
@@ -1062,10 +1174,11 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
       const result = fieldBunt(aim);
       expect(result.fielded).toBeDefined();
       expect(result.fielded!.by).toBe('P');
-      // 1段目：本塁から 10.5〜11.2m・確保 0.83〜1.20秒
+      // 1段目：本塁から 12m前後・確保 0.98〜1.82秒（野手の足を原作の 6.0m/s にした BBB-82 から。
+      // それまでの 8.5m/s では 0.83〜1.20秒）
       const depth = Math.hypot(result.fielded!.pos.x, result.fielded!.pos.z);
       expect(depth).toBeLessThan(15);
-      expect(result.fielded!.sec).toBeLessThan(1.5);
+      expect(result.fielded!.sec).toBeLessThan(2.0);
     }
   });
 
@@ -1086,28 +1199,53 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
   // ---- 代打（8段目） ----
 
   it('代打の利得は得点圏で跳ねる（＝しきい値を「得点圏かどうか」に置いた根拠）', () => {
-    const scoreTable = solveScoreProbability(distributionFor(0.5, { steps: STEPS }));
-    const pitcher = distributionFor(0.1, { average: 0.2, steps: STEPS });
-    const bench = distributionFor(0.67, { average: 0.49, steps: STEPS });
-    const gain = (outs: number, state: number) =>
-      paScoreProb(bench, outs, state, scoreTable) - paScoreProb(pitcher, outs, state, scoreTable);
-    // **走者が出ていれば利得は大きく、走者なしでは小さい**（どの塁でも走者なしの2倍以上）
-    // ＝X-45が「得点圏かどうか」でしきい値を切った根拠はここ。
-    //
-    // **フェーズUU-69で「三塁 > 一塁」は成り立たなくなった**（抗力 0.0012→0.0016）。
-    // 長打が減ると、**三塁の走者はもともと弱い打者でも還せる**ので良い打者に替える利得が
-    // 小さくなり、**一塁の走者は安打が要る**ぶん利得が大きく残る（実測 0死で 一塁11.2pt /
-    // 二塁10.8pt / 三塁8.5pt / 走者なし3.7pt）。**X-45の規則そのものは触っていない**ので、
-    // 「得点圏」という条件が**いちばん利得の大きい場面（一塁）を外している**ことは
-    // 未確認事項として記録した（規則を解き直すのは別セッションの規模）。
-    for (const state of [1, 2, 4]) {
-      expect(gain(0, state)).toBeGreaterThan(gain(0, 0) * 2);
+    // **フェーズBBB-82で「打席そのもの」の分布へ載せ替えた**（`atBatDistribution`）。
+    // それまでは一様な格子（`distributionFor`）で測っていたが、野手の足を原作の 6.0m/s に
+    // すると、その格子では**外した当たりが野手の前に落ちる**ぶん投手（長打力0.1）と控え
+    // （0.67）の出塁率が同じになり、利得が 0〜2pt まで潰れる。実際の打席では投手の打率は
+    // .10 前後・控えは .34 前後で、差ははっきり出る＝画面で起きているのはこちら。
+    // （BBB-77〜81 の間は、打線がほとんど点を取れずこの帯は `it.fails` で残していた。）
+    const starters = TEAMS.map((team) => pitcherRowPitching(team.pitchers[0]));
+    const batterOf = (average: number, power: number) => ({
+      bats: 'R' as const,
+      average,
+      power,
+      run: 0.5,
+    });
+    // 四球・死球は**押し出しの進塁としてそのまま数える**（`walkAs: 'walk'`。フェーズBBB-84で
+    // 分布に四死球の枠ができた）のと、アウトに寄せた下限の両方で確かめる。BBB-83 までは枠が無く
+    // 「アウトに寄せた下限／単打に寄せた上限」で挟んでいたが、単打へ寄せると四死球の多い弱い打者の
+    // 値打ちを過大に見る（内外角を引くようになって、踏み込んだCPU打者への死球が増えた）。
+    // **打席数は各640**（16投手×40）：160打席では標本の揺れ（±3pt）が利得の差と同じ大きさになる。
+    for (const walkAs of ['out', 'walk'] as const) {
+      const of = (average: number, power: number) =>
+        atBatDistribution(batterOf(average, power), starters, { walkAs, reps: 40 });
+      const scoreTable = solveScoreProbability(of(0.5, 0.5));
+      const pitcher = of(0.2, 0.1);
+      const bench = of(0.49, 0.67);
+      const gain = (outs: number, state: number) =>
+        paScoreProb(bench, outs, state, scoreTable) - paScoreProb(pitcher, outs, state, scoreTable);
+      // **得点圏（二塁・三塁）の利得は、走者なし・一塁のみより大きい**（四死球をそのまま数えて
+      // 0死 二塁 6.9pt 対 4.0/4.4pt、1死 9.0/6.1pt 対 3.5/4.4pt、2死 11.5/8.6pt 対 2.4/3.3pt）
+      // ＝X-45が「得点圏かどうか」で切った根拠。
+      // UU-69 が記録した「一塁がいちばん利得が大きい（規則が最良の場面を外している）」は
+      // ここで解消した＝二塁の走者が安打1本で還れるようになったため。
+      // **0死の三塁だけは別**：弱い打者でも還せる（内野ゴロ・外野フライで足りる）ので、
+      // 利得は走者なし・一塁と同じ帯に並ぶ（4.3pt 対 4.0/4.4pt）。
+      for (const outs of [0, 1, 2]) {
+        for (const scoring of outs === 0 ? [2] : [2, 4]) {
+          expect(gain(outs, scoring)).toBeGreaterThan(gain(outs, 0));
+          expect(gain(outs, scoring)).toBeGreaterThan(gain(outs, 1));
+        }
+      }
+      // アウトが増えるほど差が開く（2死では走者なしの2倍以上）＝2死の好機ほど代打が効く
+      expect(gain(2, 2)).toBeGreaterThan(gain(2, 0) * 2);
+      // どの場面でも「控えのほうが強い」ことは変わらない（負にはならない）
+      for (let state = 0; state < 8; state += 1) {
+        for (const outs of [0, 1, 2]) expect(gain(outs, state)).toBeGreaterThan(0);
+      }
     }
-    // どの場面でも「控えのほうが強い」ことは変わらない（負にはならない）
-    for (let state = 0; state < 8; state += 1) {
-      for (const outs of [0, 1, 2]) expect(gain(outs, state)).toBeGreaterThan(0);
-    }
-  });
+  }, 30000);
 
   it('しきい値0.80は名鑑16球団で死んでいない（Q-38の能力差と同じ見方）', () => {
     const rows = TEAMS.map((team) => {
@@ -1144,11 +1282,16 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
     const actual =
       sample.fielded === undefined
         ? Number.NEGATIVE_INFINITY
-        : 27.43 / speed - (sample.fielded.sec + distance(sample.fielded.pos, to) / THROW_SPEED);
+        : // 実際の守備も、拾ってから持ち替え（BBB-82）を待って投げる
+          27.43 / speed -
+          (sample.fielded.sec + PICKUP_RELEASE_SEC + distance(sample.fielded.pos, to) / THROW_SPEED);
     return { rule, actual };
   }
 
-  const hits = sweep({ batter: hitter(0.5), steps: STEPS })
+  // **守備は「CPU走者が人間の守備に見込む動き」**（いちばん近い野手を球へ向ける・反応0）で回す
+  // （フェーズBBB-83）：この規則が実機で使われるのはCPUが攻撃＝人間が守るときだけ。CPU守備の
+  // 先回りを相手に測ると、画面では起きない組み合わせを数えることになる。
+  const hits = sweep({ batter: hitter(0.5), steps: STEPS, chase: 'follow', reactionSec: 0 })
     .filter((s) => ['beatThrow', 'hit', 'groundRuleDouble'].includes(s.result.outcome.kind))
     .map((s) => {
       const crossX = crossXFor(s.course);
@@ -1176,12 +1319,15 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
       };
     });
 
-  it('帯が空ではない（安打の過半で余分な塁を狙える）', () => {
+  it('帯が空ではない（安打の3割前後で余分な塁を狙える）', () => {
     const going = hits.filter(
       (h) => extraBaseCase(h, RUNNER_SPEED).rule <= -CPU_TAG_UP_MARGIN_SEC,
     );
-    // 11段目：基準速で 80.0%
-    expect(going.length / hits.length).toBeGreaterThan(0.5);
+    // 11段目：基準速で 80.0% だった。**フェーズBBB-77で約3割に下がった**＝フェンス手前の
+    // 見えない壁（野手は本塁から98mより奥へ行けなかった）を外し、外野の頭を越えて止まった
+    // 打球（余分な塁を狙える安打の大半）が捕られるようになったため。残った安打は外野の手前に
+    // 落ちる打球と内野を抜ける打球が中心。
+    expect(going.length / hits.length).toBeGreaterThan(0.25);
     expect(going.length).toBeLessThan(hits.length); // 全部ではない（内野安打では行かない）
   });
 
@@ -1216,13 +1362,18 @@ describe('CPUの攻撃の采配（X-45。`npm run balance:offense` で測った�
     expect(cautious / diffs.length).toBeGreaterThan(0.5);
   });
 
-  it('余白 CPU_TAG_UP_MARGIN_SEC で、仕掛けた走者が実際に刺される場面が消える', () => {
+  it('余白 CPU_TAG_UP_MARGIN_SEC で、仕掛けた走者が刺されるのは「反応0の完璧な守備」に紙一重の1本だけ', () => {
     const going = hits.filter(
       (h) => extraBaseCase(h, RUNNER_SPEED).rule <= -CPU_TAG_UP_MARGIN_SEC,
     );
     const caught = going.filter((h) => extraBaseCase(h, RUNNER_SPEED).actual >= 0);
-    // 12段目：margin 0 では 1.6% が刺される。0.14 で 0.0%
-    expect(caught.length).toBe(0);
+    // 12段目：margin 0 では 1.6% が刺される。0.14 で 0.0% だった（野手 6.0m/s まで）。
+    // **フェーズBBB-85（野手 7.0m/s）で1本だけ残る**：左翼の前に落ちて転がる当たりを、
+    // いちばん近い野手ではなく、一斉移動で同じ向きへ動いた左翼手が先に拾う（見込み 2.42秒・
+    // 実際 2.05秒）。ここで言う実際の守備は**打った瞬間に動き出し、拾ってすぐ三塁へ投げる**
+    // 守備で、その差は 0.03秒＝人の反応（0.2秒）があれば走者は生きる。
+    expect(caught.length).toBeLessThanOrEqual(1);
+    for (const h of caught) expect(extraBaseCase(h, RUNNER_SPEED).actual).toBeLessThan(0.05);
   });
 });
 
@@ -1240,7 +1391,7 @@ describe('バントの成立（Y-46。`npm run balance:bunt` で測った帯）'
   /** 確保してからその塁へ送球が届くまで（打球の瞬間からの秒数）。sim.ts の throwOut と同じ式 */
   const throwArrival = (r: ReturnType<typeof fieldBunt>, base: 'first' | 'second') =>
     r.fielded!.sec +
-    CPU_POSSESSED_REACTION_SEC +
+    PICKUP_THROW_DELAY_SEC +
     distance(r.fielded!.pos, BASE_POSITIONS[base]) / THROW_SPEED;
 
   /** 捕手が投球を受けてから二塁へ投げるまで（＝盗塁を刺す経路。比較の基準線） */
@@ -1261,17 +1412,41 @@ describe('バントの成立（Y-46。`npm run balance:bunt` で測った帯）'
     expect(pushedSec).toBeLessThanOrEqual(normal.fielded!.sec);
   });
 
-  it('押し＋ライン際でだけ、転がすほうが盗塁より守備を遅くできる（このフェーズの芯）', () => {
-    // 標準のバントは**捕手の送球より速い**＝転がすと守備を助けてしまう（実際の野球と逆）
-    expect(throwArrival(fieldBunt(-1), 'second')).toBeLessThan(catcherPath);
-    // 押してライン際なら逆転する＝バントが走者を守る側に回る
+  it('ライン際へ転がせば、捕手が盗塁を刺すより守備は遅くなる（Y-46の芯。BBB-82で標準のバントも）', () => {
+    // Y-46 の当時は**標準のバントが捕手の送球より速かった**（転がすと守備を助けた＝実際の野球と逆）。
+    // 野手の足を原作の 6.0m/s にした BBB-82 からは、投手が拾いに行くのに時間が掛かるので、
+    // 標準のバントでも守備は遅くなる＝この逆転は守備のモデルの側から解けた。
+    expect(throwArrival(fieldBunt(-1), 'second')).toBeGreaterThan(catcherPath);
     expect(throwArrival(fieldBunt(-1, true), 'second')).toBeGreaterThan(catcherPath);
+    // 押しのほうが標準より遅い。**差は BBB-83 で 0.14秒 → 0.01秒まで縮んだ**：CPUの投手が
+    // 球と出会う点へまっすぐ向かうようになり（先回り）、三塁線に沿って転がる球はどこまで
+    // 転がっても拾うまでの時間がほとんど変わらない（三塁線は投手から見てほぼ等距離）。
+    // 標準のバントのほうは、打球への反応（0.25秒）のぶん拾うのが遅くなった。
+    expect(
+      throwArrival(fieldBunt(-1, true), 'second') - throwArrival(fieldBunt(-1), 'second'),
+    ).toBeGreaterThan(0);
   });
 
   it('押しバントでも打者走者は一塁で刺される（＝アウトと引き換えの手であることは変わらない）', () => {
+    // **フェーズBBB-85（野手 7.0m/s）で 13→13.5**＝BBB-83 と同じ余裕（最速の打者で 0.16秒）に
+    // なる初速。以下は BBB-82 の記録。
+    // **フェーズBBB-82で押しの初速をこの条件から解き直した（17→13）**。野手の足を原作の
+    // 6.0m/s にすると、17m/s は三塁手の手前まで転がって足の速い打者（走力0.8以上）が必ず
+    // 内野安打になり、16〜16.5m/s は誰が打っても全員セーフだった（`balance:bunt` の4c段目）。
+    // いまの初速は「いちばん足の速い打者でも一塁で刺される最大の値」（余裕 0.1秒以上）。
     for (const aim of [-1, 1] as const) {
       const r = fieldBunt(aim, true);
-      expect(throwArrival(r, 'first')).toBeLessThan(BASE_PATH / RUNNER_SPEED_MAX);
+      expect(BASE_PATH / RUNNER_SPEED_MAX - throwArrival(r, 'first')).toBeGreaterThan(0.1);
+    }
+  });
+
+  it('押しても三塁走者は還れない（スクイズはこの守備でも成立しない＝X-45の結論のまま）', () => {
+    // 4c段目：いちばん足の速い走者がリードを取っていても、本塁への送球のほうが早い
+    for (const aim of [-1, 1] as const) {
+      const r = fieldBunt(aim, true);
+      const home =
+        r.fielded!.sec + PICKUP_THROW_DELAY_SEC + distance(r.fielded!.pos, BASE_POSITIONS.home) / THROW_SPEED;
+      expect((BASE_PATH - STEAL_LEAD) / RUNNER_SPEED_MAX).toBeGreaterThan(home);
     }
   });
 
@@ -1287,14 +1462,20 @@ describe('バントの成立（Y-46。`npm run balance:bunt` で測った帯）'
     const pushed = fieldBunt(-1, true);
     const arrival = throwArrival(pushed, 'second');
     const runnerSec = (speed: number) => (BASE_PATH - STEAL_LEAD) / speed;
-    // 7段目：走力1.0はセーフ（+0.04秒）／走力0.0はアウト
+    // 4c段目（BBB-85：野手 7.0m/s・押し 13.5m/s）：走力1.0はセーフ（+0.19秒）／走力0.0は
+    // アウト（-0.41秒）。基準速はほぼ同着（-0.08秒＝わずかにアウト）＝平均より足のある走者から
+    // 成立する。BBB-82 は +0.25／-0.35／-0.02、BBB-83 は +0.22／-0.05（基準速）。
     expect(runnerSec(RUNNER_SPEED_MAX)).toBeLessThan(arrival);
     expect(runnerSec(RUNNER_SPEED_MIN)).toBeGreaterThan(arrival);
+    expect(Math.abs(runnerSec(RUNNER_SPEED) - arrival)).toBeLessThan(0.1);
   });
 
-  it('標準のバントはリードを足しても成立しない（押しが要る＝コツが効いている）', () => {
+  it('標準のバントは、基準速の走者ではリードを足しても成立しない（俊足なら成立する）', () => {
+    // BBB-82 から：野手が遅くなったぶん、標準のバントでも**いちばん速い走者**は二塁に間に合う。
+    // 基準速の走者は間に合わない＝押し（ライン際）か、足のある走者が要る。
     const arrival = throwArrival(fieldBunt(-1), 'second');
-    expect((BASE_PATH - STEAL_LEAD) / RUNNER_SPEED_MAX).toBeGreaterThan(arrival);
+    expect((BASE_PATH - STEAL_LEAD) / RUNNER_SPEED).toBeGreaterThan(arrival);
+    expect((BASE_PATH - STEAL_LEAD) / RUNNER_SPEED_MAX).toBeLessThan(arrival);
   });
 });
 
@@ -1707,6 +1888,8 @@ describe('代走（GG-54。`npm run balance:pinchrun` で測った帯）', () =>
     expect(gain).toBeLessThan(0.8);
   });
 
+  // BBB-77〜81 の間は打線がほとんど点を取れず、この帯は崩れていた（`it.fails`）。野手の足を
+  // 原作の 6.0m/s にした BBB-82 で攻撃が戻り、利得 +0.18点 に対して費用 0.74点（残り9イニング）。
   it('走力だけを見る規則は損（＝代走は「走力を買って打力を売る」手）', () => {
     // 10段目：利得（盗塁が1つ成立）+0.112点 に対し、**いちばん遅い走者をいちばん速い
     // 控えに代える**という走力だけの打ち手は、残り9イニングで 0.897点も打力を失う。
@@ -1733,7 +1916,7 @@ describe('代走（GG-54。`npm run balance:pinchrun` で測った帯）', () =>
     after[slot] = distributionFor(fastest.power, { average: fastest.average });
     const cost = solveLineup(before, 9).runs - solveLineup(after, 9).runs;
     expect(cost).toBeGreaterThan(stealGain);
-  });
+  }, 20000);
 
   it('しきい値（0.10）まで差し出す控えなら、終盤に出すぶんには損しない', () => {
     // 12段目：0.10 の保証は**フェーズJJ-57で「残り3イニングなら100%」に弱まった**
@@ -1778,70 +1961,87 @@ describe('代走（GG-54。`npm run balance:pinchrun` で測った帯）', () =>
   });
 });
 
-describe('CPU打者の選球と空振り（SS-67。`npm run balance:plate` で測った帯）', () => {
+/**
+ * 打席まるごとの帯（SS-67 → TT-68 → **AAA-75**。`npm run balance:plate`）。
+ *
+ * AAA-75 で CPU打者は**直前のストライクの速さに合わせ、人間並みにぶれる**ようになった
+ * ので、同じ対戦でも打席ごとに結果が散る。ここでは**1本のぶれの系列を共有して各対戦を
+ * `PLATE_REPS` 回ずつ**回す（系列はシードで決まる＝何度回しても同じ数字）。
+ */
+const PLATE_REPS = 4;
+const plateAtBats = (opts: AtBatOptions = {}, seed = 1) => {
+  const noise = swingNoiseStream(seed);
+  return TEAMS.map((t) => createTeamRoster(teamById(t.id)))
+    .map((off, i, all) => {
+      const def = all[(i + 1) % all.length];
+      const pitcher = def.players[def.pitcher].pitching!;
+      return off.lineup.flatMap((id) =>
+        Array.from({ length: PLATE_REPS }, () =>
+          simulateAtBat(pitcher, off.players[id].batting, { ...opts, noise }),
+        ),
+      );
+    })
+    .flat();
+};
+/** 人間がある配球の形を投げ続けたとき（1文字目＝緩急 F/N/S、2文字目＝コース m/b） */
+const humanAtBats = (pattern: readonly string[]) => {
+  const sel: Record<string, -1 | 0 | 1> = { F: -1, N: 0, S: 1 };
+  const loc: Record<string, number> = { m: 0, b: -0.43 };
+  return plateAtBats({
+    humanPitch: (_: unknown, i: number) => {
+      const tok = pattern[i % pattern.length];
+      return { selection: sel[tok[0]], localX: loc[tok[1]] };
+    },
+  }, 7);
+};
+const rateOf = (rs: readonly AtBatResult[], pred: (r: AtBatResult) => boolean) =>
+  rs.filter(pred).length / rs.length;
+const avgOf = (rs: readonly AtBatResult[]) =>
+  rs.filter((r) => r.kind === 'inPlay' && r.outcome !== 'out').length /
+  Math.max(1, rs.filter((r) => r.kind !== 'walk' && r.kind !== 'hitByPitch').length);
+
+describe('CPU打者の選球と空振り（SS-67 → AAA-75。`npm run balance:plate` で測った帯）', () => {
   /**
    * QQ-65 が計測で見つけた構造＝**CPU打者は三振も四球もしない**（1打席1.51球で必ず
    * 打球になり、見送りは0.00球）を埋めたのが SS-67。ここで固定するのは値そのものでは
    * なく「**4つの帰結がどれも実際に起きること**」と「**打席が必ず終わること**」。
    */
-  const atBats = () =>
-    TEAMS.map((t) => createTeamRoster(teamById(t.id))).map((off, i, all) => {
-      const def = all[(i + 1) % all.length];
-      const pitcher = def.players[def.pitcher].pitching!;
-      return off.lineup.map((id) => simulateAtBat(pitcher, off.players[id].batting));
-    });
-
-  const flat = () => atBats().flat();
-
   it('三振も四球も実際に起きる（SS-67の前はどちらも0%だった）', () => {
-    const rs = flat();
-    const k = rs.filter((r) => r.kind === 'strikeout').length;
-    const bb = rs.filter((r) => r.kind === 'walk').length;
-    expect(k).toBeGreaterThan(0);
-    expect(bb).toBeGreaterThan(0);
-    // **フェーズUU-69で「打球が主役」ではなくなった**（有効窓 0.14→0.09）＝
-    // インプレーは 87.5%→**47.9%**。CPU打者の正規化タイミングは不変だが、
-    // **スイング判断の時刻が遅くなった**ぶん振る球が増え、三振も増えた（25.0%→39.6%）。
-    // ここで守るのは「4つの帰結がどれも起きること」だけに戻し、**割合の帯は
-    // TT-68の describe が持つ**（そちらに実際の野球との差も書いてある）。
-    expect(rs.filter((r) => r.kind === 'inPlay').length / rs.length).toBeGreaterThan(0.4);
+    const rs = plateAtBats();
+    expect(rateOf(rs, (r) => r.kind === 'strikeout')).toBeGreaterThan(0);
+    expect(rateOf(rs, (r) => r.kind === 'walk')).toBeGreaterThan(0);
+    // **AAA-75で打球が主役に戻った**（UU-69の 47.9% → 70%台）＝CPU打者がストライクに
+    // 手を出すようになり、三振は「緩急とぶれ」からだけ生まれる
+    expect(rateOf(rs, (r) => r.kind === 'inPlay')).toBeGreaterThan(0.55);
   });
 
   it('打席は必ず終わる（ファウルの無限ループが構造的に無い）', () => {
-    // 判定は決定的なので、**同じ球を投げ続けると同じファウルが永久に繰り返される**。
-    // SS-67 の前は 144打席のうち5打席が上限（40球）に張り付いていた＝実機なら
-    // 打席が終わらない。CPU投手が「粘られたら反対の隅へ散らす」ことで構造的に消えた。
-    for (const r of flat()) expect(r.pitches).toBeLessThan(10);
+    // SS-67 の前は 144打席のうち5打席が上限（40球）に張り付いていた。AAA-75の前は、人間が
+    // ど真ん中のフォークを投げ続けると37.5%の打席が終わらなかった（下の describe で見る）。
+    for (const r of plateAtBats()) expect(r.pitches).toBeLessThan(15);
   });
 
-  it('CPU打者は見送るようになった（＝四球という帰結の入口）', () => {
-    const rs = flat();
+  it('CPU打者はボール球を見送る（＝四球という帰結の入口）', () => {
+    const rs = plateAtBats();
     const takes = rs.reduce((sum, r) => sum + r.takes, 0) / rs.length;
     expect(takes).toBeGreaterThan(0.2);
   });
 
-  it('フォークは人間の投手の支配戦略ではなくなった（緩急の両側に罰があるので芯で捉えられない）', () => {
-    // SS-67 の前は「遅い球には罰なし」だったので、CPU打者はフォークを必ず芯で捉えた
-    // （|timing| 平均 0.117）＝当たっても弱いのでほぼアウトになり、投げ続けるのが
-    // 最適解だった。いまは緩急の両側に罰があるので、フォークも芯からは外れる。
-    expect(cpuSwingLead(SPEED_SLOW)).toBeGreaterThan(cpuSwingLead(SPEED_NEUTRAL));
-    expect(cpuSwingLead(SPEED_SLOW)).toBeCloseTo(cpuSwingLead(SPEED_FAST), 10);
+  it('**同じ速さを続けられると芯で捉える**（フォークにも速球にも「投げ続ければ勝てる」は無い）', () => {
+    // SS-67 は「フォークを投げ続けるのが人間の支配戦略」を、TT-68/UU-69 は「速球を投げ
+    // 続けるのが支配戦略」（ど真ん中の速球×3で三振86%）を残していた。AAA-75 以降、
+    // 待っていた速さの球は芯（t=0）＝**どの球も、続ければ捉えられる**。
+    for (const v of [SPEED_SLOW, SPEED_NEUTRAL, SPEED_FAST]) {
+      expect(cpuSwingLead(v, SPEED_NEUTRAL, v)).toBeCloseTo(SWING_IDEAL_SEC, 10);
+    }
   });
 
-  it('基準速の帰結は1mmも動いていない（B-8以来の「基準値＝従来の定数」）', () => {
-    expect(cpuSwingLead(SPEED_NEUTRAL)).toBe(SWING_IDEAL_SEC);
-  });
-
-  /**
-   * **フェーズTT-68で罰そのものを有効窓からの導出にした**（0.045 → `SWING_ACTIVE_SEC / 3`）。
-   * SS-67 が置いた「速球は 0.045 のまま」という帯はここで意図して張り替えたもので、
-   * 守るのは値ではなく**梯子の形**＝通常は窓の1/3・2ストライクは窓の1/2（縁まで泳ぐ）。
-   */
-  it('罰は有効窓からの導出で、2ストライクの罰と同じ刻みの梯子になっている（TT-68）', () => {
-    expect(cpuSwingLead(SPEED_FAST)).toBeCloseTo(SWING_IDEAL_SEC + SWING_ACTIVE_SEC / 3, 10);
-    expect(cpuSwingLead(SPEED_FAST, true)).toBeCloseTo(SWING_IDEAL_SEC + SWING_ACTIVE_SEC / 2, 10);
-    // 通常の罰は必ず有効窓の内側＝**単独では空振りにならず「弱い当たり」になる**
-    expect(cpuSwingLead(SPEED_FAST) - SWING_IDEAL_SEC).toBeLessThan(SWING_ACTIVE_SEC / 2);
+  it('ずれは有効窓からの導出（緩急1段＝窓の1/3＝TT-68の梯子の1段）', () => {
+    expect(CPU_TIMING_PENALTY_SEC).toBeCloseTo(SWING_ACTIVE_SEC / 3, 10);
+    // **1段の変化だけでは空振りさせられない**（芯から縁までの内側）
+    expect(CPU_TIMING_PENALTY_SEC).toBeLessThan(SWING_ACTIVE_SEC / 2);
+    // ぶれは UU-69 が有効窓を決めたときの人間の σ（新しい数値を持ち込んでいない）
+    expect(CPU_SWING_SIGMA_SEC).toBeCloseTo(0.04, 10);
   });
 
   it('CPU投手の配球は、引数を渡さなければSS-67の前と完全に同じ（基準線）', () => {
@@ -1864,83 +2064,125 @@ describe('CPU打者の選球と空振り（SS-67。`npm run balance:plate` で�
   });
 });
 
-describe('三振・四球を実際の野球の帯へ（TT-68。`npm run balance:plate` の12・13段目で測った帯）', () => {
+describe('三振・四球の帯（TT-68 → AAA-75。`npm run balance:plate` の1・10段目で測った帯）', () => {
   /**
-   * SS-67 は三振・四球を 0%→6.3% にしたが、**実際の野球の帯（三振22% / 四球8.5% /
-   * 1打席3.9球）には届いていなかった**（1打席2.20球）。12段目が測った原因は
-   * **通常の球の狙いがゾーンのよく内側**（0.2475）にあったこと＝CPU打者が手を出す幅
-   * （0.40）のよく内側なので**必ず振られ、その約半分がそのまま打球になる**。
+   * TT-68 は三振・四球を実際の野球の帯（22% / 8.5%）へ寄せたが、それは**決定的なCPU打者が
+   * 0.40 ちょうどで振る／振らないを切り替える「階段」の上**に乗っていた（採用値の帯は
+   * 2.5mm）。UU-69 で有効窓を狭めた途端に三振 39.6% へ飛んだのもこの階段のせい。
    *
-   * ここで固定するのは値そのものではなく、**打席がカウントの分岐へ届くこと**
-   * （＝T-41の決め球・3ボールの置き球・S-40の持ち味が実戦で投げられる条件）と、
-   * **どの帰結も消えていないこと**（三振・四球・打球・本塁打がすべて起きる）。
+   * AAA-75 でぶれが入ったので階段は消えた。代わりに**三振は実際の野球より少ない側**
+   * （先発相手で 15%前後。実際は22%）に来ている＝CPU打者は**ストライクに必ず手を出す**
+   * （様子見で見送るストライクが無い）ので、打席が短い。**ここは「まだ届いていない」帯**。
    */
-  const atBats = () =>
-    TEAMS.map((t) => createTeamRoster(teamById(t.id)))
-      .map((off, i, all) => {
-        const def = all[(i + 1) % all.length];
-        const pitcher = def.players[def.pitcher].pitching!;
-        return off.lineup.map((id) => simulateAtBat(pitcher, off.players[id].batting));
-      })
-      .flat();
-
   it('通常の球は「隅の1つ内側」＝決め球とゾーンを挟んで対称の梯子（新しい定数を持たない）', () => {
     expect(NORMAL_TARGET_X).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH - CORNER_MARGIN, 10);
-    // **見逃せばストライク**（ゾーンの内側）でありながら、**CPU打者は振ってこない縁**
-    // ＝この2つが同時に成り立つ帯の幅は、ちょうど隅の余裕1つぶんしかない。
     expect(NORMAL_TARGET_X).toBeLessThan(STRIKE_ZONE_HALF_WIDTH);
-    expect(NORMAL_TARGET_X).toBeGreaterThanOrEqual(SELECTIVE_HALF_WIDTH);
-    expect(STRIKE_ZONE_HALF_WIDTH - SELECTIVE_HALF_WIDTH).toBeCloseTo(CORNER_MARGIN, 10);
-  });
-
-  it('罰は有効窓の1/3＝2ストライクの罰（窓の1/2）より必ず内側', () => {
-    expect(CPU_TIMING_PENALTY_SEC).toBeCloseTo(SWING_ACTIVE_SEC / 3, 10);
-    // **単独では空振りにならない**（＝弱い当たりになる）ことが罰の役目そのもの
-    expect(CPU_TIMING_PENALTY_SEC).toBeLessThan(SWING_ACTIVE_SEC / 2);
-    // **フェーズUU-69で秒数の帯（0.0455〜0.0472）は外した**＝あれは有効窓 0.14 の
-    // ときに測った絶対値で、窓を 0.09 にすれば 0.03 になる（**梯子の形は不変**）。
-    // 秒で固定すると窓を触るたびに落ちる＝「テストを直すためにテストを書き換える」になる。
+    // **AAA-75 から CPU打者はゾーンいっぱいに手を出す**＝通常の球は「振られる隅」
+    // （TT-68 までは「振られずにストライクになる帯」だった＝人間が真似すれば必勝配球）
+    expect(SELECTIVE_HALF_WIDTH).toBeCloseTo(STRIKE_ZONE_HALF_WIDTH, 10);
+    expect(NORMAL_TARGET_X).toBeLessThan(SELECTIVE_HALF_WIDTH);
   });
 
   it('打席がカウントの分岐へ届く（T-41の決め球・3ボールの置き球が実戦で投げられる条件）', () => {
-    const rs = atBats();
-    // SS-67 の実測は 2ストライク到達 12.5% / 3ボール到達 6.3% ＝ほとんど届いていなかった
-    expect(rs.filter((r) => r.maxStrikes >= 2).length / rs.length).toBeGreaterThan(0.3);
-    expect(rs.filter((r) => r.maxBalls >= 3).length / rs.length).toBeGreaterThan(0.12);
+    const rs = plateAtBats();
+    // SS-67 の実測は 2ストライク到達 12.5% / 3ボール到達 6.3% ＝ほとんど届いていなかった。
+    // **BBB-79 でファウルフライも捕れるようになった**ので、2ストライクの前にファウルフライで
+    // 終わる打席が出る（同じ標本で 36%→29%。実際の野球と同じく粘る前に打ち取られる）
+    expect(rateOf(rs, (r) => r.maxStrikes >= 2)).toBeGreaterThan(0.25);
+    expect(rateOf(rs, (r) => r.maxBalls >= 3)).toBeGreaterThan(0.08);
   });
 
-  it('三振・四球・球数（実際の野球は 22% / 8.5% / 3.9球）', () => {
-    const rs = atBats();
-    const rate = (kind: string) => rs.filter((r) => r.kind === kind).length / rs.length;
-    // **フェーズUU-69で三振が 25.0%→39.6% へ行き過ぎた**（有効窓 0.14→0.09 の代償。
-    // 人間の空振りを実際の野球に合わせるほうを優先したユーザー判断）。
-    // **上限を 0.45 まで広げたのは事実に合わせただけ**で、実際の野球（22%）から
-    // 離れたことは未確認事項として記録してある＝ここは「まだ戻せていない」帯。
-    expect(rate('strikeout')).toBeGreaterThan(0.18);
-    expect(rate('strikeout')).toBeLessThan(0.45);
-    // 四球は UU-69 でも 8.3% のまま＝実際の野球（8.5%）にぴったり乗っている
-    expect(rate('walk')).toBeGreaterThan(0.05);
-    expect(rate('walk')).toBeLessThan(0.13);
+  it('三振・四球・球数（実際の野球は 22% / 8.5% / 3.9球。三振・四球・球数は少ない側）', () => {
+    const rs = plateAtBats();
+    const k = rateOf(rs, (r) => r.kind === 'strikeout');
+    expect(k).toBeGreaterThan(0.08);
+    // UU-69 の 39.6%（すべて空振り＝2ストライクの速球が必ず空振り）へは戻らない
+    expect(k).toBeLessThan(0.3);
+    // **CCC-86 で四球も少ない側になった**（CPU同士で 8.3%→3%）：追い込んだ1球の3回に1回が
+    // 勝負球（ゾーンの隅）になり、CPU打者は追い込まれたら隅の1つ外（0.50）まで必ず手を出す
+    // （SS-67）＝四球の入口だった「荒れた投手の外へ逃げる決め球を見送る」が減った。
+    // 画面には出ない（CPU打者が相手にするのは人間の投手の配球）。人間の打者は見極めれば
+    // 四球を取れる（`balance:pace` の5段目＝ゾーンの球だけを振る打者は四死球 5〜7%）
+    expect(rateOf(rs, (r) => r.kind === 'walk')).toBeGreaterThan(0.015);
+    expect(rateOf(rs, (r) => r.kind === 'walk')).toBeLessThan(0.13);
+    // 配球のくじを入れる前（いつもの形）なら、四球は実際の野球の帯にいた
+    const before = plateAtBats({ mixes: null });
+    expect(rateOf(before, (r) => r.kind === 'walk')).toBeGreaterThan(0.04);
     const pitches = rs.reduce((sum, r) => sum + r.pitches, 0) / rs.length;
-    expect(pitches).toBeGreaterThan(3);
+    expect(pitches).toBeGreaterThan(2.3);
     expect(pitches).toBeLessThan(4.5);
   });
 
-  it('打球も長打も消えていない（＝三振ばかりの打席にならない）', () => {
-    const rs = atBats();
-    expect(rs.filter((r) => r.kind === 'inPlay').length / rs.length).toBeGreaterThan(0.4);
-    // **フェーズUU-69でCPU打線の本塁打が 0.31→0.00本/試合になった**（有効窓と抗力の
-    // 両方を動かした帰結）。**長打そのものは残っている**ので、ここで守るのは
-    // 「長打が1本も出ない打線にはなっていない」まで＝**本数ゼロは未確認事項として
-    // 記録した**（戻すなら `AIR_DRAG` 1か所。0.0012 なら 0.44本/試合へ戻る）。
-    expect(rs.filter((r) => r.outcome === 'triple' || r.outcome === 'homerun').length).toBeGreaterThan(0);
+  it('打球も長打も**本塁打も**消えていない（UU-69の「CPU打線の本塁打0本/試合」の解消）', () => {
+    const rs = plateAtBats();
+    expect(rateOf(rs, (r) => r.kind === 'inPlay')).toBeGreaterThan(0.55);
+    // AAA-75の前はCPUが速球を前へ飛ばせず、本塁打は1本も出なかった。いまは30〜60打席に1本
+    expect(rateOf(rs, (r) => r.outcome === 'homerun')).toBeGreaterThan(0.005);
+    expect(rateOf(rs, (r) => r.outcome === 'homerun')).toBeLessThan(0.06);
     // 死球は例外のまま（T-41＝寄って立った打者に決め球が当たる。実際の野球は0.4%）
-    expect(rs.filter((r) => r.kind === 'hitByPitch').length / rs.length).toBeLessThan(0.06);
+    expect(rateOf(rs, (r) => r.kind === 'hitByPitch')).toBeLessThan(0.08);
   });
 
   it('打席は必ず終わる（狙いを動かしてもファウルの無限ループは戻らない）', () => {
-    for (const r of atBats()) expect(r.pitches).toBeLessThan(10);
+    for (const r of plateAtBats({ aims: { normalTarget: STRIKE_ZONE_HALF_WIDTH } })) {
+      expect(r.pitches).toBeLessThan(15);
+    }
   });
+});
+
+describe('人間の決まった配球に必勝の形が無い（AAA-75。`npm run balance:plate` の15段目）', () => {
+  /**
+   * AAA-75の前は、人間の投手に**必勝の配球**があった：ど真ん中の速球×3＝三振86%・安打0／
+   * ど真ん中のフォークを投げ続けると37.5%の打席が終わらない／0.40〜0.45 の帯へ投げれば
+   * 見逃しストライクを取り放題。**決定的なCPU打者には、どう規則を作っても何かが残る**
+   * （35通り試した）ので、CPU打者に人間並みのぶれを入れた。ここで固定するのは
+   * **「どの決まった形も、毎打席は勝てない」**こと。
+   */
+  const PATTERNS: readonly (readonly string[])[] = [['Fm'], ['Sm'], ['Fb'], ['Fm', 'Sm'], ['Sm', 'Fm']];
+
+  it('どの形でも三振は半分に届かず、打率は下がり切らない', () => {
+    for (const p of PATTERNS) {
+      const rs = humanAtBats(p);
+      expect(rateOf(rs, (r) => r.kind === 'strikeout')).toBeLessThan(0.45);
+      expect(avgOf(rs)).toBeGreaterThan(0.05);
+      for (const r of rs) expect(r.pitches).toBeLessThan(15);
+    }
+  }, 20000);
+
+  it('**ど真ん中の速球を続けると打たれる**（AAA-75の前は三振86%・安打0）', () => {
+    const rs = humanAtBats(['Fm']);
+    expect(avgOf(rs)).toBeGreaterThan(0.3);
+    expect(rateOf(rs, (r) => r.kind === 'strikeout')).toBeLessThan(0.2);
+  });
+
+  it('速さを変えれば崩せる（交互に投げると、続けるより三振が増える）', () => {
+    const repeat = humanAtBats(['Fm']);
+    const mix = humanAtBats(['Fm', 'Sm']);
+    expect(rateOf(mix, (r) => r.kind === 'strikeout')).toBeGreaterThan(
+      rateOf(repeat, (r) => r.kind === 'strikeout'),
+    );
+  }, 20000);
+});
+
+describe('リフレッシュレートによらない（AAA-75の不具合。`npm run balance:plate` の14段目）', () => {
+  /**
+   * AAA-75の前、CPUのスイングは**判断したフレームの先頭から振り始めた**扱い（最大1フレーム
+   * 早い）で、投球の横移動も**1フレームぶん先の速度で進んでいた**。どちらもずれの量が
+   * フレームの長さそのものなので、**画面のリフレッシュレートで結果が変わった**。
+   */
+  const keyOf = (r: AtBatResult) => `${r.kind}:${r.outcome}:${r.pitches}`;
+
+  it('60Hzと144Hzで、同じぶれの打席の大半がまったく同じ結果になる', () => {
+    const a = plateAtBats({ dt: 1 / 60 }, 11).map(keyOf);
+    const b = plateAtBats({ dt: 1 / 144 }, 11).map(keyOf);
+    const same = a.filter((k, i) => k === b[i]).length / a.length;
+    // 残る差は 0.5mm 以下の軌道の違いが打球の境目（捕れる／捕れない）に当たった打席だけ
+    expect(same).toBeGreaterThan(0.85);
+    // 旧（フレームの先頭から振り出す）では 3割も揃わなかった
+    const oldA = plateAtBats({ dt: 1 / 60, legacyFrameStart: true }, 11).map(keyOf);
+    const oldB = plateAtBats({ dt: 1 / 144, legacyFrameStart: true }, 11).map(keyOf);
+    expect(oldA.filter((k, i) => k === oldB[i]).length / oldA.length).toBeLessThan(0.5);
+  }, 20000);
 });
 
 describe('人間の空振りとホームラン（UU-69。`npm run balance:plate` の14段目で測った帯）', () => {

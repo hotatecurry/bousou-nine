@@ -52,6 +52,8 @@ import {
   liveSkillsOf,
   ratingBar,
   remainingStaminaOf,
+  BOUNCING_FORK_LABEL,
+  pitcherForkBouncesOf,
 } from '../../core/roster';
 import { NEUTRAL_RATING } from '../../core/pitch';
 import { skillDef } from '../../core/skills';
@@ -70,6 +72,10 @@ const PLAY_PROMPT_TEXT: Record<PlayPromptKind, string> = {
   // タッチアップ（説明書p19）。**方向なしは全員**（フェーズL-32）は盗塁と同じ規則なので、
   // 同じ書き方で添える（同じキー・同じ入力が場面で違う意味になると案内が信用できなくなる）。
   tagUp: 'タッチアップ！\nJ+方向で進塁（方向なし＝全員）',
+  // 塁を踏んでそのまま次の塁へ（フェーズBBB-77）。打者走者は一塁を踏むまではフォースの
+  // ままなので、押しても一塁で刺されるときは刺される＝押し得ではない。K で取り消せる
+  // ことまで書くのは、予約したのに止めたくなったときの抜け道が見えていないと押せないから。
+  stretch: 'J+方向で次の塁へ（方向なし＝全員）\nK+方向でその塁に止まる',
   recall: 'K+方向で帰塁',
   // 塁間で止まる（フェーズN-34）。**帰塁を消さずに並べる**のは、この2つが同じ場面の
   // 2つの逃げ道だから（行く／戻る／止まる のうち押せる2つが見えていないと選択にならない）。
@@ -118,6 +124,10 @@ const PLAY_PROMPT_TEXT: Record<PlayPromptKind, string> = {
   // 書かないと、1人だけ走らせるつもりのJで走者全員が飛び出す＝**見えている操作と効く
   // 操作が食い違う**（無指定の意味がL-32で変わった、いちばん事故になりやすい点）。
   steal: 'J+方向で盗塁（方向なし＝全員）\nモーション中にスタート',
+  // 盗塁を押したが、走り出すのは投手が本塁へ踏み出す絵から（フェーズBBB-76。原作どおり
+  // 長くなったモーションの前半に押すと最大0.7秒待つ）。**押したことが受け付けられた**と
+  // 分からないと、入力が落ちたと思って押し直す（＝同じ操作を二重に考えさせる）。
+  stealQueued: '盗塁！ スタート待ち\n投手が踏み出したら走る',
   // リードを取りに行く（フェーズKK-58）。**まだ投げていない間だけ**出て、投球動作に
   // 入った瞬間に `steal` へ入れ替わる＝**同じJが投球前と投球中で違う意味になる**ので、
   // 並べて出すと「いまどちらが効くのか」が読めない（`bunt` / `buntTwoStrikes` と同じ
@@ -247,6 +257,11 @@ export interface Hud {
   setReading(text: string | null): void;
   /** 時間停止（フェーズYY-73）の間だけ画面を青く沈める */
   slowTint(on: boolean): void;
+  /**
+   * 画面全体を真っ黒にする（フェーズBBB-76。**打った瞬間の後の7フレーム**＝原作の
+   * でっかい→ちっちゃいの切り替えに挟まる黒）。HUDも含めてすべてを覆う。
+   */
+  blackout(on: boolean): void;
   /**
    * 乱闘中に出す操作説明と技表（フェーズG-27）。null で消す。
    * **HUDが自分では組めない**（誰がどの必殺技を持っているか＝スキル、その人が押す
@@ -571,6 +586,11 @@ export function pitcherCardText(roster: TeamRoster): string {
     `投手 ${pitcher.name}`,
     `${era}救援 残り${roster.bullpen.length}`,
     ...staminaLines(roster),
+    // ワンバウンドするフォークを持つ投手にだけ出す（フェーズBBB-79。持たない投手には
+    // 行そのものを出さない＝平常時のカードの高さは動かない）。**見逃せばボールになる球**
+    // なので、打つ側には「追い込まれても釣られるな」、投げる側には「振らせる球がある」
+    // という材料になる。疲れて落ちなくなれば消える（実際の球と同じ式から出す）。
+    ...(pitcherForkBouncesOf(roster, roster.pitcher) ? [BOUNCING_FORK_LABEL] : []),
     ...skillLines(roster, roster.pitcher),
   ].join('\n');
 }
@@ -751,6 +771,13 @@ export function createHud(root: HTMLElement): Hud {
   `;
   root.appendChild(slowTintEl);
   let slowTintOn = false;
+  // 打った後の黒（フェーズBBB-76）。原作の黒は一瞬で入って一瞬で抜ける＝フェードしない。
+  // 最後に足す＝HUDのどのパネルよりも上に重なる。
+  const blackoutEl = document.createElement('div');
+  blackoutEl.style.cssText = `
+    position: fixed; inset: 0; pointer-events: none; display: none;
+    background: #000; z-index: 1000;
+  `;
 
   // ---- デバッグモードの状態表示（フェーズPP-64。update() の管理外の独立チャンネル） ----
   const debugPanel = createPixelLabel('', { scale: 1, color: '#7ee081', align: 'center' });
@@ -1155,6 +1182,13 @@ export function createHud(root: HTMLElement): Hud {
       if (on === slowTintOn) return;
       slowTintOn = on;
       slowTintEl.style.opacity = on ? '1' : '0';
+    },
+
+    blackout(on) {
+      // 黒はほかのどのパネルより上に重なる（後から足されたパネルがあっても必ず最後尾へ）
+      if (on && blackoutEl.parentElement !== root) root.appendChild(blackoutEl);
+      if (on && root.lastElementChild !== blackoutEl) root.appendChild(blackoutEl);
+      blackoutEl.style.display = on ? 'block' : 'none';
     },
 
     setDebugLine(text) {

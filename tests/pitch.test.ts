@@ -40,7 +40,29 @@ import {
   steerAccelFor,
   stepPitchFlight,
   batterStandX,
+  flightSecondsUntil,
+  flightRateAt,
+  pitchClockRate,
+  pitchStallFor,
+  releasePitchFlight,
+  displayPitchKmh,
+  BREAK_STRENGTH,
+  FAST_BALL_PACE,
+  FORK_STALL_FACTOR,
+  FORK_STALL_FROM_Z,
+  ORIGINAL_SLOW_DELTA,
+  PITCH_CLOCK_SPEEDUP,
+  PITCH_WINDUP_SEC,
+  PLATE_Z,
+  CATCH_Z,
+  FORK_BOUNCE_MIN_RATING,
+  forkBounces,
+  pitchBounces,
+  REFERENCE_PITCHER_NEUTRAL,
+  neutralSpeedFor,
 } from '../src/core/pitch';
+import { CONTACT_PLANE_Z, callAfterSwing } from '../src/core/batting';
+import { TEAMS, pitcherRowPitching } from '../src/core/teams';
 import { BASE_POSITIONS } from '../src/core/fielding';
 
 const DT = 1 / 60;
@@ -80,6 +102,7 @@ describe('createPitchFlight', () => {
       z: RELEASE_Z,
       vx: 0,
       vz: SPEED_NEUTRAL,
+      rate: 1,
     });
   });
 
@@ -89,7 +112,110 @@ describe('createPitchFlight', () => {
       z: RELEASE_Z,
       vx: COURSE_RELEASE_VX,
       vz: SPEED_FAST,
+      rate: 1,
     });
+  });
+});
+
+describe('投げてから届くまでの時間（フェーズBBB-76→BBB-77。原作の実機映像の実測）', () => {
+  /** リリース→打撃面の実時間（フレーム）。**実際に投げる球と同じ** `releasePitchFlight`（フォークの失速込み） */
+  const framesToContact = (speed: number, center = SPEED_NEUTRAL) =>
+    flightSecondsUntil(releasePitchFlight(0, speed, 0, center), CONTACT_PLANE_Z) * 60;
+
+  it('基準速は原作のフレーム数で打撃面に来る（原作 22.3〜23.0）', () => {
+    expect(framesToContact(SPEED_NEUTRAL)).toBeGreaterThan(21.8);
+    expect(framesToContact(SPEED_NEUTRAL)).toBeLessThan(23.0);
+  });
+
+  it('速球は普通の球の1.3倍の速さで届く（BBB-77 ユーザー判断：原作の1.17倍より広げた）', () => {
+    expect(framesToContact(SPEED_NEUTRAL) / framesToContact(SPEED_FAST)).toBeCloseTo(FAST_BALL_PACE, 6);
+    // 原作の速球（18.9〜19.4フレーム）よりはっきり速い
+    expect(framesToContact(SPEED_FAST)).toBeLessThan(18);
+  });
+
+  it('フォークは手元で失速して、原作どおり33フレーム前後で打撃面に来る（原作 115km/h の球で33フレーム）', () => {
+    expect(framesToContact(SPEED_SLOW)).toBeGreaterThan(33);
+    expect(framesToContact(SPEED_SLOW)).toBeLessThan(34.5);
+  });
+
+  it('時計の倍率：基準速は PITCH_CLOCK_SPEEDUP／速球は基準速の1.3倍で飛ぶ速さ／遅い球は原作の緩急の幅（球速の数字＝打球の強さは今のまま）', () => {
+    expect(pitchClockRate(SPEED_NEUTRAL)).toBeCloseTo(PITCH_CLOCK_SPEEDUP, 12);
+    expect(SPEED_FAST * pitchClockRate(SPEED_FAST)).toBeCloseTo(
+      SPEED_NEUTRAL * FAST_BALL_PACE * PITCH_CLOCK_SPEEDUP,
+      9,
+    );
+    // 遅い球は「基準速 − ORIGINAL_SLOW_DELTA の球」が同じ倍率で飛ぶ速さ（失速の手前まで）
+    expect(SPEED_SLOW * pitchClockRate(SPEED_SLOW)).toBeCloseTo(
+      (SPEED_NEUTRAL - ORIGINAL_SLOW_DELTA) * PITCH_CLOCK_SPEEDUP,
+      9,
+    );
+  });
+
+  it('画面に出す球速は原作の数字に揃う（基準速130・速球151・フォーク116km/h。原作は129/151/115）', () => {
+    expect(displayPitchKmh(SPEED_NEUTRAL)).toBe(130);
+    expect(displayPitchKmh(SPEED_FAST)).toBe(151);
+    expect(displayPitchKmh(SPEED_SLOW)).toBe(116);
+  });
+
+  it('失速するのはフォークだけ（基準速・速球には付かない）', () => {
+    expect(pitchStallFor(SPEED_NEUTRAL)).toBeUndefined();
+    expect(pitchStallFor(SPEED_FAST)).toBeUndefined();
+    // F を渡さなければ基準値（BBB-79：どこまで落ちるかは F で決まる）
+    expect(pitchStallFor(SPEED_SLOW)).toEqual({
+      fromZ: FORK_STALL_FROM_Z,
+      factor: FORK_STALL_FACTOR,
+      fork: NEUTRAL_RATING,
+    });
+    // 失速は本塁の手前（打者が振るかを決める頃）から
+    expect(FORK_STALL_FROM_Z).toBeGreaterThan(RELEASE_Z);
+    expect(FORK_STALL_FROM_Z).toBeLessThan(PLATE_Z);
+  });
+
+  it('失速の境目をまたいで刻んでも、実時間は閉じた式（flightSecondsUntil）と一致する', () => {
+    const start = releasePitchFlight(0, SPEED_SLOW, 0);
+    const rate = start.rate ?? 1;
+    expect(flightRateAt(start, FORK_STALL_FROM_Z - 0.1)).toBeCloseTo(rate, 12);
+    expect(flightRateAt(start, FORK_STALL_FROM_Z + 0.1)).toBeCloseTo(rate * FORK_STALL_FACTOR, 12);
+    for (const fps of [30, 60, 144]) {
+      let f = start;
+      let real = 0;
+      while (f.z < CONTACT_PLANE_Z) {
+        const prev = f;
+        f = stepPitchFlight(f, 0, 1 / fps);
+        real += 1 / fps;
+        if (f.z >= CONTACT_PLANE_Z) {
+          // 最後の1歩は打撃面を越えた分だけ戻す（等速の区間の中なので線形でよい）
+          real -= ((f.z - CONTACT_PLANE_Z) / (f.z - prev.z)) * (1 / fps);
+        }
+      }
+      expect(real).toBeCloseTo(flightSecondsUntil(start, CONTACT_PLANE_Z), 3);
+    }
+  });
+
+  it('時計を速めても通り道は変わらない（曲げても、本塁を通る場所は同じ）', () => {
+    const run = (rate: number) => {
+      let f = createPitchFlight(0.2, SPEED_NEUTRAL, COURSE_RELEASE_VX, rate);
+      let steps = 0;
+      // 同じ「球速どおりの時間」ぶん曲げる＝1歩の実時間は rate で割る（飛行の時間は 1/240 ずつ）
+      while (f.z < PLATE_Z) {
+        const t = steps / 240;
+        f = stepPitchFlight(f, t < 0.2 ? -1 : 0, 1 / 240 / rate, 14);
+        steps += 1;
+      }
+      return f.x;
+    };
+    expect(run(PITCH_CLOCK_SPEEDUP)).toBeCloseTo(run(1), 6);
+  });
+
+  it('実時間は飛行の時計込みで数える（`flightSecondsUntil`）', () => {
+    const f = createPitchFlight(0, SPEED_NEUTRAL, 0, 2);
+    expect(flightSecondsUntil(f, PLATE_Z)).toBeCloseTo((PLATE_Z - RELEASE_Z) / (SPEED_NEUTRAL * 2), 12);
+    // 時計を渡さない球は球速どおり（BBB-76の前と同じ）
+    expect(flightSecondsUntil(createPitchFlight(0), PLATE_Z)).toBeCloseTo((PLATE_Z - RELEASE_Z) / SPEED_NEUTRAL, 12);
+  });
+
+  it('投球モーションは原作の70フレーム', () => {
+    expect(PITCH_WINDUP_SEC * 60).toBeCloseTo(70, 9);
   });
 });
 
@@ -244,13 +370,21 @@ describe('投球の統合挙動（リリース→プレート通過）', () => {
   });
 
   it('操作次第で打者に当てられる（死球ゾーンに到達できる）', () => {
-    // 曲げ続けると打者の背後に抜けるので、途中で戻すスキル操作を模す。
     // 既定の右打者は三塁側（-X）に立つので、曲げるのも -X 側（BB-49）。
-    // **フェーズRR-66で 0.2→0.12秒**：バットが届く範囲に合わせて打者が本塁へ寄った
-    // （死球ゾーンが 0.9〜1.7 → 0.65〜1.45 へ動いた）ので、0.2秒も曲げると
-    // **打者の背後へ抜ける**（-1.54）。
-    const { crossX } = flyToPlate(createPitchFlight(-0.4), (t) => (t < 0.12 ? -1 : 0));
+    // **フェーズBBB-77で曲がりが3割になった**（「球があまりにも左右に曲がりやすすぎる」）ので、
+    // 0.12秒の押しでは届かない＝**最後まで押し続けて**ようやく打者に届く（背後へ抜けることも無い）。
+    const { crossX } = flyToPlate(createPitchFlight(-0.4), () => -1);
     expect(judgePitch(crossX)).toBe('hitByPitch');
+  });
+
+  it('曲がりは3割（BBB-77）：3フレームだけ押すと12cm前後、普通の球を最後まで押しても0.5m前後', () => {
+    expect(BREAK_STRENGTH).toBe(0.3);
+    const tap = flyToPlate(createPitchFlight(0), (t) => (t < 3 / 60 ? 1 : 0));
+    expect(tap.crossX).toBeGreaterThan(0.08);
+    expect(tap.crossX).toBeLessThan(0.16);
+    const full = flyToPlate(createPitchFlight(0), () => 1);
+    expect(full.crossX).toBeGreaterThan(0.4);
+    expect(full.crossX).toBeLessThan(0.6);
   });
 
   it('緩急で到達時間が変わる（フォーク/チェンジ > 直球 > 速球）', () => {
@@ -564,5 +698,104 @@ describe('リリースの高さ（フェーズMM-60。投げ方で低くなる�
       10,
     );
     expect(createPitchFlight(0.3, 40)).not.toHaveProperty('y');
+  });
+});
+
+describe('ワンバウンドするフォーク（フェーズBBB-79。テストプレイ「ワンバウンドを見逃したのにストライク」）', () => {
+  it('ワンバウンドするのは F が境目以上のフォークだけ（ユーザー判断：Fの大きい投手だけ）', () => {
+    expect(forkBounces(FORK_BOUNCE_MIN_RATING)).toBe(true);
+    expect(forkBounces(FORK_BOUNCE_MIN_RATING - 0.01)).toBe(false);
+    expect(pitchBounces(releasePitchFlight(0, SPEED_SLOW, 0, SPEED_NEUTRAL, 0.8))).toBe(true);
+    expect(pitchBounces(releasePitchFlight(0, SPEED_SLOW, 0, SPEED_NEUTRAL, 0.5))).toBe(false);
+    // 基準速・速球はどれだけ F が大きくても跳ねない（失速しない＝落ちない球）
+    expect(pitchBounces(releasePitchFlight(0, SPEED_NEUTRAL, 0, SPEED_NEUTRAL, 1))).toBe(false);
+    expect(pitchBounces(releasePitchFlight(0, SPEED_FAST, 0, SPEED_NEUTRAL, 1))).toBe(false);
+    // F を渡さない球（基準値）は跳ねない＝渡さない呼び出しは従来どおり
+    expect(pitchBounces(releasePitchFlight(0, SPEED_SLOW, 0))).toBe(false);
+  });
+
+  it('跳ねるかどうかは飛行中に変わらない（投げた瞬間の F で決まる）', () => {
+    let f = releasePitchFlight(0, SPEED_SLOW, 0, SPEED_NEUTRAL, 0.8);
+    while (f.z < CATCH_Z) {
+      expect(pitchBounces(f)).toBe(true);
+      f = stepPitchFlight(f, 1, 1 / 60);
+    }
+  });
+
+  it('ワンバウンドした球はゾーンを通ってもボール（見逃し）。打者に当たれば死球', () => {
+    for (const x of [-STRIKE_ZONE_HALF_WIDTH, 0, STRIKE_ZONE_HALF_WIDTH]) {
+      expect(judgePitch(x, RIGHT_BATTER_SIDE, 0, true)).toBe('ball');
+      expect(judgePitch(x, RIGHT_BATTER_SIDE, 0, false)).toBe('strike');
+    }
+    // 死球ゾーンの球は跳ねても死球（実際の野球と同じ）
+    const body = batterStandX(RIGHT_BATTER_SIDE);
+    expect(judgePitch(body, RIGHT_BATTER_SIDE, 0, true)).toBe('hitByPitch');
+    expect(judgePitch(body, RIGHT_BATTER_SIDE, 0, true)).toBe(judgePitch(body, RIGHT_BATTER_SIDE, 0, false));
+    // 外れた球は跳ねても跳ねなくてもボール
+    expect(judgePitch(-batterStandX(RIGHT_BATTER_SIDE), RIGHT_BATTER_SIDE, 0, true)).toBe('ball');
+  });
+
+  it('振って空振りならワンバウンドでもストライク（実際の野球と同じ）', () => {
+    expect(callAfterSwing(judgePitch(0, RIGHT_BATTER_SIDE, 0, true), true)).toBe('strike');
+    expect(callAfterSwing(judgePitch(0, RIGHT_BATTER_SIDE, 0, true), false)).toBe('ball');
+  });
+
+  it('名鑑96人のうちワンバウンドするのは少数（ほぼ各球団1人）', () => {
+    const forks = TEAMS.flatMap((t) => t.pitchers.map((p) => pitcherRowPitching(p).fork));
+    const bouncing = forks.filter(forkBounces).length;
+    expect(bouncing).toBeGreaterThanOrEqual(10);
+    expect(bouncing).toBeLessThanOrEqual(24);
+    // 疲れれば落ちなくなる（B-11の変化量の低下がそのまま効く）
+    expect(forks.filter((f) => forkBounces(fatiguedBreak(f, 1))).length).toBe(0);
+  });
+});
+
+describe('球は投げた投手の基準速を持つ（フェーズBBB-85）', () => {
+  it('releasePitchFlight が書き、飛行の間ずっと持ち続ける', () => {
+    const neutral = neutralSpeedFor(0.9);
+    let flight = releasePitchFlight(0.2, speedForPitchSelection(-1, 0.9), 0, neutral, 0.5);
+    expect(flight.neutral).toBe(neutral);
+    for (let i = 0; i < 40 && flight.z < CATCH_Z; i += 1) {
+      flight = stepPitchFlight(flight, i < 4 ? 1 : 0, 1 / 60);
+      expect(flight.neutral).toBe(neutral);
+    }
+  });
+
+  it('フォーク（手元で失速する球）も同じく持つ', () => {
+    const neutral = neutralSpeedFor(0.4);
+    let flight = releasePitchFlight(0, speedForPitchSelection(1, 0.4), 0, neutral, 0.9);
+    expect(flight.stall).toBeDefined();
+    for (let i = 0; i < 60 && flight.z < CATCH_Z; i += 1) flight = stepPitchFlight(flight, 0, 1 / 60);
+    expect(flight.neutral).toBe(neutral);
+  });
+
+  it('基準速を渡さなければ、基準の球速（SPD 0.5）の投手の球', () => {
+    expect(releasePitchFlight(0, SPEED_NEUTRAL, 0).neutral).toBe(SPEED_NEUTRAL);
+  });
+
+  it('createPitchFlight で直接作った球は投手を持たない（テストと格子の素の球）', () => {
+    const flight = createPitchFlight(0, SPEED_NEUTRAL);
+    expect(flight.neutral).toBeUndefined();
+    expect(stepPitchFlight(flight, 0, 1 / 60).neutral).toBeUndefined();
+  });
+
+  it('通り道も着く時刻も、基準速を持つことでは変わらない', () => {
+    const neutral = neutralSpeedFor(0.7);
+    const speed = speedForPitchSelection(-1, 0.7);
+    const withNeutral = releasePitchFlight(0.1, speed, 0.3, neutral, 0.5);
+    const bare = createPitchFlight(0.1, speed, 0.3, pitchClockRate(speed, neutral), pitchStallFor(speed, neutral, 0.5));
+    let a = withNeutral;
+    let b = bare;
+    for (let i = 0; i < 30; i += 1) {
+      a = stepPitchFlight(a, 1, 1 / 60);
+      b = stepPitchFlight(b, 1, 1 / 60);
+      expect(a.x).toBe(b.x);
+      expect(a.z).toBe(b.z);
+    }
+  });
+
+  it('基準の投手の基準速は、基準の球速（SPD 0.5）より速い（名鑑の投手は平均 0.67）', () => {
+    expect(REFERENCE_PITCHER_NEUTRAL).toBeGreaterThan(SPEED_NEUTRAL);
+    expect(REFERENCE_PITCHER_NEUTRAL).toBeLessThan(neutralSpeedFor(1));
   });
 });

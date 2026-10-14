@@ -54,31 +54,38 @@ for (const deg of [0, 10, 15, 20, 25, 30, 40]) {
   );
 }
 
-// CPU打者は「押してからジャストミートまでの理想時間」で振る（cpuSwingLead）。速球には
-// わざと早振りのペナルティが乗るので、**CPUが実際に作るタイミングは1点に決まる**
-// ＝そこがHRになっていないかを見る（過去に「CPUが速球を100%HRにする」事故がある）。
-console.log('\n-- CPU打者が実際に作るタイミングと帰結（course=0） --');
+// CPU打者は「待っていた速さ」に合わせて振る（cpuSwingLead。フェーズAAA-75）。初球は投手の
+// 基準速を待つので、速球は差し込まれ・フォークは泳ぐ。**同じ速さを続ければ芯**＝緩急を
+// 付けない投手への罰（過去の「CPUが速球を100%HRにする」事故は、どの球でも芯だったから）。
+// ここはぶれ無し＝狙いの1点だけを見る（ぶれ込みの分布は balance:plate の15〜17段目）。
+console.log('\n-- CPU打者が狙うタイミングと帰結（course=0・ぶれ無し） --');
 for (const [label, speed] of [
   ['フォーク22', SPEED_SLOW],
   ['基準36', SPEED_NEUTRAL],
   ['速球42', SPEED_FAST],
 ] as const) {
-  const timing = (cpuSwingLead(speed) - SWING_IDEAL_SEC) / (SWING_ACTIVE_SEC / 2);
-  for (const power of [0.5, 1]) {
-    const launch = judgeSwing(
-      { crossX: 0, swingTime: cpuSwingLead(speed), pitchSpeed: speed },
-      { power, average: 0.5 },
-    );
-    if (!launch) {
-      console.log(`${label} 長打力${power}: 空振り`);
-      continue;
+  for (const [wait, expected] of [
+    ['初球', null],
+    ['同じ速さの2球目', speed],
+  ] as const) {
+    const lead = cpuSwingLead(speed, SPEED_NEUTRAL, expected);
+    const timing = (lead - SWING_IDEAL_SEC) / (SWING_ACTIVE_SEC / 2);
+    for (const power of [0.5, 1]) {
+      const launch = judgeSwing(
+        { crossX: 0, swingTime: lead, pitchSpeed: speed },
+        { power, average: 0.5 },
+      );
+      if (!launch) {
+        console.log(`${label} ${wait} 長打力${power}: 空振り`);
+        continue;
+      }
+      const r = simulatePlay(launch, 0, { park: DEFAULT_BALLPARK });
+      console.log(
+        `${label} ${wait} 長打力${power}: t=${timing.toFixed(2)} 方向${r.directionDeg
+          .toFixed(0)
+          .padStart(4)}° 初速${r.exitSpeed.toFixed(1)} → ${r.outcome.kind}`,
+      );
     }
-    const r = simulatePlay(launch, 0, { park: DEFAULT_BALLPARK });
-    console.log(
-      `${label} 長打力${power}: t=${timing.toFixed(2)} 方向${r.directionDeg
-        .toFixed(0)
-        .padStart(4)}° 初速${r.exitSpeed.toFixed(1)} → ${r.outcome.kind}`,
-    );
   }
 }
 

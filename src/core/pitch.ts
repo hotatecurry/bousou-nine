@@ -33,12 +33,27 @@ export const RUBBER_HALF_RANGE = 0.8;
 /** プレート上の左右移動速度 m/s */
 export const RUBBER_MOVE_SPEED = 4;
 
-/** 球速 m/s（ニュートラル≒130km/h / 速球≒150km/h / フォーク・チェンジアップ≒80km/h） */
+/**
+ * 球速 m/s（ニュートラル≒130km/h / 速球≒150km/h / フォーク・チェンジアップ≒80km/h）。
+ * **表示の球速＝打球の強さが読む値**で、**実際に着くまでの時間は原作に合わせて速めてある**
+ * （フェーズBBB-76。下の `pitchClockRate`）。
+ */
 export const SPEED_NEUTRAL = 36;
 export const SPEED_FAST = 42;
 export const SPEED_SLOW = 22;
-/** 左右入力による横方向加速度 m/s^2（曲がりの強さ） */
-const STEER_ACCEL = 14;
+/**
+ * 曲がりの強さ全体に掛ける割合（フェーズBBB-77）。テストプレイ「球があまりにも左右に
+ * 曲がりやすすぎる」→ **自分の球もCPUの球も3割に**（2026-10-07 ユーザー判断）。それまでは
+ * 3フレーム押しただけで普通の球が0.41m（ストライクゾーンの半幅に近い）・押しっぱなしで1.6m
+ * 曲がった。3割で 0.12m／0.49m（押しっぱなしでゾーンの端の少し外まで）。
+ *
+ * **CPUの球は狙うコースが変わらない**（P-37 が曲がりの分だけリリース位置を戻して解く）＝
+ * 判定の帰結は動かず、曲がって見える量だけが3割になる。
+ */
+export const BREAK_STRENGTH = 0.3;
+
+/** 左右入力による横方向加速度 m/s^2（曲がりの強さ。変化量0.5の投手） */
+const STEER_ACCEL = 14 * BREAK_STRENGTH;
 
 // ---- 投手の能力値の反映（フェーズB-8。roster.ts の PitcherStats を参照） ----
 
@@ -80,6 +95,24 @@ export function neutralSpeedFor(pitcherSpeed: number = NEUTRAL_RATING): number {
 }
 
 /**
+ * **球速の効き方の基準にする投手**の基準速 m/s（フェーズBBB-85）＝名鑑の投手96人の球速（SPD）の
+ * 平均（0.67）の投手の基準速。`tests/teams.test.ts` が名鑑の平均と突き合わせる。
+ *
+ * 投手の球速は2か所で「この投手からどれだけ速いか」として効く：
+ *
+ * - **打球の強さには乗らない**（`batting.ts` の `carriedPitchSpeed`）。打球に乗るのは
+ *   「この基準の投手が同じ緩急で投げたときの球速」＝速球を選べば飛ぶ・遅い球は飛ばない、は
+ *   そのままで、**球の速い投手ほど打たれたら飛ぶ、にはならない**。
+ * - **CPU打者のタイミングの誤差に乗る**（`cpuBatter.ts` の `cpuTimingScale`）。球が速いぶん
+ *   飛行時間が縮む、その同じ比で誤差が大きくなる。
+ *
+ * 基準を SPD 0.5（`SPEED_NEUTRAL`）ではなく**名鑑の平均**に置くのは、名鑑の投手の平均が 0.67 で、
+ * 0.5 に置くと実際に投げてくる投手の打球が全体に 1m/s 弱くなるから（計測：CPU打線の本塁打が
+ * 1.2→0.3%/打席）。**平均の投手の球は BBB-85 の前とまったく同じ**。
+ */
+export const REFERENCE_PITCHER_NEUTRAL = 38;
+
+/**
  * その球が**その投手の基準速からどれだけ遅い／速いか**（0..1）。
  *
  * 見た目（弧・残像。`core/camera.ts` の `pitchArcPath` / `dekkaiBallTrail`）が読む重み。
@@ -96,9 +129,213 @@ export function pitchFastness(vz: number, neutral: number = SPEED_NEUTRAL): numb
   return clamp01((vz - neutral) / SPEED_FAST_DELTA);
 }
 
-/** 変化量0..1 → 横方向加速度 m/s^2 の下限と幅（0.5 で従来の STEER_ACCEL=14） */
-export const STEER_ACCEL_MIN = 9;
-export const STEER_ACCEL_SPAN = 10;
+// ---------------------------------------------------------------------------
+// 投げてから届くまでの時間（フェーズBBB-76。原作の実機映像の実測）
+// ---------------------------------------------------------------------------
+//
+// テストプレイ「ピッチャーが球を投げてからヒットを打つまでの間が全然原作と違う」。
+// 原作（ファミスタ'90）の映像を1フレームずつ測ると、**球は画面に出る球速（km/h）どおりに
+// 飛ぶより速く本塁へ着く**：リリース（地面の影が出た瞬間）から打つ瞬間（影が打撃面に
+// 来た瞬間）まで、151km/h で 18.9フレーム・148km/h で 19.4・129km/h で 22.3・
+// 118km/h で 24.5（どれも 60fps）。**フレーム数は km/h にきれいに反比例する**
+// （影は 0.047 ドット/フレーム × km/h で動く）ので、原作は「球速どおりの飛行」を
+// **一定の倍率で速めて**見せている。その倍率がここの `PITCH_CLOCK_SPEEDUP`。
+//
+// ## 通り道は変えず、時計だけを速める（ユーザー判断 2026-10-07）
+//
+// 球速（`SPEED_*`・SPD）は**表示の球速のまま**持つ。打球の強さ（`0.5 × 球速`）も、
+// コースと曲がり（`COURSE_RELEASE_VX`・`steerAccelFor`・P-37の逆算）も、すべてこの単位で
+// 計測・調整されてきたので、**飛行の時計（`PitchFlight.rate`）だけを速める**
+// ＝**球がどこを通るか・打ったらどれだけ飛ぶかは1mmも変わらず、着くまでの時間だけが
+// 原作になる**。横の動きも同じ時計で進むので、曲がり幅（総移動量）も変わらない。
+//
+// ## 緩急3段階の飛び方（フェーズBBB-77で測り直した）
+//
+// 同じ投手（原作の録画の1人）の球を並べると：**普通 129km/h は 21フレーム**（リリース→影が
+// 本塁に乗る）、**速球 148〜151km/h は 18フレーム**、**フォーク 115km/h は 33フレーム**で、
+// フォークだけは**本塁の手前（通り道の86%）までは表示どおりの速さで来て、そこから急に
+// 4分の1の速さに落ち、球が地面へ落ちていく**（影の進み 5.4→1.4ドット/フレーム、球と影の
+// 間が20→4ドット）。BBB-76 はフォークを「118km/h の真っすぐな球」として合わせていたが、
+// それは同じ投手の**普通の球のばらつき**（118km/h・手元で遅くならない）で、フォークではなかった。
+//
+// - **速球は普通の球の1.3倍の速さで着く**（`FAST_BALL_PACE`。原作は1.17倍＝151 vs 129km/h。
+//   テストプレイ「普通の球と速球で全然速さが変わっていない」→ 2026-10-07 ユーザー判断で広げた）。
+// - **フォークは手元まで「基準速 −3.9m/s（原作の115km/h）」で飛び、通り道の86%から
+//   4分の1の速さになる**（`ORIGINAL_SLOW_DELTA`・`FORK_STALL_*`。ユーザー判断：原作どおり）。
+//
+// **打球の強さは今のまま**（球速の数字は `SPEED_*` のまま）＝変えているのは飛行の時計だけ。
+
+/**
+ * 飛行の時計の倍率（基準速）。**原作の実測から決めた**（上記）：
+ * 基準速36m/s（≒130km/h）でリリース→打撃面が **0.371秒（22.2フレーム）**＝原作の 22.3 と一致する。
+ */
+export const PITCH_CLOCK_SPEEDUP = 1.3;
+
+/**
+ * 速球が**普通の球の何倍の速さで着くか**（フェーズBBB-77。ユーザー判断で原作の1.17倍から広げた）。
+ * 基準速の投手でリリース→打撃面 **0.285秒（17.1フレーム）**＝普通の球（22.2f）より5フレーム早い。
+ * 打球の強さ（`0.5 × 球速`）は速球の球速の数字（`SPEED_FAST`）のまま＝変えたのは着く時間だけ。
+ */
+export const FAST_BALL_PACE = 1.3;
+
+/**
+ * フォーク（遅い球）が**手元まで**基準速より遅い量 m/s（原作のフォーク 115km/h vs 普通 129km/h）。
+ * 球速の数字＝打球の強さは `SPEED_SLOW` のまま。手元からは `FORK_STALL_*` でさらに遅くなる。
+ */
+export const ORIGINAL_SLOW_DELTA = 3.9;
+
+/**
+ * フォークが急に遅くなり始める場所＝**リリースから本塁までの通り道の何割**か（原作の実測 0.86＝
+ * 影が本塁の16ドット手前に来たところ）。ここから捕手まで `FORK_STALL_FACTOR` 倍の速さになる。
+ */
+export const FORK_STALL_FROM = 0.86;
+/** その z（本塁の約2.5m手前） */
+export const FORK_STALL_FROM_Z = RELEASE_Z + FORK_STALL_FROM * (PLATE_Z - RELEASE_Z);
+/** 手元で遅くなった後の速さの割合（原作の実測：影の進み 1.4 / 5.4 ドット/フレーム） */
+export const FORK_STALL_FACTOR = 0.26;
+
+/** 手元で急に遅くなる球（フォーク）の失速：`fromZ` を越えたら時計が `factor` 倍になる */
+export interface PitchStall {
+  fromZ: number;
+  factor: number;
+  /**
+   * 投げた瞬間のその投手のフォークの変化量（F。疲労・スキル込み。フェーズBBB-79）。
+   * **どこまで落ちるか**はここから決まる＝`FORK_BOUNCE_MIN_RATING` 以上なら地面まで落ちて
+   * ワンバウンドする（`pitchBounces`）、それ未満は低めに落ちるだけ（見た目の深さは
+   * `core/camera.ts` の `pitchDrawnHeight`）。**真実はこの1つの値**で、跳ねるかどうかを
+   * 別のフラグとして持たない（判定と見た目が別々の数字から出ないように）。
+   */
+  fork: number;
+}
+
+// ---- ワンバウンドするフォーク（フェーズBBB-79） ----
+//
+// テストプレイ「上入力で投げた球がワンバウンドすることがあるのに、見逃してもストライクに
+// なる（左右でしか判定していなさそう）」。**原作の録画のフォーク（115km/h）は本塁の上で
+// ワンバウンドしてボール**の判定だった＝ワンバウンドを見逃せばボール（実際の野球も同じ）。
+//
+// 2026-10-09 ユーザー判断：**ワンバウンドするのはFの大きい投手のフォークだけ**（説明書p19
+// 「上を押すとフォークかチェンジアップ」）。Fが小さい投手の球は低めに落ちるだけ（チェン
+// ジアップ）で、見逃せば今までどおりコースで判定する。境目は名鑑96人のうち17人（ほぼ各球団
+// 1人・変化量の球団ムーンズは4人）が越える 0.7。**疲れて変化量が落ちれば落ちなくなる**
+// （B-11の `fatiguedBreak` を通った値で決まる）＝「疲れるとフォークが落ちない」。
+//
+// **振ったときの判定は変えていない**（高さは見ない＝当たりうる。空振りなら実際の野球と
+// 同じくストライク＝`callAfterSwing`）。
+
+/** ワンバウンドするフォークの変化量（F）の下限（これ以上で地面まで落ちる） */
+export const FORK_BOUNCE_MIN_RATING = 0.7;
+
+/** その変化量のフォークはワンバウンドするか */
+export function forkBounces(forkRating: number): boolean {
+  return forkRating >= FORK_BOUNCE_MIN_RATING;
+}
+
+/**
+ * その球はワンバウンドするか（フォークで、Fが境目以上）。**見逃せばボール**
+ * （`judgePitch` の `bounced`）。
+ */
+export function pitchBounces(flight: PitchFlight): boolean {
+  return flight.stall !== undefined && forkBounces(flight.stall.fork);
+}
+
+/**
+ * その球の飛行の時計の速さ（`PitchFlight.rate`。フォークは**手元までの**速さ）。
+ *
+ * - 基準速：`PITCH_CLOCK_SPEEDUP` ちょうど。
+ * - 速球：**普通の球の `FAST_BALL_PACE` 倍の速さで着く**よう、そのぶん速める。
+ * - 遅い球：**基準速 −`ORIGINAL_SLOW_DELTA` の球が `PITCH_CLOCK_SPEEDUP` で飛ぶ速さ**になるよう
+ *   速める（基準速の投手で 1.89）。手元からの失速は `pitchStallFor`。
+ *
+ * 間の速さは `pitchSlowness`／`pitchFastness` で補間する（緩急の選択は3段階なので、実際に
+ * 間の値は来ない）。中心（`neutral`）はその投手の基準速（`neutralSpeedFor`）。
+ */
+export function pitchClockRate(speed: number, neutral: number = SPEED_NEUTRAL): number {
+  if (speed <= 0) return PITCH_CLOCK_SPEEDUP;
+  return (PITCH_CLOCK_SPEEDUP * pacedPitchSpeed(speed, neutral)) / speed;
+}
+
+/**
+ * **手元までの見た目の速さ** m/s（＝`PITCH_CLOCK_SPEEDUP` 倍する前）。基準速はそのまま、
+ * 速球は基準速の `FAST_BALL_PACE` 倍、遅い球は基準速 −`ORIGINAL_SLOW_DELTA`。
+ */
+function pacedPitchSpeed(speed: number, neutral: number): number {
+  return (
+    speed +
+    pitchSlowness(speed, neutral) * (SPEED_SLOW_DELTA - ORIGINAL_SLOW_DELTA) +
+    pitchFastness(speed, neutral) * (neutral * (FAST_BALL_PACE - 1) - SPEED_FAST_DELTA)
+  );
+}
+
+/**
+ * その球が手元で急に遅くなる（フォーク）なら、その失速。遅い球（上入力）だけ。
+ * fork はその投手の変化量F（疲労・スキル込み。どこまで落ちるかを決める＝BBB-79）。
+ * 省略は基準値＝ワンバウンドしない。
+ */
+export function pitchStallFor(
+  speed: number,
+  neutral: number = SPEED_NEUTRAL,
+  fork: number = NEUTRAL_RATING,
+): PitchStall | undefined {
+  return pitchSlowness(speed, neutral) > 0.5
+    ? { fromZ: FORK_STALL_FROM_Z, factor: FORK_STALL_FACTOR, fork }
+    : undefined;
+}
+
+/**
+ * 投げた直後に出す球速 km/h（フェーズBBB-77。原作どおり「129km/h」と出す）。
+ * **原作の表示の決め方に合わせる**：普通・速球は球速そのもの（基準速の投手で130・151km/h＝
+ * 原作の129・151とほぼ同じ）、フォークは**手元までの速さ**（基準速 −3.9m/s＝116km/h。
+ * 原作のフォークも表示は115km/h）。速球が実際には1.3倍の速さで着くのはユーザー判断で
+ * 広げたぶんで、表示は原作の数字のまま。
+ */
+export function displayPitchKmh(speed: number, neutral: number = SPEED_NEUTRAL): number {
+  const shown = speed + pitchSlowness(speed, neutral) * (SPEED_SLOW_DELTA - ORIGINAL_SLOW_DELTA);
+  return Math.round(shown * 3.6);
+}
+
+/**
+ * リリースした球（フェーズBBB-77）。時計（`pitchClockRate`）と、フォークなら手元の失速
+ * （`pitchStallFor`）を付けて作る＝**ゲーム本体・計測が投げる球は必ずここを通す**
+ * （時計と失速の付け忘れが起きない）。**投げた投手の基準速も球に書く**（BBB-85。`PitchFlight.neutral`）。
+ */
+export function releasePitchFlight(
+  releaseX: number,
+  speed: number,
+  initialVx: number,
+  neutral: number = SPEED_NEUTRAL,
+  fork: number = NEUTRAL_RATING,
+): PitchFlight {
+  const flight = createPitchFlight(
+    releaseX,
+    speed,
+    initialVx,
+    pitchClockRate(speed, neutral),
+    pitchStallFor(speed, neutral, fork),
+  );
+  // 投げた投手の基準速は球が持つ（BBB-85）
+  flight.neutral = neutral;
+  return flight;
+}
+
+/**
+ * 投球モーション（振りかぶり→リリース）の長さ 秒（フェーズBBB-76）。
+ *
+ * **原作は球速・投手によらず必ず70フレーム**（7球ぶん実測して全部同じ）＝1.167秒。
+ * それまでは 0.35秒で、投手は構えた次の瞬間にはもう投げていた（「投げてから打つまでの間」が
+ * 原作と違って見えた理由の1つ）。姿勢の切り替わり（原作の6枚）は `core/keyframes.ts`。
+ *
+ * **盗塁の窓（`timeToCatcher`）にそのまま効く**：モーションの頭で走り出せば、どの球にも
+ * 間に合う持ち時間（`stealSafeJumpSec`）が残る＝原作の「モーションを見てスタートを切る」。
+ */
+export const PITCH_WINDUP_SEC = 70 / 60;
+
+/**
+ * 変化量0..1 → 横方向加速度 m/s^2 の下限と幅（0.5 で `STEER_ACCEL`）。
+ * BBB-77 で全体を `BREAK_STRENGTH`（3割）にした（それまでは 9 と 10＝0.5 で 14）。
+ */
+export const STEER_ACCEL_MIN = 9 * BREAK_STRENGTH;
+export const STEER_ACCEL_SPAN = 10 * BREAK_STRENGTH;
 
 /**
  * 投球の判定に効く投手の能力値（フェーズB-8。`roster.ts` の `PitcherStats` の部分集合）。
@@ -622,12 +859,74 @@ export function clampReleaseX(releaseX: number, releaseOffset = 0): number {
   return releaseXFor(clampRubberX(releaseX - releaseOffset), releaseOffset);
 }
 
-/** 飛行中のボール状態（高低はゾーン判定に無関係なので持たない） */
+/**
+ * 飛行中のボール状態（高低はゾーン判定に無関係なので持たない）。
+ *
+ * x・z・vx・vz は**球速どおりに飛んだときの値**（＝表示の球速。打球の強さ `EXIT_PITCH_CARRY`
+ * も、CPUが投げる前に解く曲がりの逆算（P-37）も、この単位で書かれている）。
+ * **実際に画面で過ぎる時間は `rate` 倍速い**（フェーズBBB-76。下の `pitchClockRate`）＝
+ * 通り道（どこを通るか）は1mmも変えずに、**着くまでの時間だけを原作に合わせる**ための時計。
+ */
 export interface PitchFlight {
   x: number;
   z: number;
   vx: number;
   vz: number;
+  /**
+   * 飛行の時計の速さ（実時間1秒のあいだに、球速どおりの飛行が何秒ぶん進むか）。
+   * **省略は 1＝球速どおり**（BBB-76の前と同じ）。ゲーム本体の球は必ず
+   * `releasePitchFlight` で作る（時計と失速が付く）。
+   */
+  rate?: number;
+  /**
+   * 手元で急に遅くなる球（フォーク。フェーズBBB-77）。`fromZ` を越えたら時計が `factor` 倍。
+   * **通り道は変わらない**（遅くなるのは時計だけ）。
+   */
+  stall?: PitchStall;
+  /**
+   * この球を投げた投手の基準速 m/s（`neutralSpeedFor`。フェーズBBB-85）。**球が自分で持つ**＝
+   * 打球の強さ（`carriedPitchSpeed`）とCPU打者のタイミング（`cpuTimingScale`）が、投げた瞬間の
+   * 投手（疲労・スキル込み）から決まる。`releasePitchFlight` が必ず書く。省略した球
+   * （`createPitchFlight` で直接作ったもの）は「投手を持たない素の球」＝球速がそのまま効く。
+   */
+  neutral?: number;
+}
+
+/** その球の飛行の時計の速さ（`rate` を省略した球は 1）。フォークは手元までの速さ */
+export function flightRate(flight: PitchFlight): number {
+  return flight.rate ?? 1;
+}
+
+/** その球がいる場所 z での時計の速さ（フォークは `stall.fromZ` を越えたら遅くなる） */
+export function flightRateAt(flight: PitchFlight, z: number): number {
+  const r = flightRate(flight);
+  const s = flight.stall;
+  return s && z >= s.fromZ ? r * s.factor : r;
+}
+
+/**
+ * その球がいまから `z` に着くまでの**実時間**（秒）。もう通り過ぎていれば負。
+ * 球速0以下（来ない球）は Infinity。
+ *
+ * **時間を距離と球速から出す場所は、必ずここを通す**（盗塁の窓＝`timeToCatcher`・
+ * CPU打者の振り出し＝`timeToContactPlane`）。`距離 ÷ vz` と書くと**球速どおりの時間**
+ * （原作より遅い）になり、時計を速めた球と判断の時刻がずれる。**フォークの手元の失速も
+ * ここで足す**（BBB-77）＝CPU打者は失速込みの本当の残り時間で振り出す。
+ */
+export function flightSecondsUntil(flight: PitchFlight, z: number): number {
+  if (flight.vz <= 0) return Infinity;
+  if (z < flight.z) return -realSecondsBetween(flight, z, flight.z);
+  return realSecondsBetween(flight, flight.z, z);
+}
+
+/** z0 → z1（z0 ≦ z1）を飛ぶ実時間。失速の境目をまたげば分けて足す */
+function realSecondsBetween(flight: PitchFlight, z0: number, z1: number): number {
+  const r = flightRate(flight);
+  const s = flight.stall;
+  if (!s) return (z1 - z0) / (flight.vz * r);
+  const before = Math.max(0, Math.min(z1, s.fromZ) - z0);
+  const after = Math.max(0, z1 - Math.max(z0, s.fromZ));
+  return before / (flight.vz * r) + after / (flight.vz * r * s.factor);
 }
 
 export type PitchCall = 'strike' | 'ball' | 'hitByPitch';
@@ -658,21 +957,36 @@ export function speedForPitchSelection(
  * リリース時の飛行状態を作る。speed はワインドアップ中に事前選択された球速
  * （speedForPitchSelection）、initialVx は「投げる瞬間」の左右コース入力
  * （±COURSE_RELEASE_VX。説明書p19③）を渡す。
+ *
+ * rate は飛行の時計の速さ（フェーズBBB-76。`pitchClockRate`）、stall はフォークの手元の失速
+ * （BBB-77。`pitchStallFor`）。**省略は 1・失速なし＝球速どおり**（通り道だけを見る計測と
+ * テストはこれでよい）。ゲーム本体は `releasePitchFlight` で作る。
  */
 export function createPitchFlight(
   releaseX: number,
   speed: number = SPEED_NEUTRAL,
   initialVx = 0,
+  rate = 1,
+  stall?: PitchStall,
 ): PitchFlight {
-  return { x: releaseX, z: RELEASE_Z, vx: initialVx, vz: speed };
+  return stall
+    ? { x: releaseX, z: RELEASE_Z, vx: initialVx, vz: speed, rate, stall }
+    : { x: releaseX, z: RELEASE_Z, vx: initialVx, vz: speed, rate };
 }
 
 /**
- * 1フレーム分の飛行を進める（セミインプリシット・オイラー）。
+ * 1フレーム分の飛行を進める。
  * steerX はリリース後の左右入力（カーブ/シュートの横加速。説明書p19④）。
  * 球速（vz）はリリース時に確定済みで飛行中は変わらない（原作準拠）。
  *
  * steerAccel は投手の変化量に応じた曲がりの強さ（steerAccelFor）。省略時は従来の一定値。
+ *
+ * **フレームの中は等加速度として厳密に積分する**（位置＝前後の速度の平均×時間。フェーズ
+ * AAA-75）。それまでのセミインプリシット・オイラー（位置＝新しい速度×時間）は、曲げている
+ * 間じゅう**1フレームぶん先の速度で進む**ので、横移動が `加速度 × 曲げた時間 × フレーム長 / 2`
+ * だけ多くなっていた＝**同じ球が60Hzと144Hzで本塁の通過位置が最大5mm違い**、ゾーンや
+ * バットの縁に来た球の約1%で判定が入れ替わっていた。いまは**どの刻みでも同じ軌道**で、
+ * CPU投手が投げる前に解く閉じた式（P-37 の `Δ = a·ts·(T − ts/2)`）とも一致する。
  */
 export function stepPitchFlight(
   flight: PitchFlight,
@@ -680,13 +994,35 @@ export function stepPitchFlight(
   dt: number,
   steerAccel: number = STEER_ACCEL,
 ): PitchFlight {
-  const vx = flight.vx + steerX * steerAccel * dt;
-  return {
-    x: flight.x + vx * dt,
-    z: flight.z + flight.vz * dt,
-    vx,
-    vz: flight.vz,
-  };
+  // **dt は実時間**。飛行はその `rate` 倍だけ進む（フェーズBBB-76）＝横の加速も同じ時計で
+  // 効くので、曲げ続けたときの総移動量（通り道）は rate によらず同じ。
+  // **フォークの失速の境目をまたぐフレームは2つに分けて進める**（BBB-77）＝境目の手前は
+  // 手元までの時計、越えたら遅い時計。どのリフレッシュレートでも同じ時刻に失速する。
+  let { x, z, vx } = flight;
+  let remaining = dt;
+  const s = flight.stall;
+  for (let i = 0; i < 2 && remaining > 0; i += 1) {
+    const r = flightRateAt(flight, z);
+    let seg = remaining;
+    let hitsBoundary = false;
+    if (s && z < s.fromZ && flight.vz > 0) {
+      const toStall = (s.fromZ - z) / (flight.vz * r);
+      if (toStall <= seg) {
+        seg = toStall;
+        hitsBoundary = true;
+      }
+    }
+    const t = seg * r;
+    const nvx = vx + steerX * steerAccel * t;
+    x += ((vx + nvx) / 2) * t;
+    z = hitsBoundary ? s!.fromZ : z + flight.vz * t;
+    vx = nvx;
+    remaining -= seg;
+  }
+  const next: PitchFlight = { x, z, vx, vz: flight.vz, rate: flight.rate };
+  if (s) next.stall = s;
+  if (flight.neutral !== undefined) next.neutral = flight.neutral;
+  return next;
 }
 
 /**
@@ -707,17 +1043,30 @@ export function plateCrossingX(prev: PitchFlight, next: PitchFlight): number | n
  * stance（打席内の立ち位置。フェーズO-36）は**死球ゾーンを打者と一緒に動かす**：
  * プレートに寄れば当たりやすく、離れれば当たらない＝バットが外角へ届くようになる
  * リターンと、同じ操作の上に乗るリスク。既定 0＝打席中央＝従来と完全に同じ。
+ *
+ * releaseStance（**リリースの瞬間の**立ち位置。フェーズBBB-84）を渡すと、**投げた後に
+ * 踏み込んで当たった球は死球にしない**＝その位置に立ったままなら当たらなかった球は、
+ * 体に当たってもボール（実際の野球と同じ＝自分から当たりに行った球に一塁は与えない）。
+ * 隅の外へ外す球は来ると分かる（カウントと制球と投手の立ち位置）ので、これが無いと
+ * 「中央で待ち、投げた瞬間に踏み込む」だけで一塁をもらえた。リリースのときから寄っていた
+ * 打者に当たれば従来どおり死球（投手が当てた球）。省略時は stance と同じ＝従来と完全に同じ。
  */
 export function judgePitch(
   xAtPlate: number,
   side: BatterSide = RIGHT_BATTER_SIDE,
   stance = 0,
+  bounced = false,
+  releaseStance: number = stance,
 ): PitchCall {
-  if (Math.abs(xAtPlate) <= STRIKE_ZONE_HALF_WIDTH) return 'strike';
+  // ワンバウンドした球（フェーズBBB-79。`pitchBounces`）は**ゾーンを通ってもボール**。
+  // 打者に当たれば死球（ストライクゾーンの球は打者に当たらないので、この順で書いても同じ）。
+  if (!bounced && Math.abs(xAtPlate) <= STRIKE_ZONE_HALF_WIDTH) return 'strike';
   const local = batterFrameX(xAtPlate, side);
-  const offset = clampStance(stance);
-  if (local >= BATTER_ZONE_MIN_X + offset && local <= BATTER_ZONE_MAX_X + offset) {
-    return 'hitByPitch';
-  }
+  const hits = (at: number): boolean => {
+    const offset = clampStance(at);
+    return local >= BATTER_ZONE_MIN_X + offset && local <= BATTER_ZONE_MAX_X + offset;
+  };
+  // 投げた後に踏み込んで当たった球は死球にしない（リリースの瞬間の位置なら当たらなかった球）
+  if (hits(stance)) return hits(releaseStance) ? 'hitByPitch' : 'ball';
   return 'ball';
 }

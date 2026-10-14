@@ -4,13 +4,22 @@
  * でっかいモード（投球・打撃）はセッション9まで単一キーボードのホットシート専用だった
  * （PROGRESS.md「でっかいモードのCPU投球/打撃AI」参照）。本モジュールはその投球側を担う。
  *
- * 設計方針（他のCPU AI・判定ロジックと同じく乱数は一切使わない）：
- * - 狙うコースはカウントだけから決まる決定的な方針（chooseCpuPitchPlan）。
+ * 設計方針（**配球のくじ（内外角・緩急・勝負球）を除いて**乱数は使わない＝狙う距離・曲げ方は決定的）：
+ * - 何を・どの距離へ投げるかは**カウントの傾向**から決まる（chooseCpuPitchPlan）。
  *   2ストライク後は**隅の1つ外側**を突いて三振を狙い、3ボール後は四球回避でゾーン中央へ、
- *   それ以外は**隅の1つ内側**（フェーズTT-68。それまではゾーンのよく内側）を
- *   ボール数の偶奇で内外角を交互に突く単純な周期パターンで、
- *   「同じコースの連投」を避ける（周期パターンは brawl.ts の固定タイムスクリプトと
- *   同じ「乱数なしで単調になりすぎない」ための手段）。
+ *   それ以外は**隅の1つ内側**（フェーズTT-68。それまではゾーンのよく内側）。
+ * - **球速と、追い込んでからの勝負球は、傾向から「くじが当たったときだけ」外れる**（フェーズCCC-86。
+ *   `drawCpuPitchMix`）。それまで球速はカウントだけで決まり（初球は必ず速球…）、追い込んだ1球は
+ *   制球が中位以下の投手なら必ずボールだった＝どちらも投げる前に分かった。
+ * - **どちらの隅か（内外角）は、試合のシードの別系列から引く**（フェーズBBB-84。
+ *   `drawCpuPitchSides`）。BBB-83 までは「ボール数＋ファウル数の偶奇」で決めていたが、
+ *   カウントと投手の立ち位置から**投げる前に100%読めた**。いまは**立つ側**を五分五分に引き、
+ *   立ち位置は「たいていそちら側」という手がかり＝**打者の外角側に立ったときだけ**、
+ *   `CPU_CROSS_CHANCE` の割合で内角のストライクへ逆を突く。
+ *   **CLAUDE.md⑪「CPUの規則は決定的」の3つ目の例外**（引数で側を渡さない呼び出しは
+ *   従来の偶奇の規則のまま＝それまでの計測とテストの基準線）。
+ * - **踏み込んでいる打者の体へは投げない**（同BBB-84。`avoidCrowdingBatter`）＝リリースの
+ *   瞬間の打者の立ち位置を見て、寄ったから当たる球は反対側へ投げ直す。
  * - **決め球（追い込んだ1球）の球速だけは投手の持ち味で決まる**（フェーズS-40。
  *   `cpuPitcherStyle`）。それまでは速球派も変化球派もまったく同じ配球をしていた
  *   ＝B-12が「CPUは球団の個性を活かさない」として記録した穴の、投球側の分。
@@ -37,6 +46,7 @@
  */
 import type { Bases, Count } from './rules';
 import {
+  type BatterSide,
   type PitchProfile,
   BATTER_STANCE_RANGE,
   BATTER_ZONE_MIN_X,
@@ -44,11 +54,15 @@ import {
   NEUTRAL_RATING,
   PLATE_Z,
   RELEASE_Z,
+  RIGHT_BATTER_SIDE,
   STRIKE_ZONE_HALF_WIDTH,
+  batterFrameX,
   clampReleaseX,
+  judgePitch,
   speedForPitchSelection,
   steerAccelForSelection,
 } from './pitch';
+import { type RngState, nextRng } from './rng';
 
 export type CpuSpeedMode = 'fast' | 'neutral' | 'slow';
 
@@ -56,6 +70,15 @@ export interface CpuPitchPlan {
   /** 本塁通過時に狙うワールドX（コース）。シーン層がリリース位置に直接反映する */
   targetX: number;
   speed: CpuSpeedMode;
+  /**
+   * **逆を突く球か**（フェーズBBB-84）。true なら投手は**反対の隅へ投げるときと同じ場所に
+   * 立ち**、リリースの瞬間のコース入力（初期の横速度）で `targetX` へ投げ分ける
+   * （`planCpuPitchShape`）。省略・false＝立ち位置どおりの側へ来る球（従来と同じ）。
+   * 付くのは2つの場合だけ：**打者の外角側に立って内角のストライクへ**投げる球
+   * （`chooseCpuPitchPlan`）と、**踏み込んでいる打者の体を避けて反対側へ**投げ直した球
+   * （`avoidCrowdingBatter`）。真ん中狙い（`targetX` が 0）には意味を持たない。
+   */
+  cross?: boolean;
 }
 
 /**
@@ -101,6 +124,14 @@ export const CORNER_MARGIN = 0.05;
  * - **0.40 → 三振25.0% / 四球8.3% / インプレー62.5% / 3.58球**（B案と併用したとき）
  * - 0.404 以上 → 三振56.3%・インプレー25.0%（見送りばかりで打球が消える）
  * - 0.45 → 三振0%・四球0%（全球ボール→3ボールの置き球を打つだけの4球打席）
+ *
+ * ## フェーズAAA-75：「振らせない帯」ではなくなった（値は据え置き）
+ *
+ * CPU打者が**ストライクゾーンいっぱいに手を出す**ようになった（`cpuBatter.ts` の
+ * `SELECTIVE_HALF_WIDTH`＝0.45）ので、この狙いは**振られる球**に戻った。上の「階段」は
+ * 決定的なCPU打者が 0.40 ちょうどで振る／振らないを切り替えていたせいで、ぶれが入った
+ * いまは存在しない。**値を据え置いた理由**は、隅を突く球（芯を外して打ち取る球）という
+ * 意味がそのまま生きるから＝ど真ん中へ置く投手より、隅へ散らす投手が打ち取れる。
  */
 export const NORMAL_TARGET_X = STRIKE_ZONE_HALF_WIDTH - CORNER_MARGIN;
 
@@ -270,6 +301,264 @@ const PUTAWAY_SPEED: Record<CpuPitcherStyle, CpuSpeedMode> = {
   balanced: 'neutral',
 };
 
+// ---- 内外角と、立ち位置という手がかり（フェーズBBB-84） ----
+//
+// BBB-83 が見つけた穴：**CPU投手の内外角は、投げる前に100%読めた**。出どころは2つ：
+//
+// 1. **カウント**＝内外角は「ボール数＋ファウル数の偶奇」で決まっていた（初球は必ず一塁側）。
+// 2. **プレート上の立ち位置**＝リリース位置は「狙うコースから曲がりのぶん戻した所」（P-37）で、
+//    曲がりを3割にした BBB-77 からは**立ち位置と狙いが必ず同じ側**になった。
+//
+// 人間の打者は打席の中で寄れる（O-36。端まで 0.13秒）ので、**読んで寄るだけで打率 .360・
+// 本塁打 7%/打席**（中央のまま .219・2%。`npm run balance:tell` の1段目）。O-36 の立ち位置は
+// 「読みが当たれば得・外れれば損」の設計だが、**読みが外れない**。
+//
+// AAA-75 がCPU打者について出した結論（決定的な規則には必ず勝てる形が残る）の、投手側の鏡像＝
+// **どんな決定的な規則で内外角を決めても、人間は投げる前にそれを知れる**。そこで
+// （2026-10-12 ユーザー判断）：
+//
+// - **立つ側は試合のシードの別系列から引く**（`drawCpuPitchSides`）＝**CLAUDE.md⑪「CPUの規則は
+//   決定的」の3つ目の例外**（AAA-75＝CPU打者のぶれ／BBB-80＝死球の乱闘のくじ、に続く）。
+//   本編の乱数は消費しないので、シードを固定すれば試合まるごと再現できる。
+// - **立ち位置は「たいていそちら側」という手がかりとして残す**。`CPU_CROSS_CHANCE` の割合で
+//   **逆を突く**（`CpuPitchPlan.cross`）：投手は反対の隅へ投げるときとまったく同じ場所に立ち、
+//   リリースの瞬間のコース入力（説明書p19③＝人間の「投げる瞬間の左右」と同じ初期の横速度）で
+//   逆の隅へ投げ分ける。**投げる前には見分けが付かず、投げた瞬間から球筋が斜めに見える**。
+//
+// ## 最初に入れた形は、読まずに寄る打者を測らずに決めた（計測が形を2つ変えた）
+//
+// 最初は**どちらの側に立っても逆を突く**形で入れ、「立ち位置を信じて寄る打者」の帰結だけを見て
+// 割合を決めた（信じて寄る 6.6点/試合・中央のまま 4.7点）。ところが**何も読まずにプレートへ
+// 寄り切る打者は 14.0点**取れた（`npm run balance:tell` の2段目）。理由は2つ：
+//
+// 1. **死球のもらい得**。寄ると内角のボール球が体に当たり（O-36）、一塁をもらえる。隅の外へ
+//    外す球（ストライク先行の1球・追い込んでからの決め球）は必ず立ち位置どおりに来るので、
+//    内角に立たれたら踏み込むだけでよかった（死球 17%/打席）。BBB-83 までの規則でも同じ穴が
+//    あった（寄り切るだけで 14.5点）が、読む打者しか測っていなかったので見えていなかった。
+// 2. **内角と読めて離れる値打ちが小さい**。打ち上げ角は「21° − コース×30°」なので、寄って
+//    外角を捉えると 32°（長打）・離れて内角を捉えても 9°（単打）。内角側に立って外角へ逆を
+//    突いた球は**寄り切った打者の芯へ行く**＝読みが外れても損をしない。
+//
+// 仕上げの形（同じフェーズの中で直した）：
+//
+// - **逆を突くのは、打者の外角側に立って、内角のストライクへ投げるときだけ**
+//   （`chooseCpuPitchPlan`）。内角側に立たれたら必ず内角へ来る＝外角と示されて寄るのは賭け
+//   （3回に1回は内角へ食い込んで詰まる）・内角と示されたら離れて単打。**読まずに寄り切る打者が、
+//   立ち位置を信じる打者を上回らなくなる**（信じる 打率.31・7.2〜7.5点／寄り切る .24・6.4〜6.9点／
+//   中央 4.2点。得点期待は標本で1点ほど動く）。
+// - **踏み込んでいる打者の体へは投げない**（`avoidCrowdingBatter`。リリースの瞬間に見る）。
+// - **投げた後に踏み込んで当たった球は死球にしない**（`pitch.ts` の `judgePitch`）。
+//
+// 読みは消えない＝**立ち位置を見て寄るのは今も得**だが、外れる。寄るのが賭けになる
+// （桜井ノウハウ「リスクとリターンはかなり近いところに適切な大きさに配置」）。
+
+/** その1球の内外角（フェーズBBB-84。`drawCpuPitchSides` が引く） */
+export interface CpuPitchSides {
+  /** **立つ側＝打者に示す側**（ワールドXの符号。+1＝一塁側）。たいていそのまま狙う側になる */
+  side: 1 | -1;
+  /**
+   * 逆を突くくじ。当たっていても、逆を突くのは**打者の外角側に立って、内角のストライクへ**
+   * 投げるときだけ（`chooseCpuPitchPlan`）＝内角側に立った球・外す球は必ず立ち位置どおり。
+   */
+  cross: boolean;
+}
+
+/**
+ * **逆を突く割合**＝打者の外角側に立った球が、内角のストライクへ来る割合。
+ *
+ * 値は `npm run balance:tell` の4段目が決めた（CLAUDE.md「バランス調整の方針」）。見たのは
+ * **立ち位置を信じる打者**と、**読まずに寄り切る打者**の両方（得点/試合）：
+ *
+ * | 割合 | 信じる | 寄り切る | 中央のまま |
+ * |---|---|---|---|
+ * | 0（立ち位置は必ず本当） | 11.5 | 8.7 | 4.6 |
+ * | 1/4 | 8.1 | 6.9 | 4.2 |
+ * | **1/3** | **7.5** | **6.4** | **4.2** |
+ * | 1/2 | 6.4 | 5.4 | 3.7 |
+ *
+ * どの割合でも、信じる打者は読まずに寄る打者を下回らない（打率・出塁率ははっきり上。得点期待は
+ * 標本で1点ほど動く＝6912打席では 1/3 で 信じる 7.2・寄り切る 6.9）。0 では読みが外れない
+ * （打率 .37・本塁打 7%/打席）。上げるほど信じる値打ちが薄れる。**信じるのが得のまま、
+ * 外角と示された球の3回に1回は内角へ食い込む**のが 1/3。
+ *
+ * 1/3 という刻みは `CPU_BRAWL_CHANCE`（BBB-80）・`CPU_TIMING_PENALTY_SEC`（窓の1/3）と同じ
+ * ＝新しい種類の数値は持ち込んでいない。多い／少ないと感じたらこの1か所。
+ */
+export const CPU_CROSS_CHANCE = 1 / 3;
+
+/**
+ * 内外角を引く系列の塩（`cpuBatter.ts` の `CPU_SWING_NOISE_SALT`・`brawl.ts` の
+ * `CPU_BRAWL_ROLL_SALT` と同じ考え方＝**本編の乱数を消費せず、シードから別系列を起こす**）。
+ * 値そのものに意味は無い。
+ */
+export const CPU_PITCH_SIDE_SALT = 0x51de;
+
+/**
+ * 1球ぶんの内外角を引く（**立つ側は五分五分**・逆を突くくじは `crossChance` の割合）。
+ * 状態を書き換えず必ず新しい状態を返す（`rng.ts` の作法）。
+ *
+ * **必ず2つ引く**（真ん中狙いの球で使われなくても）＝1球につき系列が進む量が一定なので、
+ * 「何球目にどちらへ来るか」がカウントの進み方に左右されない。
+ */
+export function drawCpuPitchSides(
+  state: RngState,
+  crossChance: number = CPU_CROSS_CHANCE,
+): { sides: CpuPitchSides; state: RngState } {
+  const a = nextRng(state);
+  const b = nextRng(a.state);
+  return {
+    sides: { side: a.value < 0.5 ? 1 : -1, cross: b.value < crossChance },
+    state: b.state,
+  };
+}
+
+/**
+ * **踏み込んでいる打者の体へ行く球は、反対側へ投げる**（フェーズBBB-84。決定的・乱数不使用）。
+ *
+ * 打者は打席の中でプレートへ寄れる（O-36）。寄ると内角のボール球が体に当たる＝**一塁をもらえる**。
+ * O-36 はこれを「投手側の綱引き（寄られたら内角を突けるが、外せば一塁を与える）」として置いたが、
+ * CPU投手はその綱引きをしていなかった＝寄っている打者にも、決まった内角のボール球（ストライク先行の
+ * 外す1球・追い込んでからの決め球・荒れた投手の膨らんだ球）をそのまま投げて当てていた
+ * （寄り切るだけで死球 17%/打席・14点/試合。`npm run balance:tell` の2・3段目）。
+ *
+ * 見るのは**リリースの瞬間の打者の立ち位置**（投げる前に解いた立ち位置はそのまま。反対の隅へは
+ * 「逆を突く球」と同じリリースの横速度で届く＝`planCpuPitchShape` の `cross`）。リリースの後に
+ * 踏み込む打者には、投手は何もできない＝そちらは `judgePitch` が死球にしない。
+ *
+ * **打席の中央に立っていても当たる球はそのまま**＝荒れた投手はぶつけうる（T-41のユーザー判断。
+ * 避ける手は「離れて立つ」。名鑑96人のうち3人の球だけ）。ここで避けるのは**寄ったから当たる球**だけ。
+ *
+ * @param stance リリースの瞬間の打席内の立ち位置（負＝プレートへ寄っている）
+ */
+export function avoidCrowdingBatter(
+  plan: CpuPitchPlan,
+  side: BatterSide,
+  stance: number,
+): CpuPitchPlan {
+  // 逆を突く球はストライクゾーンの中＝打者には当たらない
+  if (plan.cross) return plan;
+  if (judgePitch(plan.targetX, side, stance) !== 'hitByPitch') return plan;
+  if (judgePitch(plan.targetX, side, 0) === 'hitByPitch') return plan;
+  return { ...plan, targetX: -plan.targetX, cross: true };
+}
+
+// ---- 緩急と勝負球＝配球のくじ（フェーズCCC-86。BBB-84 の続き） ----
+//
+// BBB-84 で内外角は読めなくなったが、配球にはまだ**投げる前に分かる**ものが2つ残っていた：
+//
+// 1. **球速はカウントだけで決まっていた**（初球は必ず速球・ストライクの後はフォーク・3ボールは
+//    基準速・追い込んだら持ち味）。人間の打者はカウントを見れば待つ速さを知れる＝タイミングを
+//    外されない（`npm run balance:pace` の1段目）。
+// 2. **追い込んだ1球は、制球のとびきり良い投手（名鑑96人中8人）を除いて必ずボール**だった
+//    （決め球は「隅の1つ外側」＋制球の膨らみ。T-41）。追い込まれたら振らないだけで四球になる
+//    （同2段目：出塁率 +.03〜.05・1試合 +1点ほど。緩急を引くと差は 3〜5点に広がる＝5段目の 0）。
+//
+// どちらも内外角と同じ形で塞ぐ（2026-10-14 ユーザー判断）：**いつもの形（カウントの傾向）は
+// 手がかりとして残し、くじが当たったときだけ外す**（`CpuPitchMix`）。くじは試合のシードから
+// 起こした別系列で引く（`drawCpuPitchMix`）＝本編の乱数は消費しない。**CLAUDE.md⑪「CPUの規則は
+// 決定的」の3つ目の例外（BBB-84＝CPU投手の内外角）を、配球全体（内外角・緩急・勝負球）へ広げた**。
+
+/** その1球の配球のくじ（フェーズCCC-86。`drawCpuPitchMix` が引く） */
+export interface CpuPitchMix {
+  /** いつもの球速（カウントの傾向）から外すか */
+  change: boolean;
+  /** 外すとき、投げてよい残りの球速のどれにするか（0..1。候補を等分した区間のどこに落ちたか） */
+  pick: number;
+  /**
+   * 追い込んだ1球で、外へ逃げる決め球の代わりに**ゾーンの隅へ勝負に行く**か。
+   * 狙いは通常の球と同じ隅（`NORMAL_TARGET_X`＝見逃せばストライク）。
+   */
+  attack: boolean;
+}
+
+/**
+ * **いつもの球速から外す割合**（フェーズCCC-86。2026-10-14 ユーザー判断で 1/3）。
+ *
+ * `npm run balance:pace` の1・3段目（打率/三振。打者の合わせ方は「本当の時間差の半分」）：
+ *
+ * | 外す割合 | 傾向を待つ | いつも速球を待つ | いつも基準速を待つ | 本当の球速を知る（読みの札） |
+ * |---|---|---|---|---|
+ * | 0（CCC-86 の前） | .371 / 2.8% | .351 / 9.5% | .287 / 17.4% | .371 / 2.8% |
+ * | 1/4 | .316 / 6.8% | .314 / 12.5% | .275 / 16.4% | .347 / 2.7% |
+ * | **1/3** | **.313 / 8.5%** | .311 / 13.7% | .286 / 17.0% | .351 / 2.8% |
+ * | 1/2 | .277 / 14.3% | .285 / 15.2% | .273 / 16.3% | .337 / 2.9% |
+ *
+ * **1/3 は、合わせ方の仮定3つのどれでも「傾向を待つ」の打率が読まない打ち方を下回らない
+ * 割合**（三振はどの割合でもいちばん少ない）。1/4 と 1/2 では、合わせ直せる仮定のとき
+ * 「いつも速球を待つ」のほうが打率で上回る（1/2 は手がかりが消える）。**読みの札（`予知` ほか）は
+ * ここで初めて値打ちを持つ**（いままでは札が無くてもカウントで分かった）。
+ * 刻みは `CPU_CROSS_CHANCE`（内外角の逆を突く割合）と同じ＝新しい種類の数値は持ち込んでいない。
+ *
+ * **得点はどの割合でも（CCC-86 の前でも）「いつも速球を待つ」ほうが傾向を待つより多い**（早めに
+ * 振って引っ張る打球と、空振りで粘って取る四球のぶん）。打球の作りの性質で、緩急の規則では動かない
+ * （今回は触っていない）。
+ */
+export const CPU_PACE_CHANGE_CHANCE = 1 / 3;
+
+/**
+ * **追い込んだ1球が勝負球（ゾーンの隅）になる割合**（フェーズCCC-86）。
+ *
+ * 値は `npm run balance:pace` の5段目が決めた：**追い込まれたら振らない打者が、普通に打つ打者
+ * （追い込まれたら際どい球にも手を出す）を上回らない、いちばん小さい割合**。得点/試合（外す割合
+ * 1/3。打者の合わせ方の仮定3通り＝CPU打者と同じ／本当の時間差の半分／合わせ直せない）：
+ *
+ * | 勝負球 | 普通に打つ | 2Sから振らない | 2Sはゾーンだけ振る（見極めの上限） |
+ * |---|---|---|---|
+ * | 0（CCC-86 の前の追い込み方） | 4.91 / 5.14 / 4.97 | 7.59 / 8.70 / 9.71 | 7.93 / 9.17 / 9.69 |
+ * | 1/4 | 4.35 / 4.45 / 4.23 | **5.13** / 4.06 / **4.55** | 5.83 / 5.55 / 5.95 |
+ * | **1/3** | **4.41 / 4.48 / 3.96** | **4.29 / 3.96 / 3.88** | 5.14 / 5.05 / 5.25 |
+ * | 1/2 | 4.19 / 4.15 / 3.98 | 3.65 / 2.99 / 3.10 | 4.38 / 4.38 / 3.95 |
+ *
+ * 1/4 では2つの仮定で振らないほうが得になる。1/3 は別の種2つ（48回ずつ）でも6通りすべてで
+ * 振らない打者が下回った（0.15〜0.72点）。**ゾーンの球だけを振る（見極める）打者への報酬は残る**
+ * （普通より +0.6〜1.3点）＝見る目は値打ちのまま、振らないだけでは得をしない。
+ * 刻みは `CPU_PACE_CHANGE_CHANCE` と同じ。
+ */
+export const CPU_ATTACK_CHANCE = 1 / 3;
+
+/** 配球のくじを引く系列の塩（`CPU_PITCH_SIDE_SALT` と同じ考え方。値そのものに意味は無い） */
+export const CPU_PITCH_MIX_SALT = 0x9ace;
+
+/**
+ * 1球ぶんの配球のくじを引く。**必ず3つ引く**（外さない球・追い込んでいない球でも）＝1球につき
+ * 系列が進む量が一定なので、「何球目に何が来るか」がカウントの進み方に左右されない。
+ * 状態を書き換えず必ず新しい状態を返す（`rng.ts` の作法）。
+ */
+export function drawCpuPitchMix(
+  state: RngState,
+  changeChance: number = CPU_PACE_CHANGE_CHANCE,
+  attackChance: number = CPU_ATTACK_CHANCE,
+): { mix: CpuPitchMix; state: RngState } {
+  const a = nextRng(state);
+  const b = nextRng(a.state);
+  const c = nextRng(b.state);
+  return {
+    mix: { change: a.value < changeChance, pick: b.value, attack: c.value < attackChance },
+    state: c.state,
+  };
+}
+
+/** 緩急3段（速い順） */
+const SPEED_MODES: readonly CpuSpeedMode[] = ['fast', 'neutral', 'slow'];
+
+/**
+ * カウントの区分ごとに、緩急のくじを効かせるか（`CPU_PACE_SCOPE`。計測は候補を比べるために
+ * 差し替える）。
+ */
+export interface CpuPaceScope {
+  /** 追い込んだ1球（決め球。S-40の持ち味） */
+  putaway: boolean;
+  /** 3ボールの置きにいく球（T-41の「待った側への報酬」） */
+  threeBalls: boolean;
+}
+
+/**
+ * **決め球も外す・3ボールの置き球は外さない**（2026-10-14 ユーザー判断）。決め球は持ち味（S-40）が
+ * 傾向として残る。3ボールの置き球は「誰が投げても真ん中の基準速」のまま＝T-41 の「待った側への
+ * 報酬」をそのまま残す（計測でも外すかどうかで帰結はほとんど動かない＝`balance:pace` の3段目）。
+ */
+export const CPU_PACE_SCOPE: CpuPaceScope = { putaway: true, threeBalls: false };
+
 /**
  * カウントに応じた投球方針を決める（決定的、乱数不使用）。
  * - 2ストライク以降：三振を狙って隅（ストライクゾーンぎりぎり外側の際どいコース）を突き、
@@ -324,29 +613,128 @@ const PUTAWAY_SPEED: Record<CpuPitcherStyle, CpuSpeedMode> = {
  * **カウントの規則も膨らみの掛け方も1つも変えていない**（動いたのは通常の球の狙い1点だけ）。
  * `aims.normalTarget` は `swingWidths`（SS-67）・`cpuControlSpray(control, curve)`（T-41）と
  * 同じ**計測が定数を書き換えずに振るための引数**で、渡さなければ採用値＝実機と同じ。
+ *
+ * ## フェーズBBB-79：ワンバウンドするフォークは投手有利のカウントだけ（`aims.bouncingFork`）
+ *
+ * Fの大きい投手のフォークは地面まで落ちて**見逃せば必ずボール**（`core/pitch.ts` の
+ * `pitchBounces`）。それまでの配球（1ストライク後は毎回フォーク／技巧派は追い込んだら
+ * 毎回フォーク）のままだと、**こちらが打者のとき「フォークのカウントで振らない」だけで
+ * 四球が取れてしまう**（配球は決定的＝カウントを見れば何が来るか読める）。
+ *
+ * 2026-10-09 ユーザー判断：**ワンバウンドするフォークはストライクが先行しているカウント
+ * （0-1・0-2・1-2）でだけ投げる**＝外す1球（SS-67）と決め球（S-40）として使う。それ以外の
+ * カウントでフォークになるはずの球は**基準速（ストライクを取りに行く球）に替える**。
+ * 投手有利のカウントで1球ぶんボールを差し出すのは、もともと SS-67 が「外す1球」として
+ * 払っていた対価と同じなので、**見送るだけで得をする打ち手にはならない**。
+ * ワンバウンドしない投手（チェンジアップ）は**渡さなければ従来と完全に同じ**。
+ *
+ * ## フェーズBBB-84：立つ側は引いた側（`aims.sides`）
+ *
+ * `aims.sides`（`drawCpuPitchSides`）を渡すと、**投手はその側に立つ**。たいていそのまま
+ * その側の隅へ投げる。**狙う距離（隅か、真ん中か・制球の膨らみ）と球速は1つも変わらない**＝
+ * 変わるのは「どちらの隅か」と「立ち位置がそれを正しく示すか」だけ。真ん中狙い（3ボール）は
+ * 側を持たないので、引いた側は使われない。
+ *
+ * **逆を突く（立ち位置と反対の隅へ投げる＝方針に `cross` が付く）のは、くじが当たっていて、
+ * 打者の外角側に立って、内角のストライクへ投げるときだけ**（`aims.batterSide` でどちらが
+ * 内角かを知る）：
+ *
+ * - **内角側に立った球は必ず内角へ来る**。どちらの側からも逆を突く形（最初に入れた形）では、
+ *   内角側に立って外角へ逆を突いた球が、寄り切っている打者の芯へ行った＝立ち位置を信じる
+ *   より、読まずに寄り切るほうが得だった（`npm run balance:tell` の4段目）。
+ * - **隅の外へ外す球は必ず立ち位置どおり**（追い込んでからの決め球・ストライク先行の外す1球・
+ *   荒れた投手の膨らんだ球）。ストライクゾーンの球は打者に当たらない（O-36・T-41 の不変条件）
+ *   ので、**逆を突かれて当たることは無い**＝外れたら詰まるか、見逃しのストライクになる。
+ *   副産物：**制球の悪い投手ほど逆を突けない**（狙いがゾーンの外へ膨らむ＝T-41）。
+ *
+ * `aims.crossBothWays` は、最初に入れた形（どちらの側に立っても逆を突く）を計測が再現する
+ * ための引数（ゲーム本体は渡さない）。
+ *
+ * **側を渡さなければ従来どおり「ボール数＋ファウル数の偶奇」**（T-41・SS-67）＝それらの計測と
+ * テストは引数なしで呼んでいるので1つも動かない。ゲーム本体は必ず渡す（`main.ts`）。
+ *
+ * ## フェーズCCC-86：緩急と勝負球は配球のくじ（`aims.mix`）
+ *
+ * - **球速**：上の規則で決まる球速は「いつもの球速（カウントの傾向）」。くじ（`mix.change`）が
+ *   当たれば、投げてよい残りの球速のどれかへ外す（ワンバウンドするフォークは投手有利のときだけ＝
+ *   BBB-79 はくじでも崩れない）。**3ボールの置き球は外さない**（`CPU_PACE_SCOPE`）＝T-41 の
+ *   「待った側への報酬」のまま。**コースは1つも変わらない**。
+ * - **勝負球**：追い込んだ1球は、くじ（`mix.attack`）が当たれば外へ逃げずに**通常の球と同じ隅**
+ *   （見逃せばストライク）へ行く。膨らみは通常の球と同じく外へだけ＝荒れた投手の勝負球は外れうる。
+ *
+ * **くじを渡さなければ CCC-86 の前と完全に同じ**（ここまでの計測とテストは引数なし）。
  */
 export function chooseCpuPitchPlan(
   count: Count,
   style: CpuPitcherStyle = 'balanced',
   control: number = NEUTRAL_RATING,
   foulsInAtBat = 0,
-  aims: { normalTarget?: number } = {},
+  aims: {
+    normalTarget?: number;
+    bouncingFork?: boolean;
+    sides?: CpuPitchSides;
+    /** いまの打者の打席の左右（逆を突く向き＝内角がどちらかを決める。既定は右打者） */
+    batterSide?: BatterSide;
+    crossBothWays?: boolean;
+    /**
+     * この球の配球のくじ（フェーズCCC-86。`drawCpuPitchMix`）。渡さなければいつもの形
+     * ＝球速はカウントだけで決まり、追い込んだ1球は必ず外へ逃げる（CCC-86 の前と完全に同じ）。
+     */
+    mix?: CpuPitchMix;
+    /** 緩急のくじを効かせるカウントの区分（計測用。渡さなければ `CPU_PACE_SCOPE`） */
+    paceScope?: CpuPaceScope;
+  } = {},
 ): CpuPitchPlan {
-  const cornerSign: 1 | -1 = (count.balls + Math.max(0, foulsInAtBat)) % 2 === 0 ? 1 : -1;
+  const cornerSign: 1 | -1 =
+    aims.sides?.side ?? ((count.balls + Math.max(0, foulsInAtBat)) % 2 === 0 ? 1 : -1);
+  const cross = aims.sides?.cross ?? false;
   const spray = cpuControlSpray(control);
   const aim = (base: number): number =>
     cornerSign * Math.min(base, CPU_CONTROL_MAX_TARGET);
+  // ワンバウンドするフォークは投手有利のカウントでだけ（フェーズBBB-79）。それ以外で
+  // フォークになるはずの球は基準速（ストライクを取りに行く球）に替える
+  const ahead = count.strikes > count.balls;
+  const allowed = (mode: CpuSpeedMode): boolean =>
+    !(mode === 'slow' && (aims.bouncingFork ?? false) && !ahead);
+  // いつもの球速（カウントの傾向）。くじが当たったときだけ、投げてよい残りの球速のどれかへ外す
+  // （フェーズCCC-86）。くじを渡さなければ従来と完全に同じ
+  const mix = aims.mix;
+  const scope = aims.paceScope ?? CPU_PACE_SCOPE;
+  const pick = (usual: CpuSpeedMode, inScope = true): CpuSpeedMode => {
+    const home = allowed(usual) ? usual : 'neutral';
+    if (!mix || !mix.change || !inScope) return home;
+    const others = SPEED_MODES.filter((m) => m !== home && allowed(m));
+    if (others.length === 0) return home;
+    return others[Math.min(others.length - 1, Math.floor(mix.pick * others.length))];
+  };
+  const normalTarget = (aims.normalTarget ?? NORMAL_TARGET_X) + Math.max(0, spray);
+
+  // ここまでの狙いは**立つ側**（`cornerSign`）の隅。逆を突くのは、くじが当たっていて、
+  // **打者の外角側に立って、内角のストライクへ**投げるときだけ：
+  // - 隅の外へ外す球は立ち位置どおり（ストライクゾーンの球は打者に当たらない＝逆を突かれて
+  //   当たることは無い）
+  // - 内角側に立った球は必ず内角へ来る（逆を突いて外角へ逃がすと、寄っている打者の芯へ行く）
+  // 真ん中狙いは側を持たないので、ここを通らない（立ち位置も真ん中のまま）。
+  const sided = (plan: CpuPitchPlan): CpuPitchPlan => {
+    if (!cross || Math.abs(plan.targetX) > STRIKE_ZONE_HALF_WIDTH) return plan;
+    const standsInside = batterFrameX(plan.targetX, aims.batterSide ?? RIGHT_BATTER_SIDE) > 0;
+    if (standsInside && !aims.crossBothWays) return plan;
+    return { ...plan, targetX: -plan.targetX, cross: true };
+  };
 
   if (count.strikes >= 2) {
-    return {
-      targetX: aim(STRIKE_ZONE_HALF_WIDTH + CORNER_MARGIN + spray),
-      speed: PUTAWAY_SPEED[style],
-    };
+    // 勝負球（フェーズCCC-86）：くじが当たれば、外へ逃げる決め球の代わりに通常の球と同じ隅
+    // （見逃せばストライク）へ勝負に行く。**膨らみは通常の球と同じく外へだけ**＝荒れた投手の
+    // 勝負球は今までどおり外れうる（制球の値打ち＝T-41 はそのまま）
+    return sided({
+      targetX: aim(mix?.attack ? normalTarget : STRIKE_ZONE_HALF_WIDTH + CORNER_MARGIN + spray),
+      speed: pick(PUTAWAY_SPEED[style], scope.putaway),
+    });
   }
   if (count.balls >= 3) {
-    return { targetX: 0, speed: 'neutral' };
+    return { targetX: 0, speed: pick('neutral', scope.threeBalls) };
   }
-  const speed: CpuSpeedMode = count.strikes === 0 ? 'fast' : 'slow';
+  const speed: CpuSpeedMode = pick(count.strikes === 0 ? 'fast' : 'slow');
   // ストライク先行（投手有利）なら1球、隅へ外す（フェーズSS-67）。
   //
   // それまでは**2ストライクに届くまでの球が全部ストライク**（狙いはゾーンのよく内側）
@@ -357,12 +745,9 @@ export function chooseCpuPitchPlan(
   // 制球の良い投手はゾーンの内側に収まって**見逃しストライク**になり、荒れた投手は
   // 外れて**ボール**になる＝「際どいところへ投げ切れること」がそのまま値打ちになる。
   if (count.strikes > count.balls) {
-    return { targetX: aim(STRIKE_ZONE_HALF_WIDTH + CORNER_MARGIN + spray), speed };
+    return sided({ targetX: aim(STRIKE_ZONE_HALF_WIDTH + CORNER_MARGIN + spray), speed });
   }
-  return {
-    targetX: aim((aims.normalTarget ?? NORMAL_TARGET_X) + Math.max(0, spray)),
-    speed,
-  };
+  return sided({ targetX: aim(normalTarget), speed });
 }
 
 /**
@@ -452,8 +837,17 @@ export interface CpuPitchShape {
   speed: number;
   /** リリース→本塁の飛行時間 秒（逆算に使った値） */
   flightSec: number;
-  /** 実際に曲がる横移動 m（＝ |releaseX − targetX|。プレートの幅で削られた後の値） */
+  /**
+   * 実際に曲がる横移動 m（プレートの幅で削られた後の値）。立ち位置どおりの球では
+   * ＝ |releaseX − targetX|。逆を突く球では、そこに `releaseVx` のぶんの横移動が足される。
+   */
   breakWidth: number;
+  /**
+   * リリースの瞬間の横速度 m/s（フェーズBBB-84。シーン層が `releasePitchFlight` の
+   * `initialVx` にそのまま渡す）。**立ち位置どおりの球は 0**（従来と同じ＝狙いはリリース位置
+   * そのもの）。**逆を突く球だけ**、反対の隅へ届く向き・大きさを持つ。
+   */
+  releaseVx: number;
 }
 
 /** Δ = a·ts·(T − ts/2) を ts について解く（0 ≤ ts ≤ T の側の根） */
@@ -496,6 +890,7 @@ export function planCpuPitchShape(
       speed,
       flightSec,
       breakWidth: 0,
+      releaseVx: 0,
     });
   }
   const breakAmount = steerX < 0 ? profile.breakLeft : profile.breakRight;
@@ -503,6 +898,33 @@ export function planCpuPitchShape(
   const held = Math.max(0, Math.min(steerSec, flightSec));
   // この投手がこの入力で自然に曲げられる幅
   const wanted = steerAccel * held * (flightSec - held / 2);
+  if (plan.cross) {
+    // 逆を突く球（フェーズBBB-84）。**立つのは「反対の隅へ、立ち位置どおりに投げるとき」と
+    // まったく同じ場所**（同じ球速・同じ狙いの距離で、側だけを裏返した球の形をそのまま解く）
+    // ＝投げる前には見分けが付かない。そこから、リリースの瞬間のコース入力（初期の横速度）で
+    // 本当の隅へ投げ分ける（踏み込んでいる打者の体を避けて投げ直す球も、同じ形でここを通る）。
+    // 曲げ方はいつもと同じ（狙う側へ・同じ長さだけ倒す）なので、
+    // **曲がりは3割のまま**（BBB-77）で、足りないぶんを最初からの斜めの球筋が運ぶ：
+    //
+    //     targetX = releaseX + releaseVx·T + steerX·wanted
+    //
+    // 閉じた式のまま解ける（P-37と同じ開ループ）＝本塁を通る場所は狙いどおり。
+    const shown = planCpuPitchShape(
+      { targetX: -plan.targetX, speed: plan.speed },
+      profile,
+      steerSec,
+      releaseOffset,
+    );
+    return shape(shown.releaseX, {
+      steerX,
+      steerSec: held,
+      steerAccel,
+      speed,
+      flightSec,
+      breakWidth: wanted,
+      releaseVx: (plan.targetX - shown.releaseX - steerX * wanted) / flightSec,
+    });
+  }
   // そこから逆算したリリース位置。プレートからはみ出すぶんは曲がりのほうが削られる
   // （窓は腕のぶんずれる＝**腕の側の隅へは楽に曲げられ、逆側は削られやすい**。CC-50）
   const releaseX = clampReleaseX(plan.targetX - steerX * wanted, releaseOffset);
@@ -514,6 +936,7 @@ export function planCpuPitchShape(
     speed,
     flightSec,
     breakWidth,
+    releaseVx: 0,
   });
 }
 

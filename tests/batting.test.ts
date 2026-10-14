@@ -14,9 +14,11 @@ import {
   BUNT_EXIT_SPEED,
   BUNT_PUSH_EXIT_SPEED,
   EXIT_FATIGUE_BONUS,
+  EXIT_PITCH_CARRY,
   EXIT_POWER_BONUS,
   NEUTRAL_BATTER,
   callAfterSwing,
+  carriedPitchSpeed,
   contactPlaneCrossing,
   createBattedBall,
   isFairPosition,
@@ -41,7 +43,13 @@ import {
   SPEED_SLOW,
   batterStandX,
   createPitchFlight,
+  FATIGUE_SPEED_DROP,
+  REFERENCE_PITCHER_NEUTRAL,
+  SPD_SPAN,
+  SPEED_FAST_DELTA,
+  SPEED_SLOW_DELTA,
   fatiguedSpeed,
+  neutralSpeedFor,
   speedForPitchSelection,
   stepPitchFlight,
 } from '../src/core/pitch';
@@ -800,6 +808,75 @@ describe('左打者（BOX。フェーズB-9）', () => {
   });
 });
 
+describe('投手の球速は打球の強さに乗らない（フェーズBBB-85）', () => {
+  /** 芯で捉えた打球の初速（投げた投手の基準速を持つ球） */
+  const exitOf = (y: -1 | 0 | 1, speedRating: number): number =>
+    launchSpeed(
+      judgeSwing(
+        {
+          crossX: 0,
+          swingTime: SWING_IDEAL_SEC,
+          pitchSpeed: speedForPitchSelection(y, speedRating),
+          pitcherNeutral: neutralSpeedFor(speedRating),
+        },
+        NEUTRAL_BATTER,
+        RIGHT_BATTER_SIDE,
+      )!,
+    );
+
+  it('乗るのは「基準の投手が同じ緩急で投げた球速」', () => {
+    // 基準速の球は、誰が投げても基準の投手の基準速
+    expect(carriedPitchSpeed(neutralSpeedFor(0.3), neutralSpeedFor(0.3))).toBe(REFERENCE_PITCHER_NEUTRAL);
+    expect(carriedPitchSpeed(neutralSpeedFor(0.96), neutralSpeedFor(0.96))).toBe(REFERENCE_PITCHER_NEUTRAL);
+    // 緩急はそのまま乗る
+    expect(carriedPitchSpeed(speedForPitchSelection(-1, 0.8), neutralSpeedFor(0.8))).toBeCloseTo(
+      REFERENCE_PITCHER_NEUTRAL + SPEED_FAST_DELTA,
+      10,
+    );
+    expect(carriedPitchSpeed(speedForPitchSelection(1, 0.8), neutralSpeedFor(0.8))).toBeCloseTo(
+      REFERENCE_PITCHER_NEUTRAL - SPEED_SLOW_DELTA,
+      10,
+    );
+  });
+
+  it('投手を持たない素の球は、球速がそのまま乗る（テストと一様な格子の基準線は動かない）', () => {
+    expect(carriedPitchSpeed(SPEED_NEUTRAL)).toBe(SPEED_NEUTRAL);
+    expect(carriedPitchSpeed(47.5)).toBe(47.5);
+  });
+
+  it('球の速い投手ほど打たれたら飛ぶ、にはならない（同じ緩急なら、誰から打っても同じ初速）', () => {
+    for (const y of [-1, 0, 1] as const) {
+      const slow = exitOf(y, 0.35);
+      const fast = exitOf(y, 0.96);
+      expect(fast).toBeCloseTo(slow, 10);
+    }
+  });
+
+  it('速球を選ぶと当たれば飛ぶ・遅い球は飛ばない、はそのまま', () => {
+    for (const rating of [0.35, 0.67, 0.96]) {
+      expect(exitOf(-1, rating)).toBeGreaterThan(exitOf(0, rating));
+      expect(exitOf(0, rating)).toBeGreaterThan(exitOf(1, rating));
+      expect(exitOf(-1, rating) - exitOf(0, rating)).toBeCloseTo(EXIT_PITCH_CARRY * SPEED_FAST_DELTA, 10);
+    }
+  });
+
+  it('名鑑の平均の投手（基準の投手）の球は、BBB-85 の前とまったく同じ打球', () => {
+    // 基準の投手の基準速＝REFERENCE_PITCHER_NEUTRAL。その球を「素の球」として打ったのと同じ
+    const before = launchSpeed(
+      judgeSwing({ crossX: 0, swingTime: SWING_IDEAL_SEC, pitchSpeed: REFERENCE_PITCHER_NEUTRAL })!,
+    );
+    const after = launchSpeed(
+      judgeSwing({
+        crossX: 0,
+        swingTime: SWING_IDEAL_SEC,
+        pitchSpeed: REFERENCE_PITCHER_NEUTRAL,
+        pitcherNeutral: REFERENCE_PITCHER_NEUTRAL,
+      })!,
+    );
+    expect(after).toBeCloseTo(before, 10);
+  });
+});
+
 describe('投手の疲労が打球に効く（フェーズB-11の「球威」）', () => {
   /** 芯・ジャストミートで捉えたときの打球（比較の基準） */
   function justMeet(pitchSpeed: number, pitcherFatigue: number): BattedBallLaunch {
@@ -833,19 +910,38 @@ describe('投手の疲労が打球に効く（フェーズB-11の「球威」）
   });
 
   /**
-   * B-11の設計の要：初速は `EXIT_PITCH_CARRY × 球速` を含むので、**疲労で球速だけを
-   * 落とすと打球はむしろ飛ばなくなる**。球威の上乗せがその損失を上回っていることを
-   * 「実際に疲れた投手が投げた球」（球速も落ちた球）どうしの比較で固定する。
+   * B-11 の +5 は、疲労で球速が落ちるぶん打球が弱くなる（-2.1m/s）のを上回らせる値で、
+   * 差し引きは +2.9m/s だった。**BBB-85 で投手の球速そのものが打球に乗らなくなった**ので、
+   * 落ちるぶんが無い＝上乗せは差し引きの +2.9 をそのまま置く。「実際に疲れた投手が投げた球」
+   * （球速も落ちた球）どうしの比較で、疲れた投手から打った打球が前と同じであることを固定する。
    */
-  it('球速低下を織り込んでも、疲れた投手からのほうが打球は速い', () => {
+  it('上乗せは B-11 の差し引きそのもの（+5 から、球速低下で打球が弱くなっていたぶんを引いた値）', () => {
+    expect(EXIT_FATIGUE_BONUS).toBeCloseTo(5 - EXIT_PITCH_CARRY * FATIGUE_SPEED_DROP * SPD_SPAN, 10);
+  });
+
+  it('球速低下を織り込んでも、疲れた投手からのほうが打球は速い（差し引きは前と同じ +2.9m/s）', () => {
     const rating = 0.72;
-    const fresh = launchSpeed(justMeet(speedForPitchSelection(0, rating), 0));
-    const tired = launchSpeed(
-      justMeet(speedForPitchSelection(0, fatiguedSpeed(rating, 1)), 1),
-    );
+    /** 実際に投げた球＝投げた投手の基準速を持つ */
+    const thrown = (speedRating: number, fatigue: number): number =>
+      launchSpeed(
+        judgeSwing(
+          {
+            crossX: 0,
+            swingTime: SWING_IDEAL_SEC,
+            pitchSpeed: speedForPitchSelection(0, speedRating),
+            pitcherNeutral: neutralSpeedFor(speedRating),
+          },
+          NEUTRAL_BATTER,
+          RIGHT_BATTER_SIDE,
+          fatigue,
+        )!,
+      );
+    const fresh = thrown(rating, 0);
+    const tired = thrown(fatiguedSpeed(rating, 1), 1);
     expect(tired).toBeGreaterThan(fresh);
-    // 長打力+0.5相当（+3m/s前後）＝フェンスを越えるかどうかが入れ替わる幅
+    // フェンスを越えるかどうかが入れ替わる幅（長打力 +0.29 相当）
     expect(tired - fresh).toBeGreaterThan(2);
+    expect(tired - fresh).toBeCloseTo(EXIT_FATIGUE_BONUS, 6);
   });
 
   it('球威は長打力とまったく同じ形で乗る（非力な打者にも一発が出る）', () => {

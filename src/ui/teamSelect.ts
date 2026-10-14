@@ -60,6 +60,8 @@ import {
   remainingStaminaOf,
   staffPlayerId,
   swapBattingOrder,
+  BOUNCING_FORK_LABEL,
+  pitcherForkBounces,
 } from '../core/roster';
 import { type CarriedState, nextGameRoster } from '../core/run';
 import { type PlayMode, type PlayerSlot, PLAYER_LABEL } from '../core/players';
@@ -290,6 +292,9 @@ function describeStaffPitcher(name: string, stats: PitcherStats, remaining?: num
     `変化　　 ${ratingBar(stuff.breaking)}`,
     `制球　　 ${ratingBar(stuff.control)}`,
     `スタミナ ${ratingBar(stats.stamina)}`,
+    // ワンバウンドするフォークを持つ投手にだけ出す（フェーズBBB-79。HUDの投手カード・
+    // 継投の表と同じ文言）。見逃せばボールになる「振らせる球」なので、先発を選ぶ材料になる。
+    ...(pitcherForkBounces(stats, fatigueFromRemaining(remaining ?? 1)) ? [BOUNCING_FORK_LABEL] : []),
     // 疲れの持ち越し（フェーズV-43）。**無傷なら行そのものを出さない**ので、試合前の
     // 選択画面（C-15。全員が無傷）ではこの行が出ない
     // （銃の残弾・持ち越したリード・ゼッコーチョーの行と同じ扱い）。

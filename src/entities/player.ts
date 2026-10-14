@@ -29,11 +29,7 @@ import {
   ARM_SLOT_RAD,
   NEUTRAL_PITCH_ARM,
 } from '../core/pitch';
-import {
-  SWING_ACTIVE_SEC,
-  SWING_IDEAL_SEC,
-  SWING_STARTUP_SEC,
-} from '../core/batting';
+import type { PitchKey, SwingKey } from '../core/keyframes';
 import playerModelUrl from '../assets/player.glb?url';
 import { type FighterPose, type PoseKit, applyFighterPose } from './fighterPoses';
 import { addOutline, castShadows, toonify } from '../render/toon';
@@ -132,19 +128,21 @@ export type PlayerPose =
    */
   | { kind: 'stance'; side: BatterSide; walking?: boolean }
   /**
-   * スイング。t=0（構え）〜`SWING_CONTACT_P`（当たる瞬間）〜1（振り切ったフィニッシュ）。
-   * `recover`（0..1）はフィニッシュから構えへ戻る割合＝**振った道を逆にたどらずに戻る**。
+   * スイング（フェーズBBB-76）。**原作の5枚の絵のどれか**（`core/keyframes.ts` の
+   * `swingKeyAt` がスイングの経過から選ぶ）＝絵の間を補間しない（コマ送り）。
+   * 体のヨーは呼び出し側が `swingKeyYaw(key)` を Group に掛ける。
    */
-  | { kind: 'swing'; side: BatterSide; t: number; recover?: number }
+  | { kind: 'swing'; side: BatterSide; key: SwingKey }
   /** バント（バットを出して止める） */
   | { kind: 'bunt'; side: BatterSide }
   /**
-   * 投球。t=0（セット）〜`PITCH_RELEASE_T`（リリース）〜1（フォロースルー）。
+   * 投球（フェーズBBB-76）。**原作の8枚の絵のどれか**（`core/keyframes.ts` の
+   * `windupKeyAt`／`afterReleaseKeyAt` が投球の進行から選ぶ）。
    * `arm`（説明書のARM。フェーズCC-50）は**投げる腕と、その腕の角度**で、
    * 省略すると右のオーバースロー。**判定側のリリース位置のずれ（`armReleaseOffsetX`）と
    * 同じ `ARM_SLOT_RAD` から傾きを取る**ので、球の出どころと腕の向きが食い違わない。
    */
-  | { kind: 'pitch'; t: number; arm?: PitchArm }
+  | { kind: 'pitch'; key: PitchKey; arm?: PitchArm }
   /**
    * 送球（フェーズHH-55）。**t=0 がリリースの瞬間**（腕が前へ出切っている）〜1（振り抜き）
    * ＝**ボールが手を離れた後だけ**を描く。投球（`pitch`）が担ぎ上げから始まるのと違うのは、
@@ -198,9 +196,6 @@ export type PlayerPose =
    */
   | { kind: 'fighter'; pose: FighterPose };
 
-/** 投球アニメのうちリリースの瞬間（0..1 のどこか）。呼び出し側が時間を割り付けるのに使う */
-export const PITCH_RELEASE_T = 0.45;
-
 // ---- 姿勢の角度（すべてラジアン） ----
 //
 // 回転の向きの約束（モデルは +Z 正面・手足は -Y に垂れている）：
@@ -240,27 +235,46 @@ const CATCH_ARM_HIGH = 2.0;
 const CROUCH_THIGH = -1.15;
 const CROUCH_SHIN = 1.45;
 
-/** 打席の構え：膝の曲げ・足の開き */
+/**
+ * 打席の構え：膝の曲げ・足の開き。**原作の打者は構えから振り切りまで同じ高さ**
+ * （頭と足の位置が6枚とも同じ。フェーズBBB-77で実測）なので、スイングの絵もこの曲げの
+ * 上に組み立てる。
+ *
+ * **膝はわずかに曲げるだけ＝ほぼ直立**（フェーズBBB-78。テストプレイ「後ろにのけぞりすぎ。
+ * 直立してちゃんと構えてほしい」）。BBB-77 で深く曲げた（腿 -0.55・脛 0.95）ら、腰が
+ * 立ったまま膝だけが前へ出て、**いすに座りかけたように上体が後ろへ倒れて見えた**
+ * （原作の構えは頭が足の真上にある）。上体の前傾（`SWING_FRAMES` の `torsoX`）で構えの形を作る。
+ *
+ * **それでも後ろへ反って見えた原因は `torsoX` の符号**だった（フェーズBBB-79。テストプレイ
+ * 「まだちょっと後ろにのけぞってます」）。腕・脚（-Y へぶら下がる部品）は `rotation.x` の正が
+ * 後ろへ振る向きだが、**胴・骨盤（+Y へ伸びる部品）は正が前へ倒す向き**＝BBB-78 が前傾の
+ * つもりで入れた負の値は、**上体を後ろへ反らせていた**。走り・捕球・バントの前傾も同じ
+ * 取り違えだったので一緒に正した（`RUN_LEAN` ほか）。
+ */
 const STANCE_THIGH = -0.2;
 const STANCE_SHIN = 0.35;
 const STANCE_FEET_SPREAD = 0.18;
+/**
+ * 打者が首を回して投手を見る量の範囲 rad（フェーズBBB-77）。**原作の打者はどの絵でも
+ * 後頭部しか見えない**＝ずっと投手のほうを見ている。体がどれだけ回っていても首で
+ * 投手のほうへ向け直す（回せる量には限りがある）。
+ */
+const BATTER_HEAD_TURN_MIN = -0.6;
+const BATTER_HEAD_TURN_MAX = 1.35;
 
 /**
- * 投球の腕の角度（rotation.x を増やし続けると、腕は後ろ→頭上→前へ回る）。
- * **`PITCH_ARM_RELEASE` にちょうど届いた瞬間にボールが出る**（`PITCH_RELEASE_T`）ので、
- * 手からボールが離れるフレームと腕が前へ出るフレームが必ず一致する。
+ * リリースの瞬間の投げる腕の角度（rotation.x を増やし続けると、腕は後ろ→頭上→前へ回る。
+ * 4.7＝**前方水平**）。**この形の手から球が出る**（MM-60 の `armReleaseHeight`・CC-50 の
+ * `armReleaseOffsetX` はこの腕から解いてある）＝リリースの絵（`PITCH_FRAMES.release`）と
+ * 送球の振り出し（`applyThrow`）が共有する。
  */
-const PITCH_ARM_BACK = 2.3;
 const PITCH_ARM_RELEASE = 4.7;
-const PITCH_ARM_THROUGH = 5.6;
-/** ワインドアップのうち、腕が担ぎ上げの頂点に来るところ（残りで一気に振り出す） */
-const PITCH_ARM_PEAK = 0.75;
 
 /**
  * 送球の振り抜き（フェーズHH-55）。**投球の `PITCH_ARM_RELEASE` から始まって
  * ここまで振り下ろす**＝始点は投球と同じ定数なので、リリースの腕の形が投球と送球で
- * 食い違わない。投球の `PITCH_ARM_THROUGH`（5.6）より浅いのは、野手は踏み込んで
- * 体ごと倒れ込まずに1歩で投げるため（＝振り抜いた後すぐ次の動作に移れる形に見える）。
+ * 食い違わない。野手は踏み込んで体ごと倒れ込まずに1歩で投げる（＝振り抜いた後すぐ
+ * 次の動作に移れる形に見える）。
  */
 const THROW_ARM_THROUGH = 5.3;
 /** 送球で上体が前へ出る角（投球のフォロースルーより浅い） */
@@ -684,13 +698,13 @@ export function setPlayerPose(group: THREE.Group, pose: PlayerPose): void {
       if (pose.walking) applyRunLegs(j, visual.gait * GAIT_RADIANS_PER_METER, WALK_STRIDE_SCALE);
       break;
     case 'swing':
-      applySwing(visual, pose.side, pose.t, pose.recover ?? 0);
+      applySwing(visual, pose.side, pose.key);
       break;
     case 'bunt':
       applyBunt(visual, pose.side);
       break;
     case 'pitch':
-      applyPitch(j, pose.t, pose.arm);
+      applyPitch(j, pose.key, pose.arm);
       break;
     case 'throw':
       applyThrow(j, pose.t, pose.arm);
@@ -790,7 +804,7 @@ function applyRun(j: Joints, cycle: number): void {
   j.ArmUpperR.rotation.x = RUN_ARM_SWING * s;
   j.ArmLowerL.rotation.x = -RUN_ELBOW;
   j.ArmLowerR.rotation.x = -RUN_ELBOW;
-  j.Torso.rotation.x = -RUN_LEAN;
+  j.Torso.rotation.x = RUN_LEAN;
 }
 
 /**
@@ -809,7 +823,7 @@ function applyCatch(visual: PlayerVisual, reach: number): void {
   j.ArmUpperR.rotation.z = 0.25;
   glove.lower.rotation.x = -0.35;
   glove.bareLower.rotation.x = -0.5;
-  j.Torso.rotation.x = -0.12;
+  j.Torso.rotation.x = 0.12;
   if (visual.moving) applyRunLegs(j, visual.gait * GAIT_RADIANS_PER_METER);
   else flexLegs(j, -0.18, 0.3);
 }
@@ -847,125 +861,197 @@ function gloveArms(visual: PlayerVisual) {
 }
 
 /**
- * 打席の構え。**バットを持つ手（捕手側）を後ろ肩の高さへ、もう一方を添える**形で、
- * 左右の打席は `side` で鏡像になる（判定の鏡像＝B-9とまったく同じ符号を使う）。
+ * 打席の構え＝**スイングの絵の1枚目**（`SWING_FRAMES.stance`）。左右の打席は `side` で
+ * 鏡像になる（判定の鏡像＝B-9とまったく同じ符号を使う）。バントもここから組み立てる。
  */
 function applyStancePose(visual: PlayerVisual, side: BatterSide): void {
+  applyBatterFrame(visual, side, SWING_FRAMES.stance);
+}
+
+/** バントのバットの向き（体の前へ水平に出す） */
+const BUNT_BAT_DIR = { x: -0.45, y: 0.05, z: 0.89 };
+/**
+ * バントの体のヨー（構えから投手側へ回した量 rad。スイングの絵の `yaw` と同じ約束＝
+ * 呼び出し側が打者のGroupに掛ける）。バットを投手方向へ出して止めた角度。首の向きも
+ * この値から決めるので、体の向きと首の向きが別々の数字から出ない（フェーズBBB-77）。
+ */
+export const BUNT_BODY_YAW = 0.95;
+
+/**
+ * スイングの絵（フェーズBBB-76→BBB-77。**原作の6枚**＝`core/keyframes.ts` の `SwingKey`。
+ * 構えも1枚目として同じ形で持つ）。
+ *
+ * テストプレイ「バットを振ってから振り切った後のアニメーション絵が全然イメージと違う」
+ * （BBB-76）→「まだ違和感ある。原作の動画をちゃんと見てほしい」（BBB-77）。原作のスイングは
+ *
+ * 0. `stance`：バットを立てて頭の後ろへ倒す（手は胸の前）
+ * 1. `load`：バットを**後ろへ水平に寝かせる**（手は腰の前へ下りる）
+ * 2. `lag`：**バットの先が手の後ろ下に残る**（手は前の腰。先は捕手側の下）
+ * 3. `contact`：**本塁の前で水平**（当たる絵）
+ * 4. `follow`：**右上へ振り上げる**（手は右肩の高さ）
+ * 5. `finish`：**手が頭の左・あごの高さ、バットは頭の後ろを左上へ**
+ *
+ * の6枚を切り替える（ユーザー判断：コマ送り＝間を補間しない）。**打者の頭と足は6枚とも
+ * 同じ位置**（膝を曲げた低い姿勢のまま振る）で、どの絵でも後頭部しか見えない＝ずっと
+ * 投手のほうを見ている（BBB-77で原作の6枚を1ドットずつ読んだ）。
+ *
+ * **当たる絵（`contact`）だけは判定の形でもある**：バットを本塁の前の面に沿って
+ * 球の通る高さに置き、判定の到達範囲（`BAT_REACH_*`）を覆う（描いたバットと当たる範囲が
+ * 食い違わない）。他の5枚は判定に一切効かない（**見た目だけ**）。BBB-78で構えを直立に
+ * したぶん肩が上がり、腕を伸ばし切っても握りは 1.10m までしか下がらないので、**バットの先を
+ * わずかに下げて（先端 1.05m）球の通り道（本塁の前で 1.06m）を横切らせる**。
+ */
+interface SwingArm {
+  /** 上腕の前後（負＝前へ上げる） */
+  upperX: number;
+  /** 上腕の開き（後ろの腕は捕手側・前の腕は投手側へ開く向きが正。打席の左右で鏡像） */
+  upperZ: number;
+  /** 肘の曲げ（負＝曲げる） */
+  lowerX: number;
+}
+
+interface SwingFrame {
+  /**
+   * 体のヨー＝構えから投手側へ回した量 rad。**呼び出し側が打者のGroupに掛ける**
+   * （`swingKeyYaw`）＝体ごと回る。腕とバットの向きはその回った体の中で書く。
+   */
+  yaw: number;
+  /** バットを握る後ろの腕（捕手側） */
+  back: SwingArm;
+  /** 添える前の腕（投手側） */
+  front: SwingArm;
+  /** 上体の前傾（**正＝前へかぶさる**／負＝後ろへ反る。BBB-79で符号を正した） */
+  torsoX: number;
+  /** 上体のねじり（投手側へ回す向きが正） */
+  torsoTwist: number;
+  /**
+   * バットの向き（**モデル座標**＝`aimBat` の約束：+x＝捕手側／+y＝上／+z＝本塁側）。
+   * 体が `yaw` だけ回った後の座標なので、同じ向きの数字でも絵ごとに世界での向きは違う。
+   */
+  bat: { x: number; y: number; z: number };
+  /** 前の脚の踏み込み（腿を前へ振る量 rad。負＝前） */
+  stride: number;
+  /**
+   * 後ろの脚の返し（膝を曲げて踵を上げる量 rad）。原作の振り抜き・振り切りの絵は
+   * **後ろの膝が前へ折れて踵が上がる**（腰を回し切った形）。
+   */
+  pivot: number;
+}
+
+/**
+ * 6枚の絵の中身。**実機（Playwright）で原作の絵と並べて見ながら決めた**。腕の角度は、
+ * 手とバットの先を置きたい場所（原作の絵から取った位置）へ**関節を解いて**出した値
+ * （BBB-78で脚の曲げを変えたときに、同じ置き場所で解き直した）。
+ */
+export const SWING_FRAMES: Record<SwingKey, SwingFrame> = {
+  stance: {
+    yaw: 0,
+    back: { upperX: 0.5, upperZ: 0.008, lowerX: -2.248 },
+    front: { upperX: 0.412, upperZ: 1.162, lowerX: -1.183 },
+    torsoX: 0.25,
+    torsoTwist: 0,
+    bat: { x: 0.3, y: 0.878, z: -0.373 },
+    stride: 0,
+    pivot: 0,
+  },
+  load: {
+    yaw: 0.1,
+    back: { upperX: 0.5, upperZ: 0.133, lowerX: -1.155 },
+    front: { upperX: -0.29, upperZ: 0.69, lowerX: -0.038 },
+    torsoX: 0.25,
+    torsoTwist: 0.05,
+    bat: { x: 0.156, y: -0.283, z: -0.946 },
+    stride: -0.05,
+    pivot: 0,
+  },
+  lag: {
+    yaw: 0.55,
+    back: { upperX: 0.5, upperZ: -0.007, lowerX: -1.195 },
+    front: { upperX: 0.388, upperZ: 0.683, lowerX: -0.838 },
+    torsoX: 0.2,
+    torsoTwist: 0.2,
+    bat: { x: 0.817, y: -0.503, z: 0.281 },
+    stride: -0.2,
+    pivot: 0.15,
+  },
+  contact: {
+    yaw: 1,
+    back: { upperX: -0.255, upperZ: 0.51, lowerX: -1.29 },
+    front: { upperX: -0.902, upperZ: 0.845, lowerX: -0.102 },
+    torsoX: 0.2,
+    torsoTwist: 0.3,
+    bat: { x: 0.783, y: 0, z: 0.622 },
+    stride: -0.25,
+    pivot: 0.3,
+  },
+  follow: {
+    yaw: 1.35,
+    back: { upperX: 0.055, upperZ: 1.013, lowerX: -2.137 },
+    front: { upperX: 0.198, upperZ: 1.412, lowerX: -1.125 },
+    torsoX: 0.05,
+    torsoTwist: 0.4,
+    bat: { x: 0.624, y: 0.602, z: 0.499 },
+    stride: -0.2,
+    pivot: 0.45,
+  },
+  finish: {
+    yaw: 1.7,
+    back: { upperX: -0.18, upperZ: -1.445, lowerX: -1.14 },
+    front: { upperX: -0.21, upperZ: 0.413, lowerX: -2.033 },
+    torsoX: 0.05,
+    torsoTwist: 0.45,
+    bat: { x: -0.706, y: 0.609, z: -0.362 },
+    stride: -0.15,
+    pivot: 0.55,
+  },
+};
+
+/** その絵の体のヨー（構えから投手側へ回した量 rad。打者のGroupに掛ける） */
+export function swingKeyYaw(key: SwingKey): number {
+  return SWING_FRAMES[key].yaw;
+}
+
+/**
+ * 打者の絵を1枚描く（構え・スイング共通。フェーズBBB-77）。**体のヨー（振り）は
+ * 呼び出し側がGroupごと回している**ので、ここが描くのは「その絵の脚・腕・上体・首・
+ * バットの向き」だけ。脚は構えの曲げの上に、前の脚の踏み込みと後ろの脚の返しを足す。
+ */
+function applyBatterFrame(visual: PlayerVisual, side: BatterSide, f: SwingFrame): void {
   const j = visual.joints;
   flexLegs(j, STANCE_THIGH, STANCE_SHIN);
+  j.LegUpperL.rotation.z = -STANCE_FEET_SPREAD;
+  j.LegUpperR.rotation.z = STANCE_FEET_SPREAD;
   // 捕手側（後ろ）がモデルの +X になるのが side=+1 の打席（左打者。BB-49）。もう一方は鏡像
   const sign = side >= 0 ? 1 : -1;
   const back = side >= 0 ? { upper: j.ArmUpperR, lower: j.ArmLowerR } : { upper: j.ArmUpperL, lower: j.ArmLowerL };
   const front = side >= 0 ? { upper: j.ArmUpperL, lower: j.ArmLowerL } : { upper: j.ArmUpperR, lower: j.ArmLowerR };
-  j.LegUpperL.rotation.z = -STANCE_FEET_SPREAD;
-  j.LegUpperR.rotation.z = STANCE_FEET_SPREAD;
-  // 後ろの手は肩の高さで握る／前の手は胸の前を横切って添える
-  back.upper.rotation.x = -0.15;
-  back.upper.rotation.z = sign * 0.35;
-  back.lower.rotation.x = -1.95;
-  front.upper.rotation.x = -0.35;
-  front.upper.rotation.z = sign * 0.95;
-  front.lower.rotation.x = -1.6;
-  j.Torso.rotation.x = -0.08;
-  // バットは立てて捕手側へ倒す（原作の構えの角度）
-  aimBat(visual, side, STANCE_BAT_DIR.x, STANCE_BAT_DIR.y, STANCE_BAT_DIR.z);
+  back.upper.rotation.x = f.back.upperX;
+  back.upper.rotation.z = sign * f.back.upperZ;
+  back.lower.rotation.x = f.back.lowerX;
+  front.upper.rotation.x = f.front.upperX;
+  front.upper.rotation.z = sign * f.front.upperZ;
+  front.lower.rotation.x = f.front.lowerX;
+  j.Torso.rotation.x = f.torsoX;
+  j.Torso.rotation.y = -sign * f.torsoTwist;
+  // 首は投手のほうへ（体が回ったぶんだけ戻す＝どの絵でも投手を見ている）
+  const headTurn = Math.PI / 2 - f.yaw - f.torsoTwist;
+  j.Head.rotation.y =
+    -sign * Math.min(BATTER_HEAD_TURN_MAX, Math.max(BATTER_HEAD_TURN_MIN, headTurn));
+  // 前の脚（投手側）だけ踏み込む。足首で戻して足の裏は地面に向けたまま
+  const frontLeg = side >= 0 ? { upper: j.LegUpperL, lower: j.LegLowerL, foot: j.FootL } : { upper: j.LegUpperR, lower: j.LegLowerR, foot: j.FootR };
+  frontLeg.upper.rotation.x = STANCE_THIGH + f.stride;
+  frontLeg.foot.rotation.x = -(frontLeg.upper.rotation.x + frontLeg.lower.rotation.x);
+  // 後ろの脚（捕手側）は返す：膝を前へ折り、踵が上がる（つま先立ち）
+  const backLeg = side >= 0 ? { upper: j.LegUpperR, lower: j.LegLowerR, foot: j.FootR } : { upper: j.LegUpperL, lower: j.LegLowerL, foot: j.FootL };
+  backLeg.upper.rotation.x = STANCE_THIGH - f.pivot * 0.5;
+  backLeg.lower.rotation.x = STANCE_SHIN + f.pivot;
+  backLeg.foot.rotation.x = -(backLeg.upper.rotation.x + backLeg.lower.rotation.x) + f.pivot * 0.8;
+  aimBat(visual, side, f.bat.x, f.bat.y, f.bat.z);
 }
 
-/**
- * **バットが伸び切るスイング進行度**（フェーズRR-66）＝理想のタイミングで球が来る瞬間。
- * `SWING_IDEAL_SEC / (SWING_STARTUP_SEC + SWING_ACTIVE_SEC)`＝判定側の「芯で捉える時刻」を
- * そのまま読むので、**判定が当たりと言う瞬間と、バットが伸び切る瞬間が同じ1か所から出る**。
- */
-const SWING_CONTACT_P =
-  SWING_IDEAL_SEC / (SWING_STARTUP_SEC + SWING_ACTIVE_SEC);
-
-/** 構えのバットの向き（立てて捕手側へ倒す）／振り抜きのバットの向き（体の前で水平） */
-const STANCE_BAT_DIR = { x: 0.45, y: 0.87, z: -0.2 };
-const SWING_BAT_DIR = { x: 0.68, y: -0.05, z: 0.73 };
-/**
- * **振り切った後のバットの向き**（前の肩から**背中を斜めに横切って**反対の腰の上へ。
- * テストプレイの指摘「バットを完全に振り切ったときのバットの位置が中途半端」）。
- * 真後ろ（−Z）へ向けると、捕手の後ろにあるでっかいモードのカメラへまっすぐ向いて
- * 頭に隠れる＝**横切る向き**でないと画面で読めない（フェーズZZ-74）。
- *
- * それまでは腕もバットも**当たる瞬間（`SWING_CONTACT_P`）で止まったまま**で、
- * 以後は体のヨーだけが回り続けていた＝**腕を前へ伸ばし切った形のまま体だけ回る**ので、
- * 振り終わりがフォロースルーに見えず途中で固まったように映っていた。
- * **当たる瞬間までの姿勢は1mmも動かさない**（RR-66が実機で合わせた「バットが本塁を
- * 通る時刻＝判定の芯」はそのまま）ので、**判定にも見た目の接触にも影響しない**。
- */
-const FOLLOW_BAT_DIR = { x: 0.62, y: -0.3, z: -0.72 };
-/**
- * フィニッシュの腕（フェーズZZ-74。テストプレイ「振り切った後のバットの位置が明らかにおかしい」）。
- * **両手が前の肩の横・耳の高さ**に来る角度を、実機の人形で手の位置を測って探した
- * （握る手 (−0.33, 1.61, −0.08)・添える手 (−0.21, 1.56, −0.01)＝右打者・本塁から見て。
- * 頭の中心は (0, 1.54)）。それ以前は**握る手が頭の真上（1.82m）の中央**に来ていて、
- * バットが頭の上から横へ突き出し、頭を貫いて見えた。
- */
-const FINISH = {
-  /** 振り切りで肘がたたまれる量（握る後ろの腕／添える前の腕） */
-  backElbow: 1.0,
-  frontElbow: 2.6,
-  /** 振り切りで腕が振り上がる量（負＝当たる瞬間より少し下ろす） */
-  backRaise: -0.34,
-  frontRaise: -0.26,
-  /** 振り切りで腕が前の肩の側へ寄る量 */
-  backCross: 1.76,
-  frontCross: 1.16,
-  /** 上体のねじり切り */
-  torsoTwist: 0.2,
-} as const;
-/** バントのバットの向き（体の前へ水平に出す） */
-const BUNT_BAT_DIR = { x: -0.45, y: 0.05, z: 0.89 };
-
-/**
- * スイング。**体のヨー回転（振り）は呼び出し側がGroupごと回している**ので、ここが
- * 描くのは「腕がたたまれた構えから伸び切るまで」だけ＝両方が合わさって振り抜きになる。
- * t は0（構え）〜1（振り抜き）。
- */
-function applySwing(visual: PlayerVisual, side: BatterSide, t: number, recover: number): void {
-  applyStancePose(visual, side);
-  const j = visual.joints;
-  const p = Math.min(1, Math.max(0, t));
-  // 構えへ戻る割合（フィニッシュの形から構えの形へ補間する。0=フィニッシュのまま）
-  const r = Math.min(1, Math.max(0, recover));
-  const mix = (swing: number, stance: number): number => swing + (stance - swing) * r;
-  // **腕とバットは「当たる瞬間」に伸び切る**（フェーズRR-66）。体のヨー（振り）は
-  // 呼び出し側が `p` で回し続けるので、ここで前倒しするのは腕の伸びとバットの向きだけ
-  // ＝G-27の技（0.5＝当たる瞬間に伸び切る）と同じ約束を打撃にも通す。
-  //
-  // **これが無いと、判定が当たりと言っている瞬間にバットがまだ立っている**：実測で
-  // 打撃面を通過するフレームのバット先端は本塁（x=0）にすら届いておらず（-0.32m）、
-  // ストライクゾーンの球でさえ「バットが当たっていないのに当たった」ように見えていた。
-  const ext = Math.min(1, p / SWING_CONTACT_P);
-  // **当たった後は振り抜く**（フォロースルー）。`ext` が 1 で止まった先の区間だけを
-  // 0→1 に取り直すので、**当たる瞬間までの姿勢は1つも変わらない**。
-  const follow = Math.max(0, (p - SWING_CONTACT_P) / (1 - SWING_CONTACT_P));
-  const sign = side >= 0 ? 1 : -1;
-  const back = side >= 0 ? { upper: j.ArmUpperR, lower: j.ArmLowerR } : { upper: j.ArmUpperL, lower: j.ArmLowerL };
-  const front = side >= 0 ? { upper: j.ArmUpperL, lower: j.ArmLowerL } : { upper: j.ArmUpperR, lower: j.ArmLowerR };
-  // 肘が伸びる（構えの -1.95/-1.6 から 0 へ）＝バットが体から離れて走る。
-  // 振り切りでは**もう一度たたまれる**＝バットが前の肩の上から背中へ巻き付く。
-  back.lower.rotation.x = mix(-1.95 * (1 - ext) - FINISH.backElbow * follow, -1.95);
-  front.lower.rotation.x = mix(-1.6 * (1 - ext) - FINISH.frontElbow * follow, -1.6);
-  // 腕が投手方向（体の前）へ出て、振り切りでは**両手が前の肩の横・耳の高さ**へ戻ってくる
-  back.upper.rotation.x = mix(-0.15 - 1.0 * ext - FINISH.backRaise * follow, -0.15);
-  front.upper.rotation.x = mix(-0.35 - 0.9 * ext - FINISH.frontRaise * follow, -0.35);
-  // 振り切りでは両腕が前の肩の側へ寄る（**握る後ろの腕は胸を横切り**、手が前の肩の横に来る
-  // ＝バットが肩の上を越えて背中側へ抜ける。手が胸の前に残るとバットが体の中を通り、
-  // 頭の真上に来るとバットが頭を貫いて見える＝どちらも実機で踏んだ）
-  back.upper.rotation.z = sign * mix(0.35 - 0.15 * ext - FINISH.backCross * follow, 0.35);
-  front.upper.rotation.z = sign * mix(0.95 - 0.55 * ext - FINISH.frontCross * follow, 0.95);
-  // 腰が回るぶん上体もついていく。振り切りでは**胸が投手を越えるまでねじり切り**、
-  // 上体が起きる＝前へかぶさったまま終わらない
-  j.Torso.rotation.y = mix(-sign * (0.35 * Math.min(p, SWING_CONTACT_P) / SWING_CONTACT_P + FINISH.torsoTwist * follow), 0);
-  j.Torso.rotation.x = mix(-0.08 - 0.1 * Math.min(1, p / SWING_CONTACT_P) + 0.22 * follow, -0.08);
-  // バットは立てた構えから体の前の水平へ（**体のヨー回転と合わさって振り抜きになる**）、
-  // 振り切りでは前の肩の上を越えて背中側へ
-  const bx = STANCE_BAT_DIR.x + (SWING_BAT_DIR.x - STANCE_BAT_DIR.x) * ext + (FOLLOW_BAT_DIR.x - SWING_BAT_DIR.x) * follow;
-  const by = STANCE_BAT_DIR.y + (SWING_BAT_DIR.y - STANCE_BAT_DIR.y) * ext + (FOLLOW_BAT_DIR.y - SWING_BAT_DIR.y) * follow;
-  const bz = STANCE_BAT_DIR.z + (SWING_BAT_DIR.z - STANCE_BAT_DIR.z) * ext + (FOLLOW_BAT_DIR.z - SWING_BAT_DIR.z) * follow;
-  aimBat(visual, side, mix(bx, STANCE_BAT_DIR.x), mix(by, STANCE_BAT_DIR.y), mix(bz, STANCE_BAT_DIR.z));
+/** スイング（フェーズBBB-76）。その絵を描くだけ（絵の中身は `SWING_FRAMES`） */
+function applySwing(visual: PlayerVisual, side: BatterSide, key: SwingKey): void {
+  applyBatterFrame(visual, side, SWING_FRAMES[key]);
 }
 
 /** バント：バットを前へ出して止める（振り抜かないので進行度を持たない） */
@@ -973,6 +1059,10 @@ function applyBunt(visual: PlayerVisual, side: BatterSide): void {
   applyStancePose(visual, side);
   const j = visual.joints;
   const sign = side >= 0 ? 1 : -1;
+  // 首は投手のほうへ（構えより体を回しているぶんだけ戻す。`applyBatterFrame` と同じ考え方）
+  j.Head.rotation.y =
+    -sign *
+    Math.min(BATTER_HEAD_TURN_MAX, Math.max(BATTER_HEAD_TURN_MIN, Math.PI / 2 - BUNT_BODY_YAW));
   const back = side >= 0 ? { upper: j.ArmUpperR, lower: j.ArmLowerR } : { upper: j.ArmUpperL, lower: j.ArmLowerL };
   const front = side >= 0 ? { upper: j.ArmUpperL, lower: j.ArmLowerL } : { upper: j.ArmUpperR, lower: j.ArmLowerR };
   back.upper.rotation.x = -0.85;
@@ -981,7 +1071,7 @@ function applyBunt(visual: PlayerVisual, side: BatterSide): void {
   front.upper.rotation.x = -0.95;
   front.upper.rotation.z = sign * 0.55;
   front.lower.rotation.x = -0.35;
-  j.Torso.rotation.x = -0.15;
+  j.Torso.rotation.x = 0.15;
   // バットを水平に寝かせて前へ出す
   aimBat(visual, side, BUNT_BAT_DIR.x, BUNT_BAT_DIR.y, BUNT_BAT_DIR.z);
 }
@@ -1007,72 +1097,198 @@ function throwingLimbs(j: Joints, side: PitchArmSide) {
 }
 
 /**
- * 投球。t は0（セット）→ `PITCH_RELEASE_T`（リリース）→ 1（フォロースルー）。
- * ワインドアップで振りかぶって前脚を上げ、リリース後は腕が振り下ろされて前へ倒れ込む。
+ * 投球モーションの絵（フェーズBBB-76。**原作の8枚**＝`core/keyframes.ts` の `PitchKey`）。
  *
- * **投げる腕は `arm.side` が決める**（フェーズCC-50。それまでは全投手が +X側＝
- * 実際の野球なら左投手の腕で投げていた）。**腕の角度（`arm.slot`）は横への傾き
- * `rotation.z` として入れる**：この傾きの横成分は振り（`rotation.x`）に一切影響されない
- * （Euler XYZ は Z を先に効かせるので、腕は必ず `腕の長さ × sin(傾き)` だけ横へ出る）
- * ＝**判定側のリリースのずれ（`armReleaseOffsetX`）と同じ形で、同じ定数から出る**。
+ * 原作の投手は どの球でも同じ70フレームで、構え→両手を顔の前へ→頭上へ→足を上げる→
+ * 腕を後ろへ引いて踏み出す→腕を頭の上へ担ぐ→リリース（前へ倒れ込む）→守備の構え、の
+ * 絵を切り替える（ユーザー判断：コマ送り）。それまでは 0.35秒で「担いで振り出す」1本の
+ * 動きだった。
  *
- * **上体は投げる側へ傾ける**（フェーズMM-60。`ARM_RELEASE_LEAN_RAD`）＝横手・下手が
- * 肩ごと下がって**低い位置から出てくる**。腕の角度だけでは高さが変わらない（リリースの
- * 瞬間は腕が前方水平まで振り切れているので、横へ倒しても手は肩の高さに張り付く）ため。
- * **球の出どころの高さ（`armReleaseHeight`）はこの同じ傾きから解く**ので、球は必ず手から出る。
+ * **リリースの絵だけは MM-60・CC-50 が決めた形そのまま**＝腕が前方水平（`PITCH_ARM_RELEASE`）・
+ * 腕の角度（`ARM_SLOT_RAD`）・上体の傾き（`ARM_RELEASE_LEAN_RAD`）。球の出どころ
+ * （`armReleaseHeight` / `armReleaseOffsetX`）はこの形から解いてあるので、**球は必ず手から出る**。
+ * 他の7枚は判定に一切効かない（見た目だけ）。
  */
-function applyPitch(j: Joints, t: number, arm: PitchArm = NEUTRAL_PITCH_ARM): void {
-  const p = Math.min(1, Math.max(0, t));
+interface PitchArmPose {
+  /** 上腕の前後（負＝前へ上げる／正＝後ろへ引く。腕は 2π 近くまで回せる） */
+  upperX: number;
+  /** 上腕の開き（その腕の側へ開く向きが正。負＝体の中央へ寄せる） */
+  upperZ: number;
+  /** 肘の曲げ（負＝曲げる） */
+  lowerX: number;
+}
+
+interface PitchFrame {
+  /** 投げる腕 */
+  arm: PitchArmPose;
+  /** グラブの腕 */
+  off: PitchArmPose;
+  /** 投げる腕を投げ方（上手・横手・下手）の角度へ倒すか（担ぐ・振り出す絵だけ） */
+  slot: boolean;
+  /** 踏み出す脚（腿の前後・膝・足首・腿の開き＝体を横へ向けたとき本塁の側へ出す量） */
+  stride: { upperX: number; lowerX: number; footX: number; out?: number };
+  /** 軸足（腿の前後・膝・腿の開き＝外側へ開く量） */
+  pivot: { upperX: number; lowerX: number; out?: number };
+  /** 上体の前後（正＝前へ倒れる） */
+  torsoX: number;
+  /** 上体のねじり（投げる腕を後ろへ引く向きが正） */
+  torsoTwist: number;
+  /**
+   * 腰ごと横を向く量 rad（投げる腕の側を後ろへ引く向きが正＝右投げなら胸が三塁側）。
+   * 足を上げる・腕を引く絵は体が横を向く＝**上げた膝が本塁から見て横へ出る**（原作の絵）。
+   * 正面のまま上げると、膝がカメラの方へ向いて潰れて見えない。
+   */
+  hipTurn?: number;
+  /** 腰を落とす量 m（直立の腰の高さからの差） */
+  hipDrop: number;
+}
+
+/** 投手の8枚の絵。リリース以外は実機で原作の絵と並べて見ながら決めた（見た目だけ） */
+export const PITCH_FRAMES: Record<PitchKey, PitchFrame> = {
+  // 構え：グラブと手を胸の前で合わせる
+  set: {
+    arm: { upperX: -0.45, upperZ: -0.3, lowerX: -1.75 },
+    off: { upperX: -0.45, upperZ: -0.3, lowerX: -1.75 },
+    slot: false,
+    stride: { upperX: 0, lowerX: 0, footX: 0 },
+    pivot: { upperX: 0, lowerX: 0 },
+    torsoX: 0,
+    torsoTwist: 0,
+    hipDrop: 0,
+  },
+  // 両手を合わせたまま顔の前へ上げる
+  raise: {
+    arm: { upperX: -1.25, upperZ: -0.25, lowerX: -1.7 },
+    off: { upperX: -1.25, upperZ: -0.25, lowerX: -1.7 },
+    slot: false,
+    stride: { upperX: 0, lowerX: 0, footX: 0 },
+    pivot: { upperX: 0, lowerX: 0 },
+    torsoX: -0.05,
+    torsoTwist: 0,
+    hipDrop: 0,
+  },
+  // 両手を頭上へ（振りかぶり）
+  overhead: {
+    arm: { upperX: -2.85, upperZ: -0.2, lowerX: -0.7 },
+    off: { upperX: -2.85, upperZ: -0.2, lowerX: -0.7 },
+    slot: false,
+    stride: { upperX: 0, lowerX: 0, footX: 0 },
+    pivot: { upperX: 0, lowerX: 0 },
+    torsoX: -0.12,
+    torsoTwist: 0,
+    hipDrop: 0,
+  },
+  // 足を高く上げる（体ごと横を向き、手は胸の前に下ろして体を縮める）
+  kick: {
+    arm: { upperX: -0.5, upperZ: -0.3, lowerX: -1.8 },
+    off: { upperX: -0.5, upperZ: -0.3, lowerX: -1.8 },
+    slot: false,
+    stride: { upperX: -1.55, lowerX: 1.7, footX: -0.2 },
+    pivot: { upperX: 0, lowerX: 0.15 },
+    torsoX: -0.1,
+    torsoTwist: 0.1,
+    hipTurn: 1.25,
+    hipDrop: 0.03,
+  },
+  // 腕を後ろへ引いて本塁へ踏み出す（グラブの腕は本塁へ向ける。引いた腕は背中の側へ
+  // まっすぐ伸ばす＝体が横を向いているので、本塁から見て一塁側へ球が出て見える＝原作の絵）
+  back: {
+    arm: { upperX: 1.5, upperZ: 0.2, lowerX: -0.1 },
+    off: { upperX: -1.3, upperZ: 0.2, lowerX: -0.3 },
+    slot: false,
+    stride: { upperX: -0.2, lowerX: 0.4, footX: 0, out: 0.75 },
+    pivot: { upperX: 0.1, lowerX: 0.35 },
+    torsoX: 0,
+    torsoTwist: 0.3,
+    hipTurn: 1.3,
+    hipDrop: 0.12,
+  },
+  // 腕を頭の上へ担ぐ（踏み出した足は着いて、体は本塁へ向き直りかけている）
+  cock: {
+    arm: { upperX: 2.6, upperZ: 0, lowerX: -1.3 },
+    off: { upperX: -1.1, upperZ: 0.1, lowerX: -0.6 },
+    slot: true,
+    stride: { upperX: -0.45, lowerX: 0.35, footX: 0.1, out: 0.35 },
+    pivot: { upperX: 0.25, lowerX: 0.4 },
+    torsoX: 0.05,
+    torsoTwist: 0.1,
+    hipTurn: 0.5,
+    hipDrop: 0.08,
+  },
+  // リリース（MM-60・CC-50 の形そのまま。腕は前方水平＝この手から球が出る）
+  release: {
+    arm: { upperX: PITCH_ARM_RELEASE, upperZ: 0, lowerX: -0.2 },
+    off: { upperX: -0.4, upperZ: 0, lowerX: -0.5 },
+    slot: true,
+    stride: { upperX: -0.55, lowerX: 0.15, footX: 0 },
+    pivot: { upperX: 0, lowerX: 0 },
+    torsoX: -0.1,
+    torsoTwist: 0,
+    hipDrop: 0.05,
+  },
+  // 投げ終わり（原作のリリースの絵＝低く前へ倒れ込む。腕は振り下ろして体の前を横切る）
+  follow: {
+    arm: { upperX: 5.7, upperZ: -0.5, lowerX: -0.3 },
+    off: { upperX: -0.2, upperZ: 0.3, lowerX: -0.9 },
+    slot: false,
+    stride: { upperX: -1.0, lowerX: 1.1, footX: -0.1, out: 0.2 },
+    pivot: { upperX: 0.55, lowerX: 0.7 },
+    torsoX: 0.55,
+    torsoTwist: -0.2,
+    hipDrop: 0.22,
+  },
+  // 守備の構え（膝を外へ開いて腰を落とし、両手を前へ。顔は本塁へ向けたまま）
+  field: {
+    arm: { upperX: -0.9, upperZ: 0.25, lowerX: -0.6 },
+    off: { upperX: -1.0, upperZ: 0.25, lowerX: -0.5 },
+    slot: false,
+    stride: { upperX: -0.9, lowerX: 1.4, footX: -0.5, out: 0.35 },
+    pivot: { upperX: -0.9, lowerX: 1.4, out: 0.35 },
+    torsoX: 0.15,
+    torsoTwist: 0,
+    hipDrop: 0.26,
+  },
+};
+
+/**
+ * 投球（フェーズBBB-76。原作の8枚を切り替える）。投げる腕は `arm.side` が決める
+ * （フェーズCC-50）。腕の角度（`arm.slot`）は担ぐ・振り出す絵（`cock`・`release`）でだけ
+ * 横へ倒す（`rotation.z` に入れる＝振り（`rotation.x`）に影響されない横成分）。
+ * **上体の傾き（MM-60）はリリースの絵でだけ**倒す＝球の出どころ（`armReleaseHeight`）が
+ * 想定している形と同じ。
+ */
+function applyPitch(j: Joints, key: PitchKey, arm: PitchArm = NEUTRAL_PITCH_ARM): void {
+  const f = PITCH_FRAMES[key];
   const limbs = throwingLimbs(j, arm.side);
-  // 腕を横へ倒す（上手＝ほぼ真上／横手＝ほぼ水平／下手＝その中間）
-  limbs.armUpper.rotation.z = arm.side * ARM_SLOT_RAD[arm.slot];
-  const lean = ARM_RELEASE_LEAN_RAD[arm.slot];
-  if (p <= PITCH_RELEASE_T) {
-    const w = p / PITCH_RELEASE_T;
-    // 担ぎ上げ（頂点まで）→ 振り出し（頂点からリリースまで）。0..1 で表す
-    const lift = Math.min(1, w / PITCH_ARM_PEAK);
-    const whip = Math.max(0, (w - PITCH_ARM_PEAK) / (1 - PITCH_ARM_PEAK));
-    // 投げる腕は後ろ上へ担いでから、頭の上を通って前へ出る
-    limbs.armUpper.rotation.x = lerp(0, PITCH_ARM_BACK, lift) + (PITCH_ARM_RELEASE - PITCH_ARM_BACK) * whip;
-    limbs.armLower.rotation.x = -0.6 * lift + 0.4 * whip;
-    limbs.offUpper.rotation.x = -0.9 * lift + 0.5 * whip;
-    limbs.offLower.rotation.x = -0.8 * lift + 0.3 * whip;
-    // 上体は反ってから、振り出しと一緒に起きる
-    j.Torso.rotation.x = 0.3 * lift - 0.4 * whip;
-    // 投げる側へ傾ける（フェーズMM-60）。**振り出し（whip）と一緒に倒す**ので、
-    // セットの構えでは傾いておらず、リリースの瞬間にちょうど倒し切っている
-    // ＝球の出どころ（`armReleaseHeight`）が想定している姿勢と同じ形になる。
-    j.Torso.rotation.z = -arm.side * lean * whip;
-    // 前脚を上げ、振り出しで踏み出して着地する
-    limbs.strideUpper.rotation.x = -1.0 * lift + 0.45 * whip;
-    limbs.strideLower.rotation.x = 1.3 * lift - 1.15 * whip;
-    limbs.strideFoot.rotation.x = -0.3 * lift + 0.3 * whip;
-    j.Pelvis.position.y = HIP_HEIGHT - 0.05 * whip;
-    return;
-  }
-  // フォロースルー：腕を振り下ろし切り、上体は前へ倒れ、軸足が後ろへ流れる
-  const f = (p - PITCH_RELEASE_T) / (1 - PITCH_RELEASE_T);
-  limbs.armUpper.rotation.x = lerp(PITCH_ARM_RELEASE, PITCH_ARM_THROUGH, f);
-  limbs.armLower.rotation.x = lerp(-0.2, 0.1, f);
-  limbs.offUpper.rotation.x = lerp(-0.4, 0.5, f);
-  limbs.offLower.rotation.x = lerp(-0.5, -0.2, f);
-  j.Torso.rotation.x = lerp(-0.1, -0.55, f);
-  // 傾きはリリースの形のまま保つ（フェーズMM-60）＝倒し切った上体が、そのまま
-  // 前へ倒れ込む。ここで0へ戻すとリリースの瞬間だけ体が跳ね起きて見える。
-  j.Torso.rotation.z = -arm.side * lean;
-  limbs.strideUpper.rotation.x = lerp(-0.55, -0.5, f);
-  limbs.strideLower.rotation.x = lerp(0.15, 0.1, f);
-  limbs.strideFoot.rotation.x = 0;
-  limbs.pivotUpper.rotation.x = 0.5 * f;
-  limbs.pivotLower.rotation.x = 0.55 * f;
-  j.Pelvis.position.y = HIP_HEIGHT - lerp(0.05, 0.1, f);
+  limbs.armUpper.rotation.x = f.arm.upperX;
+  limbs.armUpper.rotation.z = f.slot ? arm.side * ARM_SLOT_RAD[arm.slot] : arm.side * f.arm.upperZ;
+  limbs.armLower.rotation.x = f.arm.lowerX;
+  limbs.offUpper.rotation.x = f.off.upperX;
+  limbs.offUpper.rotation.z = -arm.side * f.off.upperZ;
+  limbs.offLower.rotation.x = f.off.lowerX;
+  limbs.strideUpper.rotation.x = f.stride.upperX;
+  // 本塁の側へ開く（踏み出す脚は投げる腕と反対の側＝その脚の外側へ開く向き）
+  limbs.strideUpper.rotation.z = -arm.side * (f.stride.out ?? 0);
+  limbs.strideLower.rotation.x = f.stride.lowerX;
+  limbs.strideFoot.rotation.x = f.stride.footX;
+  limbs.pivotUpper.rotation.x = f.pivot.upperX;
+  limbs.pivotUpper.rotation.z = arm.side * (f.pivot.out ?? 0);
+  limbs.pivotLower.rotation.x = f.pivot.lowerX;
+  j.Torso.rotation.x = f.torsoX;
+  // 投げる腕の側を後ろへ引く向きにねじる（右投げなら胸が三塁側を向く＝左肩が本塁を指す）
+  j.Torso.rotation.y = arm.side * f.torsoTwist;
+  // 上体を投げる側へ傾ける（フェーズMM-60）。リリースの絵だけ＝球の出どころと同じ形
+  j.Torso.rotation.z = key === 'release' ? -arm.side * ARM_RELEASE_LEAN_RAD[arm.slot] : 0;
+  // 腰ごと横を向く（右投げなら時計回り＝胸が三塁側）。リリースは正面（0）＝MM-60の形
+  j.Pelvis.rotation.y = arm.side * (f.hipTurn ?? 0);
+  j.Pelvis.position.y = HIP_HEIGHT - f.hipDrop;
 }
 
 /**
  * 送球（フェーズHH-55）。t は0（**リリースの瞬間**＝腕が前へ出切っている）→1（振り抜き）。
  *
  * **描くのはボールが手を離れた後だけ**。投球（`applyPitch`）が担ぎ上げから始まるのは、
- * 判定の側にワインドアップという時間が実在するから（`PITCH_RELEASE_T`）で、**送球には
+ * 判定の側にワインドアップという時間が実在するから（`PITCH_WINDUP_SEC`）で、**送球には
  * それが無い**（送球時間は `距離 ÷ THROW_SPEED` をリリースの瞬間から数える）。担ぎ上げを
  * 見せるにはボールを待たせるしかなく、それは盗塁の窓・けん制の境界・内野ゴロの帰結を
  * まとめて動かす＝**判定を1行も触らないという約束のほうを優先した**。

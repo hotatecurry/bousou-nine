@@ -3,152 +3,224 @@
  * cpuPitcher.ts と対になる、打者側の2P/CPU操作分離の本体（PROGRESS.md「でっかいモードの
  * CPU投球/打撃AI」参照）。
  *
- * 設計方針（乱数は一切使わない）：
+ * 設計方針：
  * - CPU打者は毎フレーム「今スイングを押すべきか」を判断するのではなく、着弾（打撃面通過）
- *   までの残り時間が「押してからジャストミートまでの理想時間（SWING_IDEAL_SEC）」と
- *   ちょうど一致するフレームで一度だけ判断する（shouldCpuSwing）。現在のボール速度・
- *   コースを線形外挿して着弾点を予測するので、投手側がその後もカーブを続けている場合は
- *   予測が外れて差し込まれる／泳ぐことがある（＝曲げ球がCPU打者も欺けるという、
- *   人間の打者と同じ駆け引きが自然に成立する。意図した挙動）。
- * - 判断内容：バットが届く範囲外なら見送り。**「甘い球」だけを振る**（ストライクゾーンの
- *   隅の1つ内側）。**2ストライク以降は隅の1つ外まで広げて粘る**（ファウルで凌ぐ＝
- *   三振回避を優先）が、そこから更に外れた球は見送る。
+ *   までの残り時間が**その球で狙う時刻**（`cpuSwingLead`）とちょうど一致する瞬間に一度だけ
+ *   判断する（shouldCpuSwing）。現在のボール速度・コースを線形外挿して着弾点を予測するので、
+ *   投手側がその後もカーブを続けている場合は予測が外れて差し込まれる／泳ぐことがある
+ *   （＝曲げ球がCPU打者も欺けるという、人間の打者と同じ駆け引きが自然に成立する）。
+ * - 判断内容：バットが届く範囲外なら見送り。**ストライクには手を出す**。**2ストライク以降は
+ *   隅の1つ外まで広げて粘る**（ファウルで凌ぐ＝三振回避を優先）が、そこから更に外れた球は
+ *   見送る。
  * - エッジ検出（crossesSwingDecisionPoint）は、既存の contactPlaneCrossing 等と同じ
  *   「前後2フレームの状態から境界越えを検出する」作法に揃えた。
  *
- * ## フェーズSS-67：打席の駆け引きを成立させた
+ * ## フェーズAAA-75：タイミングは「直前の球の速さ」に合わせ、人間並みにぶれる
  *
- * QQ-65 が計測で見つけた構造（`ORIGINAL_PARITY.md`）＝**CPU打者は三振も四球もしない**
- * （1打席1.51球で必ず打球になる／見送りは0.00球）と、**フォークが人間の投手の支配戦略**
- * （ど真ん中のフォークが88.2%アウト）を、**新しい定数を1つも増やさずに**埋めた：
+ * UU-69 が残した「CPUの三振 39.6%／CPU打線の本塁打 0本」を測ったら、原因は数値ではなく
+ * **スイングの始め方**にあった（`npm run balance:plate` の12〜15段目）：
  *
- * 1. **罰を緩急の両側へ**（`cpuSwingLead`）＝遅い球には泳ぐ。速球・基準速は完全に不変。
- * 2. **追い込まれたら窓の縁まで泳ぐ**（同上の `twoStrikes`）＝決め球に空振りが生まれる。
- * 3. **振る幅を実際に「甘い球」へ**（`SELECTIVE_HALF_WIDTH` / `TWO_STRIKE_HALF_WIDTH`）
- *    ＝見送りと四球が生まれ、T-41の制球（どれだけ外れるか）に初めて帰結が付く。
+ * 1. **CPUのスイングは「判断したフレームの1フレーム前から振り始めた」扱いになっていた**
+ *    （判断は `next` の位置で下すのに、スイングの時計は `prev` の時刻から数えていた）。
+ *    遅れは最大1フレーム＝**結果が画面のリフレッシュレートで変わる**（ど真ん中の速球を
+ *    投げ続けたときの三振率：60Hzで86.1%／144Hzで37.5%）。UU-69 が有効窓を 0.14→0.09 に
+ *    狭めたせいで、この固定の遅れが窓に対して相対的に大きくなった。
+ * 2. その遅れのせいで、**2ストライク後の速球はCPUが必ず空振りし**、**CPUは速球を一度も
+ *    前へ飛ばせなかった**＝CPUの三振 39.6% はすべて空振り、本塁打0本の正体もこれ。
+ *    人間の投手側から見ると**ど真ん中の速球×3＝三振86%・安打0の必勝配球**だった。
+ * 3. 遅れを消して**完全に決定的なまま**にすると「同じ球には必ず同じ結果」になる。
+ *    規則を35通り試したが、**どの規則にも三振100%か打率.000になる配球が残った**
+ *    （空振りさせる球があれば人間は必ずそれを選べる。無ければCPUは三振しない）。
  *
- * 実測（`npm run balance:plate`）：三振 0%→**6.3%** / 四球 0%→**6.3%** /
- * 1打席 1.51→**2.20球** / 死球 0% / **40球で終わらない打席 5件→0件**。
+ * そこで（2026-09-29 ユーザー判断）：
+ *
+ * - **タイミングは「直前の球の速さ」に合わせる**（`cpuSwingLead`）。その打席でストライクに
+ *   なった球（見逃し・空振り・ファウル）の速さを覚え、**同じ速さを続けると捉えられ、
+ *   速さを変えると崩れる**。緩急1段（速球↔基準速↔フォーク）につき
+ *   `CPU_TIMING_PENALTY_SEC`（窓の1/3）ずれる。初球はその投手の基準速を待つ。
+ *   **O-36の「直前のストライクのコースへ芯を合わせる」と対**になる＝CPU打者は
+ *   **コースも速さも、直前のストライクに合わせてくる**（読める規則のまま）。
+ * - **人間並みの小さなぶれを持たせる**（`CPU_SWING_SIGMA_SEC`）。**CLAUDE.md⑪の
+ *   「CPUの規則は決定的」を、打撃のタイミングについてだけ緩めた**唯一の場所。ぶれは
+ *   試合のシードから別系列で引く（`drawCpuSwingNoise`。本編の乱数は消費しない）ので、
+ *   **シードを固定すれば試合まるごと再現できる**という約束は保たれる。
+ * - **スイングはサブフレームで正確に始める**（`cpuSwingClockAt`）＝どのリフレッシュレート
+ *   でも同じ結果になる。
+ * - **2ストライクのタイミングの特別扱い（窓の縁まで泳ぐ）はやめた**。空振りは緩急とぶれから
+ *   自然に生まれるので要らない（残したまま測ると、人間の決まった配球で取れる三振の最大が
+ *   36%→45% に増えた＝必勝配球に近づく）。
+ * - **手を出す幅はストライクゾーンいっぱい**（`SELECTIVE_HALF_WIDTH`）。TT-68 の
+ *   「隅の1つ内側（0.40）」のままだと、0.40〜0.45 に投げれば**見逃しストライクを
+ *   取り放題**という別の必勝配球が残った（`npm run balance:plate` の9段目：その帯を使う
+ *   配球で三振 33〜51%）。
+ *
  * **判定（`judgeSwing`）には1行も触っていない**ので `npm run balance` は完全に不変で、
  * 人間の打者の手応え（到達範囲・有効窓）も1mmも動いていない。
  */
 import { CONTACT_PLANE_Z, SWING_ACTIVE_SEC, SWING_IDEAL_SEC, batReachFor } from './batting';
 import type { BatterSide, PitchFlight } from './pitch';
 import {
+  REFERENCE_PITCHER_NEUTRAL,
   RIGHT_BATTER_SIDE,
   SPEED_FAST_DELTA,
-  SPEED_NEUTRAL,
   SPEED_SLOW_DELTA,
   STRIKE_ZONE_HALF_WIDTH,
   batterFrameX,
   clampStance,
+  flightSecondsUntil,
 } from './pitch';
 import { CORNER_MARGIN as CPU_CORNER_MARGIN } from './cpuPitcher';
+import { type RngState, nextRng } from './rng';
 import type { Bases, Count } from './rules';
 
 /**
- * 基準速から離れた球に対してCPUがどれだけ早振り（＝タイミングを外して引っ掛け気味）に
- * なるか。実機テストプレイで「守備のときCPUが速球を100%ホームランにする」ことが判明した
- * 対策として入った値。旧実装はCPUが球速によらず常にジャストミート（timing=0）で捉えたため、
- * 初速が最大になる速球が確実にフェンスを越えていた。現実同様「基準からずれた球ほど
- * タイミングが取りづらい」よう、スイング判断のリード（＝押すタイミング）を早める。
- * スイングが早まるとジャストミートより terminal 側で捉える＝引っ張り・詰まりで初速が
- * 落ち、痛烈な当たりでも深いフライ／ゴロ止まりになりHRが激減する（ミートは残るので
- * CPUの攻撃自体は成立し続ける）。スイング経過が理想＋この罰＝有効窓（`SWING_ACTIVE_SEC`）の
- * 中に収まるため、単独では空振りにならず「弱い当たり」になる。
+ * **緩急1段あたり**、CPU打者のスイングがどれだけずれるか（秒）。
  *
- * **フェーズSS-67で名前を `FAST` から外した**（値は 0.045 のまま＝**新しい定数はゼロ**）：
- * `cpuSwingLead` が緩急の**両側**を見るようになったので、速球専用の値ではなくなった。
+ * 1段＝速球↔基準速、または基準速↔フォーク（`paceStepOf` の1）。**待っていた球より
+ * 遅ければ早振り（泳ぐ＝引っ張り）、速ければ振り遅れ（差し込まれる＝流し）**になる。
+ * 速球を待っているところへフォークが来れば2段ぶん＝窓の2/3ずれる＝**芯から縁まで（窓の半分）を
+ * 越える**ので、ぶれが引き戻さなければ空振りになる。
  *
- * ## フェーズTT-68：値を有効窓からの導出にした（0.045 → `SWING_ACTIVE_SEC / 3` ＝0.0467）
+ * ## 値の出どころ（新しい数値は持ち込んでいない）
  *
- * SS-67 が残した宿題（**三振・四球が実際の野球の帯に届いていない**）を埋める2つのてこの
- * うちの打者側。**新しい定数は増えず、むしろマジックナンバーが1つ消えた**＝
- * 2ストライクの罰（`SWING_ACTIVE_SEC / 2`＝窓の縁まで泳ぐ）と**同じ刻みの梯子**になる：
+ * `SWING_ACTIVE_SEC / 3`＝**TT-68 が「通常の罰」として決めた梯子の1段そのもの**。
+ * TT-68 までは「基準速から離れた球ほど早振り」（`offness`）の罰として使っていたのを、
+ * フェーズAAA-75で**「待っていた速さから何段ずれたか」**の1段ぶんへ読み替えた。
+ * 1段なら窓の1/3（芯から縁までの2/3＝弱い当たり）、2段なら窓の2/3（縁の外＝空振り寄り）
+ * ＝**1段の変化だけでは空振りさせられない**のが要点で、これより大きくすると
+ * 「速さを1段変えるだけで空振り」が必勝配球になる（`npm run balance:plate` の13段目）。
  *
- * | 場面 | 罰 | 意味 |
- * |---|---|---|
- * | 通常 | `SWING_ACTIVE_SEC / 3` | 窓の1/3ぶん早振り＝弱い当たり（空振りにはならない） |
- * | 2ストライク | `SWING_ACTIVE_SEC / 2` | 窓の縁まで泳ぐ＝決め球に空振りが生まれる（SS-67） |
- *
- * **SS-67 が「一律に上げる案」を否定したときの計測は、`foulsInAtBat`（ファウルで隅を
- * 散らす規則）を入れる前のものだった**（＝1打席17球・ファウルの無限打席25%）。
- * `npm run balance:plate` の13段目で測り直すと、**無限ファウルは起きない**（最長6球）。
- *
- * 値は同13段目が決めた（CLAUDE.md「バランス調整の方針」）＝**帯は 0.0455〜0.0472 で、
- * `SWING_ACTIVE_SEC / 3`（0.0467）はそのほぼ中央**。上限の外（0.0475以上）では
- * **CPU打線の本塁打が 0.00本/試合になる**（弱い当たりしか出なくなる）。
- * さらに上（0.050）では**人間がど真ん中へ投げたフォークが100%ファウル**になり、
- * SS-67 が消したばかりの「人間の投手側の支配戦略」が別の形で戻る＝**採用値では
- * 3段目（人間の3択）は SS-67 と完全に同じ**（フォーク 32.6%アウト/67.4%安打）。
+ * 旧来のコメントが持っていた経緯（セッション9の「CPUが速球を100%本塁打にする」対策
+ * として入った早振り／SS-67で緩急の両側へ／TT-68で窓からの導出へ）は ORIGINAL_PARITY.md の
+ * フェーズ記録にある。
  */
 export const CPU_TIMING_PENALTY_SEC = SWING_ACTIVE_SEC / 3;
 
 /**
- * 球速に応じたスイング判断リード（**基準速から離れた球ほど早振りになりタイミングを外す**）。
+ * CPU打者のタイミングのぶれ（標準偏差・秒）＝**人間並み**。
  *
- * ## フェーズSS-67：罰を緩急の両側へ広げた
+ * 値は **UU-69 が有効窓（`SWING_ACTIVE_SEC`）を決めたときの人間のばらつき**（σ=40ms。
+ * 「押す時刻が ±45ms に入れば当たる」窓で空振り 25.1%＝実際の野球の約25%）を
+ * そのまま使う＝**新しい数値は持ち込んでいない**。意味はひと言で言える＝
+ * **CPU打者は、平均的な人間と同じだけタイミングがぶれる**。
  *
- * それまで罰は**速球側にしか無かった**（`fastness`）ので、**緩い球はCPU打者に必ず芯で
- * 捉えられていた**（実測：フォークの |timing| は平均 0.117・芯率 87.5%）。打球初速に
- * `0.5 × 球速` が入るぶん当たっても弱いのでほとんどアウトになり、結果として
- * **フォークを投げ続けるのが人間の投手の支配戦略**になっていた（`npm run balance:plate`
- * の3段目で「ど真ん中のフォーク＝88.2%アウト」。QQ-65 が
- * `ORIGINAL_PARITY.md` に「別セッションの規模」として書き残した穴）。
- *
- * 実際の野球で緩急が効くのは**両側**（速い球には差し込まれ、遅い球には泳ぐ）なので、
- * `fastness` を「基準速からの隔たり」（`offness`）に一般化した。**新しい定数は1つも
- * 増えていない**（W-44 が `FATIGUE_CONTROL_LOSS` を `FATIGUE_SPEED_DROP` に、
- * CC-50 が腕のずれを O-36 の可動幅に揃えたのと同じ「既にある値に揃える」やり方）。
- *
- * **基準線は動かない**（B-8以来の約束）：
- * - **基準速（`SPEED_NEUTRAL`）は offness 0＝ジャストミートのまま**
- * - **速球（`SPEED_FAST`）は offness 1＝従来とまったく同じ 0.045**
- * ＝I-29・JJ-57・QQ-65・RR-66 が測った打たれ方の骨格（速球のHR・ファウルの帯）は
- * 1mmも動かない（`tests/balance.test.ts` の速球HRの回帰帯がそのまま通る）。
- * 動くのは**基準速より遅い球だけ**。
- *
- * 幅は上下で違う（`SPEED_FAST_DELTA`=6 / `SPEED_SLOW_DELTA`=14）ので、
- * **どちらの端でも「緩急を目いっぱい使った球」がちょうど罰の最大**になる
- * （＝緩急の幅そのものが投手によらず一定という `speedForPitchSelection` の約束と揃う）。
+ * ぶれを入れた理由は `npm run balance:plate` の12・15段目：**決定的なCPU打者には、
+ * どう規則を作っても必勝の配球が残る**（同じ球には必ず同じ結果になるので、空振りさせる
+ * 球があれば人間は必ずそれを選べる）。ぶれがあれば**同じ球でも結果が散る**ので、
+ * どの決まった配球でも三振は4割程度までに収まる。
  */
-export function cpuSwingLead(
-  pitchSpeed: number,
-  twoStrikes = false,
-  normalPenalty: number = CPU_TIMING_PENALTY_SEC,
-): number {
-  const offness =
-    pitchSpeed >= SPEED_NEUTRAL
-      ? (pitchSpeed - SPEED_NEUTRAL) / SPEED_FAST_DELTA
-      : (SPEED_NEUTRAL - pitchSpeed) / SPEED_SLOW_DELTA;
-  const penalty = twoStrikes ? SWING_ACTIVE_SEC / 2 : normalPenalty;
-  return SWING_IDEAL_SEC + penalty * Math.min(1, Math.max(0, offness));
+export const CPU_SWING_SIGMA_SEC = 0.04;
+
+/**
+ * ぶれを引く系列の塩（`condition.ts` の `HOT_SEED_SALT`・`skills.ts` の
+ * `LINEAGE_SEED_SALT` と同じ考え方＝**本編の乱数を消費せず、シードから別系列を起こす**）。
+ * 値そのものに意味は無い。
+ */
+export const CPU_SWING_NOISE_SALT = 0xba7;
+
+/**
+ * ぶれを1球ぶん引く（正規分布。Box–Muller）。**±3σ で打ち切る**＝ごくまれに
+ * 「0.2秒以上早く振り出す」ような、人がやらない振り方にはしない。
+ *
+ * 状態を書き換えず必ず新しい状態を返す（`rng.ts` の作法）。
+ */
+export function drawCpuSwingNoise(
+  state: RngState,
+  sigma: number = CPU_SWING_SIGMA_SEC,
+): { noise: number; state: RngState } {
+  const a = nextRng(state);
+  const b = nextRng(a.state);
+  const u = Math.max(a.value, Number.EPSILON);
+  const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * b.value);
+  return { noise: sigma * Math.max(-3, Math.min(3, z)), state: b.state };
 }
 
 /**
- * 手を出す幅（＝これより外は見送る）＝**「甘い球」の定義そのもの**。
- * **ストライクゾーンの隅の1つ内側**（`ゾーン半幅 - 投手が狙う隅の余裕`）。
+ * その球が**その投手の基準速から緩急何段か**（速球＝+1／基準速＝0／フォーク＝-1）。
  *
- * **フェーズSS-67で 0.15 → `-CPU_CORNER_MARGIN`**（0.60 → **0.40**）。
- * このファイルの冒頭コメントは元から「**『甘い球』だけを振る選球眼**」と書いていたが、
- * **実際の 0.60 は名鑑96人が投げる球をすべて含んでいた**（実測：通常の球は最大 0.382、
- * 決め球でも最大 0.634）＝**CPU打者は1球も見送らず**（実測 見送り 0.00球/打席）、
- * **四球も見逃し三振も構造的に起こりえなかった**。
- *
- * **新しい数値は持ち込まず、`CPU_CORNER_MARGIN`（＝CPU投手が狙う隅の余裕）1刻みで
- * 表した**（W-44 が `COURSE_VX_PER_CONTROL` を「既にある隅に合わせる」で決めたのと
- * 同じやり方）。意味はひと言で言える＝**「投手が狙う隅より内側だけを振る」**。
- *
- * 値は `npm run balance:plate` が決めた（CLAUDE.md「バランス調整の方針」）：
- * ここを 0.40 にすると **三振6.3% / 四球6.3% / 死球0%** と3つが同時に成立する。
- * 1つ広い 0.45（ゾーンいっぱい）では**三振が0%に戻り**、1つ狭い 0.3375 では
- * **死球が2.8%に増える**（見送りが増えて内角の荒れ球が本塁まで届くため）。
+ * 幅は上下で違う（`SPEED_FAST_DELTA`=6 / `SPEED_SLOW_DELTA`=14）ので、上下それぞれの幅で
+ * 割る＝**緩急を目いっぱい使った球がちょうど1段**になる（`speedForPitchSelection` の
+ * 「緩急の幅は投手によらず一定」と揃う）。**中心はその投手の基準速**なので、
+ * 球速（SPD）の違う投手でも「速球→フォーク」は同じ2段になる（疲労で全体が遅くなっても同じ）。
  */
-export const SELECTIVE_HALF_WIDTH = STRIKE_ZONE_HALF_WIDTH - CPU_CORNER_MARGIN;
+export function paceStepOf(pitchSpeed: number, pitcherNeutral: number): number {
+  return pitchSpeed >= pitcherNeutral
+    ? (pitchSpeed - pitcherNeutral) / SPEED_FAST_DELTA
+    : (pitchSpeed - pitcherNeutral) / SPEED_SLOW_DELTA;
+}
+
+/**
+ * 投手の球速（基準速）が、CPU打者のタイミングの誤差に掛ける倍率（フェーズBBB-85）。
+ *
+ * **球が速いぶん飛行時間が縮む、その同じ比で誤差（緩急のずれとぶれ）が大きくなる**＝
+ * `投手の基準速 ÷ 基準の投手の基準速`。名鑑の平均の投手で 1（BBB-85 の前と同じ）、
+ * いちばん速い投手（基準速42）で 1.11、いちばん遅い投手（30）で 0.79。
+ *
+ * それまで球速はCPU打者相手に何の得にもならなかった：CPU打者は緩急を**その投手の基準速からの
+ * 段**で見て（`paceStepOf`）、ぶれは秒で持つので、誰が投げても同じだけ当てた。人間の打者は
+ * 球が速いほど読む時間が短くなる＝その不利を、CPU打者は同じ比の誤差として持つ。
+ *
+ * 計測（先発16人の球速だけを差し替え、散らして投げる）：球速 0.3→0.9 で 三振 18→25%・
+ * 打率 .246→.214。新しい数値は持ち込んでいない（比はそのまま飛行時間の比）。
+ *
+ * `pitcherNeutral` を渡さなければ 1＝投手を持たない素の球。
+ */
+export function cpuTimingScale(pitcherNeutral?: number): number {
+  return pitcherNeutral === undefined ? 1 : pitcherNeutral / REFERENCE_PITCHER_NEUTRAL;
+}
+
+/**
+ * CPU打者がバットを出し始める時刻＝**打撃面まで残り何秒でスイングを始めるか**
+ * （フェーズAAA-75）。`SWING_IDEAL_SEC` ちょうどならジャストミート。
+ *
+ * **待っている球（`expectedSpeed`）との緩急の差**で決まる：
+ * - 待っていた球より**遅い**＝早く振り出す（泳ぐ。正のタイミング＝引っ張り）
+ * - 待っていた球より**速い**＝振り出しが遅れる（差し込まれる。負のタイミング＝流し）
+ * - **同じ速さなら芯**（＝同じ球を続けると捉えられる）
+ *
+ * `expectedSpeed` が null＝**その打席の初球**で、投手の基準速を待つ。
+ * `noiseSec` はぶれ（`drawCpuSwingNoise`）。渡さなければ0＝ぶれの無い狙いそのもの。
+ * `stepSec` は**計測が定数を書き換えずに1段の重みを振るための引数**（`swingWidths` と
+ * 同じ作法）。渡さなければ採用値＝ゲーム本体はこの経路しか通らない。
+ * `timingScale` は投手の球速による誤差の倍率（`cpuTimingScale`。BBB-85）＝**緩急のずれと
+ * ぶれの両方に掛かる**。渡さなければ 1。ゲーム本体は投げた球の基準速から必ず渡す。
+ *
+ * **0 より小さくはしない**（打撃面を過ぎてから振り出すことはない）。0 のときも判断は
+ * 打撃面を通る瞬間に一度だけ起き、バットが届かないので空振りになる。
+ */
+export function cpuSwingLead(
+  pitchSpeed: number,
+  pitcherNeutral: number,
+  expectedSpeed: number | null = null,
+  noiseSec = 0,
+  stepSec: number = CPU_TIMING_PENALTY_SEC,
+  timingScale = 1,
+): number {
+  const expected = expectedSpeed ?? pitcherNeutral;
+  const gap = paceStepOf(expected, pitcherNeutral) - paceStepOf(pitchSpeed, pitcherNeutral);
+  return Math.max(0, SWING_IDEAL_SEC + (stepSec * gap + noiseSec) * timingScale);
+}
+
+/**
+ * 手を出す幅（＝これより外は見送る）＝**ストライクゾーンいっぱい**。
+ *
+ * ## 経緯
+ *
+ * - SS-67 までは 0.60（**名鑑96人が投げる球をすべて含んでいた**＝1球も見送らなかった）。
+ * - SS-67 で `ゾーン半幅 - 隅の余裕`（0.40）＝「甘い球だけを振る」へ。
+ * - **フェーズAAA-75で `ゾーン半幅`（0.45）へ**。0.40 のままだと、0.40〜0.45 に投げた球は
+ *   **振られずにストライクになる**＝人間の投手が**見逃しストライクを取り放題**だった
+ *   （TT-68 が未確認事項に残していた形。`npm run balance:plate` の9段目で、その帯を使う
+ *   配球の三振が 33〜51%）。ぶれが入って空振りが自然に生まれるようになったので、
+ *   **四球・三振を作るために「振らせない帯」を置く必要が無くなった**。
+ *
+ * 意味はひと言で言える＝**「ストライクには手を出す」**。
+ */
+export const SELECTIVE_HALF_WIDTH = STRIKE_ZONE_HALF_WIDTH;
 
 /**
  * 2ストライク以降に手を出す幅（＝**追い込まれたら隅まで手を出す**）。
- * **ストライクゾーンの隅の1つ外側**＝`SELECTIVE_HALF_WIDTH` とゾーンを挟んで対称。
+ * **ストライクゾーンの隅の1つ外側**＝投手の決め球（`ゾーン半幅 + 隅の余裕`）の狙いそのもの。
  *
  * それまでは `count.strikes >= 2` なら **バットが届く球すべてに手を出す**（＝幅は無限大）
  * だった。「ファウルで凌ぐ＝三振回避を優先」という意図は正しいが、**CPU投手の決め球は
@@ -162,40 +234,63 @@ export const SELECTIVE_HALF_WIDTH = STRIKE_ZONE_HALF_WIDTH - CPU_CORNER_MARGIN;
  */
 export const TWO_STRIKE_HALF_WIDTH = STRIKE_ZONE_HALF_WIDTH + CPU_CORNER_MARGIN;
 
-/** 打撃面（CONTACT_PLANE_Z）通過までの残り時間。既に通過済み/球速0以下なら Infinity */
+/**
+ * 打撃面（CONTACT_PLANE_Z）通過までの残り**実時間**（秒）。通過済みなら負、球速0以下なら Infinity。
+ *
+ * **飛行の時計（フェーズBBB-76の `PitchFlight.rate`）込みで数える**＝CPU打者が振り出す時刻
+ * （`cpuSwingLead`）もスイングの時計も実時間なので、ここを球速どおりの時間で数えると、
+ * 原作の速さで飛んでくる球に対して**毎回振り遅れる**。
+ */
 export function timeToContactPlane(flight: PitchFlight): number {
-  if (flight.vz <= 0) return Infinity;
-  return (CONTACT_PLANE_Z - flight.z) / flight.vz;
+  return flightSecondsUntil(flight, CONTACT_PLANE_Z);
 }
 
-/** 現在の速度で等速直線運動を続けたと仮定した、打撃面通過時のX（線形外挿） */
+/**
+ * 現在の速度で等速直線運動を続けたと仮定した、打撃面通過時のX（線形外挿）。
+ * **通り道の計算なので球速どおりの時間で外挿する**（横の速度 vx も同じ単位）＝時計を
+ * 速めても予測する場所は変わらない。
+ */
 export function predictCrossX(flight: PitchFlight): number {
-  const t = Math.max(0, timeToContactPlane(flight));
+  if (flight.vz <= 0) return flight.x;
+  const t = Math.max(0, (CONTACT_PLANE_Z - flight.z) / flight.vz);
   return flight.x + flight.vx * t;
 }
 
 /**
- * このステップでスイング判断フレーム（残り時間がしきい値を下回った最初の瞬間）を
- * 通過したか。prev/next は onFlightStep で渡される前後1ステップ分の飛行状態。
- * しきい値は球速に応じて変わる（速球ほど早振りになる。cpuSwingLead 参照）。
- *
- * `normalPenalty` は**計測が定数を書き換えずに罰を振るための引数**（`swingWidths` と
- * 同じ作法。フェーズTT-68）。渡さなければ採用値＝ゲーム本体はこの経路しか通らない。
+ * このステップでスイング判断の瞬間（残り時間が `lead` を下回った最初の瞬間）を通過したか。
+ * prev/next は onFlightStep で渡される前後1ステップ分の飛行状態、`lead` はその球の
+ * `cpuSwingLead`（**球ごとに一度だけ決める**＝ぶれを飛行の途中で引き直さない）。
  */
 export function crossesSwingDecisionPoint(
   prev: PitchFlight,
   next: PitchFlight,
-  count: Count = { balls: 0, strikes: 0 },
-  normalPenalty: number = CPU_TIMING_PENALTY_SEC,
+  lead: number,
 ): boolean {
-  const lead = cpuSwingLead(prev.vz, count.strikes >= 2, normalPenalty);
   return timeToContactPlane(prev) > lead && timeToContactPlane(next) <= lead;
 }
 
 /**
- * 判断フレームで呼ぶ。予測着弾点とカウントから、スイングすべきかを返す。
+ * 判断した瞬間に振り出すときの、**このフレームの先頭の時点でのスイングの経過時間**
+ * （フェーズAAA-75。0 以下）。バッティングの `trySwing` にそのまま渡す。
+ *
+ * スイングの時計（`swingT`）は「フレームの先頭時点の経過」で持ち、接触判定はそこへ
+ * サブフレームの通過時刻を足して読む（`dekkaiScene.ts` の `checkContact`）。CPUが振り出す
+ * のは、残り時間がちょうど `lead` になった瞬間＝**このフレームの先頭から
+ * `timeToContactPlane(prev) - lead` 秒後**なので、先頭の時点では**まだその分だけ
+ * 振り出していない**（負の値）。
+ *
+ * **これが無いと、スイングはフレームの先頭から始まった扱いになる**＝狙いより最大
+ * 1フレーム早く振ることになり、しかもその量が画面のリフレッシュレートで変わる
+ * （AAA-75の前は、60Hzで2ストライクの速球が必ず空振り・144Hzでは半分しか空振らなかった）。
+ */
+export function cpuSwingClockAt(prev: PitchFlight, lead: number): number {
+  return Math.min(0, lead - timeToContactPlane(prev));
+}
+
+/**
+ * 判断の瞬間に呼ぶ。予測着弾点とカウントから、スイングすべきかを返す。
  * バットが届かない球は常に見送り。2ストライク以降は粘るため際どい球にも手を出し、
- * それ以外は甘い球だけを振る。
+ * それ以外はストライクだけを振る。
  *
  * side（打席の左右。フェーズB-9）は「バットが届くか」の判定にだけ効く（judgeSwing と
  * 同じく打者ローカルで比べる）。選球眼はストライクゾーン基準＝本塁について左右対称なので

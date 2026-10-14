@@ -17,8 +17,8 @@ import {
   BATTER_STANCE_MOVE_SPEED,
   CATCH_Z,
   NEUTRAL_RATING,
+  PITCH_WINDUP_SEC,
   PLATE_Z,
-  RELEASE_Z,
   RIGHT_BATTER_SIDE,
   NEUTRAL_PITCH_ARM,
   RUBBER_MOVE_SPEED,
@@ -29,12 +29,15 @@ import {
   clampRubberX,
   clampStance,
   courseReleaseVxFor,
-  createPitchFlight,
+  displayPitchKmh,
+  flightRateAt,
+  flightSecondsUntil,
   judgePitch,
   neutralSpeedFor,
-  pitchFastness,
-  pitchSlowness,
   plateCrossingX,
+  releasePitchFlight,
+  pitchBounces,
+  forkBounces,
   releaseXFor,
   speedForPitchSelection,
   steerAccelForSelection,
@@ -44,7 +47,6 @@ import {
   type BattedBall,
   type BattingProfile,
   SWING_ACTIVE_SEC,
-  SWING_IDEAL_SEC,
   SWING_STARTUP_SEC,
   contactPlaneCrossing,
   createBattedBall,
@@ -59,8 +61,11 @@ import {
   stepAimX,
 } from '../core/gun';
 import {
+  type CpuPitchMix,
   type CpuPitchPlan,
   type CpuPitchShape,
+  type CpuPitchSides,
+  avoidCrowdingBatter,
   chooseCpuPitchPlan,
   cpuPitcherStyle,
   cpuSteerAccelAt,
@@ -68,20 +73,28 @@ import {
   shouldCpuPickoff,
 } from '../core/cpuPitcher';
 import {
-  PITCH_RELEASE_T,
   attachBat,
+  BUNT_BODY_YAW,
   attachGun,
   movePlayerTo,
   setPlayerFacing,
   setPlayerPose,
+  swingKeyYaw,
 } from '../entities/player';
+import {
+  STEAL_GO_SEC,
+  SWING_FINISH_FROM,
+  SWING_TOTAL_SEC,
+  afterReleaseKeyAt,
+  swingKeyAt,
+  windupKeyAt,
+} from '../core/keyframes';
 import { createProp, gunMuzzleOf } from '../entities/props';
 import {
   DEKKAI_CAMERA_LOOK_AT,
   DEKKAI_CAMERA_POS,
   dekkaiFovFor,
-  dekkaiBallLook,
-  pitchArcPath,
+  dekkaiPitchLook,
 } from '../core/camera';
 import type { Bases, Count } from '../core/rules';
 import { CPU_PITCH_INTERVAL_SEC, PITCH_SETTLE_SEC } from '../core/tempo';
@@ -107,27 +120,13 @@ export function createDekkaiCamera(aspect: number): THREE.PerspectiveCamera {
 
 export type PitchPhase = 'ready' | 'windup' | 'flight' | 'settle';
 
-const WINDUP_SEC = 0.35;
 /**
- * リリース後にフォロースルーを取り切るまでの時間（フェーズE-25-(c)。**見た目だけ**）。
- * 球の飛行・判定はこの値を一切見ないので、長くしても投球そのものは変わらない。
+ * 投球モーションの長さ＝**原作の70フレーム**（フェーズBBB-76。`core/pitch.ts` の
+ * `PITCH_WINDUP_SEC`）。盗塁の窓（`timeToCatcher`）にも効くので判定の層に置いてある。
  */
-const PITCH_FOLLOW_SEC = 0.3;
+const WINDUP_SEC = PITCH_WINDUP_SEC;
 /** タブ非アクティブ復帰などで dt が跳ねたときの暴走防止 */
 const MAX_DT = 0.1;
-/**
- * 緩急を見た目で伝える視覚演出（高低はゾーン判定に無関係・原作準拠）。
- * 遅い球（＝上入力で選ぶフォーク/チェンジアップ）は弧を描いて手元で落ち、
- * 速球は進行方向に残像を引く。**式と値は `core/camera.ts` に集約してある**
- * （フェーズPP-63。`pitchArcPath` / `dekkaiBallLook`）＝「球がどう見えるか」の
- * 調整先を散らさない（NN-61の見かけの大きさ・LL-59の選手の縮尺と同じ場所）。
- *
- * ここに残るのは残像の向きを three へ渡すための作業用ベクトルだけ。伸ばす向きは
- * 毎フレーム変わる（＝画面上の進行方向）ので、球のローカル+Zをその向きへ合わせてから
- * そのローカル軸だけを伸ばす。毎フレーム new しないよう使い回す。
- */
-const TRAIL_FROM = new THREE.Vector3(0, 0, 1);
-const TRAIL_AXIS = new THREE.Vector3();
 
 
 /**
@@ -150,6 +149,30 @@ export interface PitchingController {
   isBusy(): boolean;
   /** ワインドアップ〜飛行中（スイングを受け付ける区間）の間 true */
   isPitchLive(): boolean;
+  /**
+   * 走者がスタートを切れるか（フェーズBBB-76）＝投手が本塁へ踏み出した後（`STEAL_GO_SEC`）か
+   * 飛行中。モーションの前半に押された盗塁は、ここが true になるまで待ってから走り出す。
+   */
+  runnersMayGo(): boolean;
+  /**
+   * 飛んでいる球の**本当の** z（判定の飛行状態）。飛行中でなければ null。
+   * 画面の球（ボールメッシュ）は原作の見え方に合わせて置き直してある（フェーズBBB-76の
+   * `dekkaiPitchLook`）ので、**球の位置で何かを決めるときはこちらを読む**。
+   */
+  ballZ(): number | null;
+  /** 直前に投げた球の表示の球速 km/h（まだ投げていなければ null。フェーズBBB-77） */
+  lastPitchKmh(): number | null;
+  /**
+   * 直前に投げた球に、打者が**投げた後に踏み込んで**当たったか（フェーズBBB-84）。
+   * その球は死球にならずボール＝判定のバナーが理由を添える。
+   */
+  lastPitchSteppedInto(): boolean;
+  /**
+   * 直前に投げた球がワンバウンドしたか（Fの大きい投手のフォーク。フェーズBBB-79）。
+   * 判定のバナーに理由を添えるために出す＝本塁の上で跳ねる所は捕手の体に隠れることが
+   * あり、「真ん中なのにボール」の理由が画面から読めないため。
+   */
+  lastPitchBounced(): boolean;
   /**
    * この球が捕手のミット（CATCH_Z）へ届くまでの残り時間（秒）。isPitchLive() の間だけ
    * 意味を持つ（それ以外は0）。盗塁（説明書p13）の判定に使う：仕掛けた瞬間のこの値が
@@ -177,6 +200,11 @@ export interface PitchingController {
 export function createPitchingController(opts: {
   pitcher: THREE.Group;
   ball: THREE.Mesh;
+  /**
+   * 投げた球の地面の影（フェーズBBB-76。原作の球は必ず影を連れて飛ぶ）。地面に寝かせた
+   * 円で、置き場所と大きさは `dekkaiPitchLook` が球と一緒に決める。省略すれば影は出ない。
+   */
+  ballShadow?: THREE.Object3D;
   pad: VirtualPad;
   onJudged: (call: PitchCall) => void;
   /**
@@ -206,6 +234,19 @@ export function createPitchingController(opts: {
    */
   cpuBreak?: (sinceRelease: number, dt: number) => { steerX: -1 | 0 | 1; accel: number };
   /**
+   * CPUが投げるときの、リリースの瞬間の横速度（フェーズBBB-84。`CpuPitchShape.releaseVx`）。
+   * **逆を突く球だけ**が値を持つ（立ち位置どおりの球は 0＝狙いはリリース位置そのもの）。
+   * 人間の「投げる瞬間の左右」（説明書p19③）と同じ経路＝`releasePitchFlight` の初期横速度に入る。
+   * 省略時は 0＝BBB-83 までと同じ。
+   */
+  cpuReleaseVx?: () => number;
+  /**
+   * CPUが投げる**リリースの瞬間に一度だけ**呼ぶ（フェーズBBB-84。`cpuReleaseVx`・`cpuBreak` を
+   * 読む前）。CPU投手はここで打者の立ち位置を見て、踏み込んでいる打者の体へ行く球を
+   * 反対側へ投げ直す（`CpuPitcherController.atRelease`）。
+   */
+  cpuAtRelease?: () => void;
+  /**
    * 今マウンドにいる投手の能力値（フェーズB-8）。人間が投げるときの球速と変化量に効く
    * （CPUの球速は cpuReleaseSpeed 側で同じ能力値から決まる）。継投で変わるので毎回問い合わせる。
    * 省略時は基準値＝能力値を持ち込む前とまったく同じ球になる。
@@ -226,7 +267,8 @@ export function createPitchingController(opts: {
   /**
    * **人間が投げるときのコース入力の効き幅**（フェーズW-44。`courseReleaseVxFor` の引数）。
    * 制球スキルの上乗せ（名鑑のERAからの差）と疲労を渡す＝**どちらも無ければ従来と
-   * 完全に同じ 0.9**。CPUの球はリリース位置そのもので狙う（初期横速度は常に0）ので
+   * 完全に同じ 0.9**。CPUの球はふつうリリース位置そのもので狙い（初期横速度0）、逆を突く球
+   * だけが投げる前に解いた横速度を持つ（`cpuReleaseVx`。BBB-84）ので、この効き幅は
    * 関係しない＝CPU側の制球は `createCpuPitcherController` の `pitcherControl` が受け持つ。
    */
   pitcherCourse?: () => { controlBonus: number; fatigue: number };
@@ -241,6 +283,7 @@ export function createPitchingController(opts: {
   const {
     pitcher,
     ball,
+    ballShadow,
     pad,
     onJudged,
     onRelease,
@@ -248,6 +291,8 @@ export function createPitchingController(opts: {
     isCpuTurn,
     cpuReleaseSpeed,
     cpuBreak,
+    cpuReleaseVx,
+    cpuAtRelease,
     pitcherProfile,
     batterSide,
     batterStance,
@@ -276,8 +321,24 @@ export function createPitchingController(opts: {
    * フィールドプレー側へ渡した状態。投球の物理・判定は従来どおり進める。
    */
   let ballDetached = false;
-  /** リリースからの経過（フォロースルーの進行。フェーズE-25-(c)。見た目だけに使う） */
+  /** リリースからの経過（実時間。リリースの絵→守備の構えの切り替えに使う＝見た目だけ） */
   let sinceRelease = 0;
+  /**
+   * リリースからの**飛行の時間**（球速どおりの時計。CPUの曲げ方＝P-37 はこの時計で解いてある）。
+   * フォークは手元で時計が遅くなるので、実時間×倍率では出せない（BBB-77）。
+   */
+  let flightElapsed = 0;
+  /** 直前に投げた球の表示の球速 km/h（原作どおり投げた直後に出す。BBB-77） */
+  let lastKmh: number | null = null;
+  /** 直前に投げた球がワンバウンドしたか（判定のバナーに添える。BBB-79） */
+  let lastBounced = false;
+  /**
+   * リリースの瞬間の打者の立ち位置（フェーズBBB-84）。**投げた後に踏み込んで当たった球は
+   * 死球にしない**＝`judgePitch` が「ここに立ったままなら当たったか」を見るのに使う。
+   */
+  let releaseStance = 0;
+  /** 直前に投げた球に、打者が投げた後に踏み込んで当たったか（判定のバナーに添える。BBB-84） */
+  let lastSteppedInto = false;
 
   /** カメラが -Z を向くため、画面上の左右入力はワールドXと同じ向き（反転不要） */
   function worldSteerX(): -1 | 0 | 1 {
@@ -296,78 +357,88 @@ export function createPitchingController(opts: {
 
   function syncBallMesh(f: PitchFlight): void {
     if (ballDetached) return;
-    // **中心はその投手の基準速**（`neutralSpeedFor`）から取る（フェーズO-35で気づいて直した）。
-    // 従来はグローバルな `SPEED_NEUTRAL` を中心にしていたので、**速球派の投手のフォークは
-    // 「あまり遅くない球」として浅くしか沈まず**、軟投派の速球は伸びなかった。
-    const neutral = neutralSpeedFor(pitcherProfile?.().speed);
-    // **球はその投手の腕の先から出て、ミットへ落ちる**（MM-60＋フェーズPP-63）。
-    // 弧は `core/camera.ts` の `pitchArcPath`＝**リリースの高さからミットの高さへ重力で
-    // 落ちる放物線**で、大きさは飛行時間（＝球速）だけで決まる。基準速以上の球は弧なし
-    // ＝PP-63の前と完全に同じ直線。高低はゾーン判定に無関係（説明書p19準拠）なので
-    // **ここから下はすべて見た目だけ**（NN-61が置いていた地面の下限は、弧が必ずミットの
-    // 高さで終わるので構造的に不要になった）。
-    const path = pitchArcPath(f.z, f.vz, armReleaseHeight(arm()), pitchSlowness(f.vz, neutral));
-    // **画面上の大きさの距離補正（NN-61）と残像（PP-63）を1か所で組む**。残像は画面上の
-    // 進行方向へ伸ばす（旧実装はワールドZ＝視線に沿っていたので画面にほぼ出なかった）ので、
-    // 弧の傾きから縦の速度を作って渡す＝**弧と残像が同じ1つの式から出る**。
-    const look = dekkaiBallLook(
-      { x: f.x, y: path.y, z: f.z },
-      { x: f.vx, y: path.slope * f.vz, z: f.vz },
-      pitchFastness(f.vz, neutral),
-    );
+    // **原作の見え方で描く**（フェーズBBB-76。`core/camera.ts` の `dekkaiPitchLook`）：
+    // 球はその投手の腕の先（MM-60）からミットへの直線の上を、**画面上で等速に**下りてくる。
+    // 地面には影が付き、球の絵は途中で1回だけ大きくなる。**判定はこれを一切見ない**
+    // （描く場所を置き直すだけで、着く時刻は本当の球と同じ）。
+    const look = dekkaiPitchLook(f, armReleaseHeight(arm()));
     ball.position.set(look.center.x, look.center.y, look.center.z);
-    if (look.axis) {
-      // 伸ばす向きへローカル+Zを合わせてから、その軸だけ伸ばす（球なので他の軸は等倍）
-      TRAIL_AXIS.set(look.axis.x, look.axis.y, look.axis.z);
-      ball.quaternion.setFromUnitVectors(TRAIL_FROM, TRAIL_AXIS);
-    } else {
-      ball.quaternion.identity();
+    ball.quaternion.identity();
+    ball.scale.set(look.scale, look.scale, look.scale);
+    if (ballShadow) {
+      ballShadow.visible = true;
+      // 地面の模様（芝・土・本塁の板＝`fieldGround.ts` は y≦0.07）より上に置く＝埋もれない
+      ballShadow.position.set(look.shadow.x, 0.08, look.shadow.z);
+      // 地面に寝かせた円（ローカルXY）。ローカルYが奥行きの向きになる
+      ballShadow.scale.set(look.shadow.scale, look.shadow.scale * look.shadow.depthStretch, 1);
     }
-    ball.scale.set(look.scale, look.scale, look.scale * (1 + look.trail));
+  }
+
+  function hideShadow(): void {
+    if (ballShadow) ballShadow.visible = false;
   }
 
   /**
-   * 投球モーションの見た目（フェーズE-25-(c)）。**投球の進行そのものから毎フレーム
-   * 導出する**ので、モーションと球が食い違わない（振りかぶり中は必ず振りかぶって
-   * いるし、リリースの瞬間に必ず腕が出る）。判定側の値は一切見ない。
+   * 投球モーションの見た目（フェーズE-25-(c)→**BBB-76で原作の8枚の絵に**）。**投球の進行
+   * そのものから毎フレーム選ぶ**ので、モーションと球が食い違わない（リリースの絵が出る
+   * フレームに必ず球が手から出る）。判定側の値は一切見ない。
+   *
+   * 構えている間は `set`、モーション中は原作の時間割（`windupKeyAt`）、リリースの後は
+   * 原作どおり16フレームで守備の構え（`afterReleaseKeyAt`。最初の4フレームが球が手を離れた
+   * 形、残りが倒れ込み）。次の球の構え（ready）に戻るまで守備の構えのまま＝原作どおり。
    */
   function syncPitcherPose(): void {
     if (phase === 'ready') {
-      setPlayerPose(pitcher, { kind: 'idle' });
+      setPlayerPose(pitcher, { kind: 'pitch', key: 'set', arm: arm() });
       return;
     }
     if (phase === 'windup') {
-      const w = 1 - Math.max(timer, 0) / WINDUP_SEC;
-      setPlayerPose(pitcher, { kind: 'pitch', t: PITCH_RELEASE_T * w, arm: arm() });
+      setPlayerPose(pitcher, { kind: 'pitch', key: windupKeyAt(WINDUP_SEC - Math.max(timer, 0)), arm: arm() });
       return;
     }
-    // リリース後（飛行中・捕球後の間）はフォロースルーを取り切ってその姿勢で止まる
-    const f = Math.min(1, sinceRelease / PITCH_FOLLOW_SEC);
-    setPlayerPose(pitcher, {
-      kind: 'pitch',
-      t: PITCH_RELEASE_T + (1 - PITCH_RELEASE_T) * f,
-      arm: arm(),
-    });
+    setPlayerPose(pitcher, { kind: 'pitch', key: afterReleaseKeyAt(sinceRelease), arm: arm() });
   }
 
   function release(): void {
     phase = 'flight';
     // 球速：人間はワインドアップ中の上下事前選択、CPUは方針（plan）から。
     // コース：人間は「投げる瞬間」の左右入力を初期横速度に変換（説明書p19③）。
-    // CPUはリリース位置そのもので狙うため初期横速度は常に0（cpuPitcher.ts参照）。
+    // CPUはふつうリリース位置そのもので狙う（初期横速度0）。**逆を突く球だけ**、投げる前に
+    // 解いた横速度で反対の隅へ投げ分ける（フェーズBBB-84。cpuPitcher.ts の `planCpuPitchShape`）。
     const cpu = isCpuTurn?.() ?? false;
+    // 打者がいまどこに立っているかを覚える（投げた後に踏み込んで当たった球は死球にしない）。
+    // CPU投手はこの瞬間の立ち位置を見て、体へ行く球を反対側へ投げ直す（どちらもBBB-84）。
+    releaseStance = batterStance?.() ?? 0;
+    lastSteppedInto = false;
+    if (cpu) cpuAtRelease?.();
     const speed = resolvedReleaseSpeed();
     // 効き幅は制球（W-44）で増減する。**向きは入力どおりのまま**で、掛ける量だけが動く。
     const course = pitcherCourse?.();
-    const releaseVx =
-      cpu ? 0 : worldSteerX() * courseReleaseVxFor(course?.controlBonus, course?.fatigue);
+    const releaseVx = cpu
+      ? (cpuReleaseVx?.() ?? 0)
+      : worldSteerX() * courseReleaseVxFor(course?.controlBonus, course?.fatigue);
     // **ボールは体の中心ではなく腕の先から出る**（フェーズCC-50）。投手の位置は
     // 人間なら十字キーで動かしたプレート上の立ち位置、CPUなら `shape.plateX`（逆算で
     // 解いた立ち位置）なので、どちらの経路でも `plateX + 腕のずれ` の1本で済む。
-    flight = createPitchFlight(releaseXFor(pitcher.position.x, armReleaseOffsetX(arm())), speed, releaseVx);
+    // **飛行の時計は原作の速さ**（フェーズBBB-76／77。`releasePitchFlight`＝時計とフォークの
+    // 手元の失速を付ける）＝通り道は球速どおりのまま、着くまでの時間だけが変わる。
+    // 中心はその投手の基準速（速球・遅い球の判別に使う）。フォークがどこまで落ちるか
+    // （ワンバウンドするか）はその投手の変化量F（疲労込み。フェーズBBB-79）で決まる。
+    const profileNow = pitcherProfile?.();
+    const neutral = neutralSpeedFor(profileNow?.speed);
+    flight = releasePitchFlight(
+      releaseXFor(pitcher.position.x, armReleaseOffsetX(arm())),
+      speed,
+      releaseVx,
+      neutral,
+      profileNow?.fork,
+    );
+    lastKmh = displayPitchKmh(speed, neutral);
+    lastBounced = pitchBounces(flight);
     call = null;
     // ここからフォロースルー（見た目だけ。フェーズE-25-(c)）
     sinceRelease = 0;
+    flightElapsed = 0;
     if (!ballDetached) ball.visible = true;
     syncBallMesh(flight);
     // 投球数の記録は最後に。先に呼ぶと**この球自身が消耗の分を先取りしてしまう**
@@ -382,7 +453,8 @@ export function createPitchingController(opts: {
     flight = null;
     // 盗塁中はボールをちっちゃいモード側が使っている（走者を刺す送球）ので触らない
     if (!ballDetached) ball.visible = false;
-    // 投げ終わりの姿勢（フォロースルー）はそのまま。次の startPitch で構えへ戻る
+    hideShadow();
+    // 投げ終わりの姿勢（守備の構え）はそのまま。次の球の構え（ready）で `set` へ戻る
     onJudged(judged);
   }
 
@@ -436,7 +508,12 @@ export function createPitchingController(opts: {
           // **CPUのときは飛行中に判断せず、投げる前に解いた形をなぞるだけ**（フェーズP-37。
           // このステップが覆う区間は [sinceRelease − d, sinceRelease]＝上で先に進めてある）。
           const cpuTurn = isCpuTurn?.() ?? false;
-          const cpuSteer = cpuTurn ? cpuBreak?.(sinceRelease - d, d) : undefined;
+          // CPUの曲げ方は**球速どおりの飛行の時間**で解いてある（P-37）ので、その時計で問い合わせる
+          // （フェーズBBB-76。実時間のままだと、時計を速めた球では曲げる時間が足りず狙いを外れる）
+          // 区間の頭は**ここまでに進んだ飛行の時間**（`flightElapsed`）。フォークは手元で時計が
+          // 遅くなるので、実時間×倍率では数えない（BBB-77）。曲げるのはリリース直後だけ。
+          const r = flightRateAt(prev, prev.z);
+          const cpuSteer = cpuTurn ? cpuBreak?.(flightElapsed, d * r) : undefined;
           const steerX = cpuSteer ? cpuSteer.steerX : cpuTurn || !controlActive ? 0 : worldSteerX();
           // 曲がりの強さは投手の変化量（説明書のR/L/F）から。曲げる向きで別々の値を使う
           // ＝「カーブは大きいがシュートは小さい」といった持ち味が出る。
@@ -452,16 +529,21 @@ export function createPitchingController(opts: {
             ? cpuSteer.accel
             : steerAccelForSelection(speedSelection, breakAmount, profile?.fork);
           const next = stepPitchFlight(prev, steerX, d, accel);
+          if (prev.vz > 0) flightElapsed += (next.z - prev.z) / prev.vz;
           // スイング接触はコース判定より先（打った球はストライク/死球にならない）
           onFlightStep?.(prev, next, d);
           if (phase !== 'flight') break; // 接触で abortFlight された
           const crossX = plateCrossingX(prev, next);
           if (crossX !== null) {
-            call = judgePitch(
-              crossX,
-              batterSide?.() ?? RIGHT_BATTER_SIDE,
-              batterStance?.() ?? 0,
-            );
+            const side = batterSide?.() ?? RIGHT_BATTER_SIDE;
+            const stance = batterStance?.() ?? 0;
+            // ワンバウンドした球は見逃せばボール（フェーズBBB-79）
+            const bounced = pitchBounces(next);
+            // 投げた後に踏み込んで当たった球は死球にしない（フェーズBBB-84。リリースの瞬間の
+            // 位置なら当たらなかった球＝自分から当たりに行った球はボール）
+            call = judgePitch(crossX, side, stance, bounced, releaseStance);
+            lastSteppedInto =
+              call === 'ball' && judgePitch(crossX, side, stance, bounced) === 'hitByPitch';
           }
           if (call === 'hitByPitch') {
             // 打者に当たった球は捕手まで飛ばさない
@@ -490,24 +572,42 @@ export function createPitchingController(opts: {
 
     isPitchLive: () => phase === 'windup' || phase === 'flight',
 
+    runnersMayGo: () =>
+      phase === 'flight' || (phase === 'windup' && WINDUP_SEC - timer >= STEAL_GO_SEC - 1e-9),
+
+    ballZ: () => (phase === 'flight' && flight ? flight.z : null),
+
+    lastPitchKmh: () => lastKmh,
+
+    lastPitchBounced: () => lastBounced,
+    lastPitchSteppedInto: () => lastSteppedInto,
+
     timeToCatcher() {
       if (phase === 'windup') {
         // まだリリースしていないので、残りモーション＋リリース点から捕手までの飛行時間。
-        return Math.max(timer, 0) + (CATCH_Z - RELEASE_Z) / resolvedReleaseSpeed();
+        // 飛行は**リリースで作る球とまったく同じ球**で数える（時計とフォークの失速込み）。
+        const speed = resolvedReleaseSpeed();
+        const profileNow = pitcherProfile?.();
+        const ahead = releasePitchFlight(0, speed, 0, neutralSpeedFor(profileNow?.speed), profileNow?.fork);
+        return Math.max(timer, 0) + flightSecondsUntil(ahead, CATCH_Z);
       }
-      if (phase === 'flight' && flight) return Math.max(0, (CATCH_Z - flight.z) / flight.vz);
+      if (phase === 'flight' && flight) return Math.max(0, flightSecondsUntil(flight, CATCH_Z));
       return 0;
     },
 
     detachBall() {
       ballDetached = true;
+      hideShadow();
     },
 
     abortFlight() {
       phase = 'ready';
       flight = null;
       call = null;
-      setPlayerPose(pitcher, { kind: 'idle' });
+      // 打たれた球はここで終わり。**影は消す**（打った後の2フレームは球だけがバットの所に残る）。
+      // 投手の絵はリリースのまま＝打った瞬間の画面は原作どおり投げ終わりの投手が映る
+      // （次に update が来たとき ready として `set` に戻る）。
+      hideShadow();
     },
   };
 }
@@ -543,6 +643,18 @@ export interface CpuPitcherController {
   /** createPitchingController の cpuReleaseSpeed にそのまま渡す（リリース球速） */
   releaseSpeed(): number;
   /**
+   * **リリースの瞬間に一度だけ**呼ぶ（フェーズBBB-84。createPitchingController の cpuAtRelease）。
+   * 打者がいま立っている場所を見て、**踏み込んでいる打者の体へ行く球を反対側へ投げ直す**
+   * （`avoidCrowdingBatter`）。立ち位置（プレート上）は変わらない＝反対の隅へは、逆を突く球と
+   * 同じリリースの横速度で届く。当たらない球なら何も変えない。
+   */
+  atRelease(): void;
+  /**
+   * createPitchingController の cpuReleaseVx にそのまま渡す（フェーズBBB-84）。
+   * 逆を突く球だけが値を持つ（解いた形を読み出すだけ）。
+   */
+  releaseVx(): number;
+  /**
    * createPitchingController の cpuBreak にそのまま渡す（フェーズP-37）。
    * 投げる前に解いた形（`planCpuPitchShape`）を読み出すだけで、ここでは何も判断しない。
    */
@@ -555,6 +667,9 @@ export interface CpuPitcherController {
   /**
    * 決めた狙いと球の形を読むだけ（フェーズYY-73。読みの札＝`テレパシー`・`未来視`・`心眼` が
    * 画面に出す）。まだ決めていなければ null。**ここから何かを変えることはできない**。
+   * 投げる前は**打者がいまの立ち位置のまま投げられたときの球**を返す（フェーズBBB-84。
+   * 踏み込んでいれば、体へ行く球は反対側へ投げ直される＝`atRelease` と同じ規則）
+   * ＝読みの札の予言は、打者が動いても外れない。
    */
   peek(): { plan: CpuPitchPlan; shape: CpuPitchShape } | null;
 }
@@ -597,12 +712,62 @@ export function createCpuPitcherController(
      * 省略時は 0＝SS-67の前とまったく同じ配球。
      */
     foulsInAtBat?: () => number;
+    /**
+     * この1球の内外角を引く（フェーズBBB-84。`drawCpuPitchSides`）。**1球につき1回だけ呼ぶ**
+     * ＝系列は1球ぶんずつ進む。試合のシードから起こした別系列を main.ts が持つ。
+     * 省略時は BBB-83 までの規則（ボール数＋ファウル数の偶奇・必ず立ち位置どおり）。
+     */
+    pitchSides?: () => CpuPitchSides;
+    /**
+     * この1球の配球のくじを引く（フェーズCCC-86。`drawCpuPitchMix`）。**1球につき1回だけ呼ぶ**。
+     * くじが当たった球だけ、いつもの球速（カウントの傾向）から外す／追い込んだ1球をゾーンの隅へ
+     * 勝負に行かせる。省略時は CCC-86 の前（球速はカウントだけで決まり、追い込んだ1球は必ず外へ）。
+     */
+    pitchMix?: () => CpuPitchMix;
+    /**
+     * いまの打者の打席の左右（フェーズBBB-84）。**逆を突くのは打者の外角側に立って内角の
+     * ストライクへ投げるときだけ**なので、どちらが内角かが要る。省略時は右打者。
+     */
+    batterSide?: () => BatterSide;
+    /**
+     * いまの打者の打席内の立ち位置（フェーズBBB-84。`BattingController.stanceOffset`）。
+     * **リリースの瞬間に**見て、踏み込んでいる打者の体へ行く球を反対側へ投げ直す。
+     * 省略時は 0＝打席の中央。
+     */
+    batterStance?: () => number;
   } = {},
 ): CpuPitcherController {
-  const { pitcherProfile, pitcherControl, pitcherArm, foulsInAtBat } = opts;
+  const {
+    pitcherProfile,
+    pitcherControl,
+    pitcherArm,
+    foulsInAtBat,
+    pitchSides,
+    pitchMix,
+    batterSide,
+    batterStance,
+  } = opts;
   let plan: CpuPitchPlan | null = null;
   /** その球の形（リリース位置・曲げ方）。plan と同時に解いて1球のあいだ使い回す */
   let shape: CpuPitchShape | null = null;
+  /** 形を解くのに使った能力値と腕のずれ（リリースの瞬間に同じもので解き直す） */
+  let solvedWith: { profile: PitchProfile | undefined; releaseOffset: number } | null = null;
+  /** リリースを過ぎたか（過ぎた後は、決めた球をそのまま返す） */
+  let released = false;
+
+  /**
+   * 打者がいまの立ち位置のままなら投げる球（踏み込んでいる打者の体へ行く球は反対側へ）。
+   * 立ち位置（`plateX`）は元の球と同じ場所になる＝投手は動かない。
+   */
+  function answerTo(stance: number): { plan: CpuPitchPlan; shape: CpuPitchShape } | null {
+    if (!plan || !shape || !solvedWith) return null;
+    const next = avoidCrowdingBatter(plan, batterSide?.() ?? RIGHT_BATTER_SIDE, stance);
+    if (next === plan) return { plan, shape };
+    return {
+      plan: next,
+      shape: planCpuPitchShape(next, solvedWith.profile, undefined, solvedWith.releaseOffset),
+    };
+  }
   let timer = 0;
   /** けん制の「間」の計時。1球ごとに reset() で仕切り直す */
   let pickoffTimer = 0;
@@ -619,15 +784,24 @@ export function createCpuPitcherController(
           cpuPitcherStyle(profile),
           pitcherControl?.(),
           foulsInAtBat?.() ?? 0,
+          // ワンバウンドするフォーク（Fの大きい投手。疲労込み）は投手有利のカウントでだけ
+          // 投げる（フェーズBBB-79）。立つ側は引いた側（フェーズBBB-84）＝逆を突く球
+          // （打者の外角側に立って内角のストライクへ）なら、下で解く立ち位置は
+          // 「立っている側の隅へ投げるとき」と同じ場所になる
+          {
+            bouncingFork: forkBounces(profile?.fork ?? NEUTRAL_RATING),
+            sides: pitchSides?.(),
+            batterSide: batterSide?.(),
+            // 緩急はいつもの球速（カウントの傾向）から、くじが当たったときだけ外す。追い込んだ1球は
+            // くじが当たれば外へ逃げずにゾーンの隅へ勝負に行く（どちらもフェーズCCC-86）
+            mix: pitchMix?.(),
+          },
         );
-        // 曲がりを織り込んだリリース位置をここで解く。以後この球の間は解き直さない
-        // （＝球速も曲がりも「投げると決めた瞬間の能力値」で一貫する）。
-        shape = planCpuPitchShape(
-          plan,
-          profile,
-          undefined,
-          armReleaseOffsetX(pitcherArm?.() ?? NEUTRAL_PITCH_ARM),
-        );
+        // 曲がりを織り込んだリリース位置をここで解く。球速も曲がりも「投げると決めた瞬間の
+        // 能力値」で一貫する（リリースの瞬間に反対側へ投げ直すときも、同じ値で解く）。
+        solvedWith = { profile, releaseOffset: armReleaseOffsetX(pitcherArm?.() ?? NEUTRAL_PITCH_ARM) };
+        released = false;
+        shape = planCpuPitchShape(plan, profile, undefined, solvedWith.releaseOffset);
         // CPUは狙いを決めた位置へ一度で移る（＝歩いて動いたのではない）ので snap。
         // **置くのは体（`plateX`）**で、ボールはそこから腕のぶん外れた `releaseX` から出る
         // （フェーズCC-50。投球側の `release()` が同じ式で解き直す）。
@@ -661,6 +835,20 @@ export function createCpuPitcherController(
       return shape ? shape.speed : SPEED_NEUTRAL;
     },
 
+    atRelease() {
+      // 打者がいま立っている場所を見て決め直す（踏み込んでいる打者の体へは投げない）
+      const answer = answerTo(batterStance?.() ?? 0);
+      if (answer) {
+        plan = answer.plan;
+        shape = answer.shape;
+      }
+      released = true;
+    },
+
+    releaseVx() {
+      return shape ? shape.releaseVx : 0;
+    },
+
     breakAt(sinceRelease, dt) {
       if (!shape) return { steerX: 0, accel: 0 };
       return { steerX: shape.steerX, accel: cpuSteerAccelAt(shape, sinceRelease, dt) };
@@ -669,11 +857,14 @@ export function createCpuPitcherController(
     reset() {
       plan = null;
       shape = null;
+      solvedWith = null;
+      released = false;
       pickoffTimer = 0;
     },
 
     peek() {
-      return plan && shape ? { plan, shape } : null;
+      if (!plan || !shape) return null;
+      return released ? { plan, shape } : answerTo(batterStance?.() ?? 0);
     },
   };
 }
@@ -682,44 +873,13 @@ export function createCpuPitcherController(
 
 /**
  * 接触ウィンドウの終端（ここまでにKを離せばバントに切り替わる＝説明書p14）。
- * **当たる瞬間までの振りの速さもここから決まる**（進行度 = 経過 ÷ この時間。RR-66で
- * 実機に合わせた「バット先端が本塁を通る時刻＝判定の芯」はこの速さの上に乗っている）。
  */
 const SWING_SWEEP_SEC = SWING_STARTUP_SEC + SWING_ACTIVE_SEC;
-/** 当たる瞬間の進行度（`player.ts` の `SWING_CONTACT_P` と同じ値＝判定の芯の時刻） */
-const SWING_CONTACT_P = SWING_IDEAL_SEC / SWING_SWEEP_SEC;
 /**
- * 当たる瞬間から振り切るまでの時間。**打球が飛んでちっちゃいモードへ切り替わるまでの間
- * （`CONTACT_FOLLOW_SEC`＝0.16秒）に振り切りが終わる**長さ＝打った瞬間の画面でも
- * フィニッシュまで見える。
- */
-const SWING_FOLLOW_SEC = 0.16;
-/** 振り切った形（フィニッシュ）で止まっている時間 */
-const SWING_HOLD_SEC = 0.22;
-/** フィニッシュから構えへ戻る時間（**振った道を逆にはたどらない**） */
-const SWING_RECOVER_SEC = 0.3;
-const SWING_TOTAL_SEC = SWING_IDEAL_SEC + SWING_FOLLOW_SEC + SWING_HOLD_SEC + SWING_RECOVER_SEC;
-/**
- * 当たる瞬間より後に体がさらに回る角度（振り切り）。当たる瞬間までの回転
- * （`SWING_YAW_RANGE × SWING_CONTACT_P`）と合わせて、**胸が投手を越えるまで回り切る**。
- */
-const SWING_FOLLOW_YAW = 0.45;
-/**
- * 構えのヨー角と、フルスイングまでの回転量（プレースホルダー人形の簡易モーション）。
- * いずれも**右打者基準**で、左打者は打者ローカルの鏡像＝ヨー角の符号を反転して使う
- * （applyStance 参照）。
+ * 構えのヨー角（右打者基準。左打者は打者ローカルの鏡像＝ヨー角の符号を反転して使う
+ * ＝applyStance 参照）。スイングで体が回る量は絵ごとに `swingKeyYaw`（`entities/player.ts`）。
  */
 const STANCE_YAW = 0.6;
-/**
- * スイングで体が回る角度。**フェーズRR-66で 2.4→1.6**：実機で計測したところ、
- * **バット先端が本塁の上を通るのが t=0.067秒**なのに対し、**判定が芯と言うのは
- * t=0.090秒**（`SWING_IDEAL_SEC`）で、**当たった瞬間に止まる画面（ヒットストップ）では
- * バットがもう振り抜かれた後**になっていた。回る速さを落とすと通過が 0.089秒＝
- * **判定の芯とそろう**（実測）。振り抜きそのものは腕の伸び（`applySwing`）が担う。
- */
-const SWING_YAW_RANGE = 1.6;
-/** バントの姿勢（バットを投手方向へ出して止めた角度。振り抜かないので固定） */
-const BUNT_YAW = -0.35;
 /**
  * バットの長さ（握りから先端まで。バットは手のノードの子＝握りが原点）。
  *
@@ -756,8 +916,15 @@ const ENTRANCE_DELAY_RATIO = 0.35;
 const HOT_BAT_SPIN_RATE = 7;
 
 export interface BattingController {
-  /** Aボタン押下で呼ぶ。1球につき1スイングのみ受け付ける */
-  trySwing(): boolean;
+  /**
+   * Aボタン押下で呼ぶ。1球につき1スイングのみ受け付ける。
+   *
+   * `startSec` は**このフレームの先頭の時点でのスイングの経過時間**（既定0＝フレームの
+   * 先頭で振り出した）。CPU打者はフレームの途中の決まった瞬間に振り出すので、その分を
+   * 負の値で渡す（`cpuBatter.ts` の `cpuSwingClockAt`。フェーズAAA-75）＝**どの
+   * リフレッシュレートでも同じ時刻に振り出す**。人間は押した瞬間がフレームの先頭なので0。
+   */
+  trySwing(startSec?: number): boolean;
   /** PitchingController の onFlightStep に結線する（飛行1ステップごとの接触判定） */
   checkContact(prev: PitchFlight, next: PitchFlight, dt: number): void;
   /** 毎フレーム呼ぶ（スイングモーションの進行） */
@@ -1016,34 +1183,6 @@ export function createBattingController(opts: {
   }
 
   /**
-   * スイングの進行度（`p`：0=構え / `SWING_CONTACT_P`=当たる瞬間 / 1=振り切り）と、
-   * フィニッシュから構えへ戻る割合（`recover`）。**体のヨー（振り）も腕の姿勢もこの2つから
-   * 起こす**ので、「体は振り切っているのに腕は構えのまま」がフレーム単位でも起きない。
-   *
-   * **当たる瞬間までは従来とまったく同じ速さ**（判定の芯とバットが本塁を通る時刻は RR-66 の
-   * まま）。それより後は減速しながら振り切り、少し止まってから、**振った道を逆にたどらずに**
-   * 構えへ戻る（テストプレイ「振り切ったバットが中途半端な位置で止まる」＝旧実装は振り抜きの
-   * 形を0.045秒しか見せず、すぐにスイングを逆再生して構えへ戻していた）。
-   */
-  function swingProgress(t: number): { p: number; recover: number } {
-    if (t <= SWING_IDEAL_SEC) return { p: t / SWING_SWEEP_SEC, recover: 0 };
-    const u = Math.min(1, (t - SWING_IDEAL_SEC) / SWING_FOLLOW_SEC);
-    const eased = 1 - (1 - u) * (1 - u);
-    const p = SWING_CONTACT_P + (1 - SWING_CONTACT_P) * eased;
-    const back = t - SWING_IDEAL_SEC - SWING_FOLLOW_SEC - SWING_HOLD_SEC;
-    if (back <= 0) return { p, recover: 0 };
-    const rr = Math.min(1, back / SWING_RECOVER_SEC);
-    return { p, recover: rr * rr * (3 - 2 * rr) };
-  }
-
-  /** 体のヨー（構えからどれだけ回したか）。当たる瞬間までは従来の速さ、その後は振り切り */
-  function swingYaw(p: number, recover: number): number {
-    const toContact = SWING_YAW_RANGE * Math.min(p, SWING_CONTACT_P);
-    const follow = Math.max(0, (p - SWING_CONTACT_P) / (1 - SWING_CONTACT_P));
-    return (toContact + SWING_FOLLOW_YAW * follow) * (1 - recover);
-  }
-
-  /**
    * 打者の見た目を書く唯一の場所（体のヨー＝振り／関節の姿勢）。打撃動作の状態
    * （構え・バント・スイング）から毎回導出するので、**姿勢の書き残し**が起きない。
    */
@@ -1054,23 +1193,25 @@ export function createBattingController(opts: {
       return;
     }
     if (bunting) {
-      batter.rotation.y = stanceSide * BUNT_YAW;
+      batter.rotation.y = stanceSide * (STANCE_YAW - BUNT_BODY_YAW);
       setPlayerPose(batter, { kind: 'bunt', side: stanceSide });
       return;
     }
-    const { p, recover } = swingProgress(swingT);
-    batter.rotation.y = stanceSide * (STANCE_YAW - swingYaw(p, recover));
-    setPlayerPose(batter, { kind: 'swing', side: stanceSide, t: p, recover });
+    // **原作の5枚の絵を切り替える**（フェーズBBB-76。`core/keyframes.ts`）。体のヨーも
+    // 絵ごとに決まっている（`swingKeyYaw`）＝絵の間を補間しない（コマ送り）。
+    const key = swingKeyAt(swingT);
+    batter.rotation.y = stanceSide * (STANCE_YAW - swingKeyYaw(key));
+    setPlayerPose(batter, { kind: 'swing', side: stanceSide, key });
   }
   syncBatterPose();
 
   return {
-    trySwing() {
+    trySwing(startSec = 0) {
       if (swung) return false;
-      // 前のスイングがフィニッシュ（止まっている形・構えへ戻る途中）にあれば、振り直せる
-      // （振り切りを最後まで見せるようにしたので、次の球のほうが先に来ても振れなくならない）
-      if (swingT !== null && (bunting || swingT < SWING_IDEAL_SEC + SWING_FOLLOW_SEC)) return false;
-      swingT = 0;
+      // 前のスイングが振り切った形（止まっている形・構えへ戻る途中）にあれば、振り直せる
+      // （原作どおり0.68秒止めるので、次の球のほうが先に来ても振れなくならない）
+      if (swingT !== null && (bunting || swingT < SWING_FINISH_FROM)) return false;
+      swingT = Math.min(0, startSec);
       swung = true;
       contacted = false;
       bunting = false;
@@ -1093,6 +1234,8 @@ export function createBattingController(opts: {
               // swingT はフレーム先頭時点の経過なので、サブフレームの通過時刻を足す
               swingTime: swingT + cross.frac * dt,
               pitchSpeed: prev.vz,
+              // 打球に乗るのは緩急ぶんだけ＝投げた投手の基準速は球が持っている（BBB-85）
+              pitcherNeutral: prev.neutral,
             },
             batterProfile?.(),
             stanceSide,

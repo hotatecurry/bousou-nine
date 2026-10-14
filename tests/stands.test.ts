@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  FIELDER_WALL_MARGIN,
   FOUL_MARGIN,
   SEAT_BACK_OFFSET,
   SEAT_SURFACE_Y,
@@ -7,6 +8,7 @@ import {
   STAND_RISE,
   STAND_STEP_DEG,
   STAND_TREAD,
+  clampToPark,
   normalizeDeg,
   outerWallDistance,
   ringRow,
@@ -282,5 +284,40 @@ describe('standSurfaceHeight（観客席に落ちた球が止まる面。見た�
   it('最上段より後ろ（スタンドの外）は地面', () => {
     const p = pointAt(0, standFrontDistance(park, 0) + (rows + 2) * STAND_TREAD);
     expect(standSurfaceHeight(park, rows, p.x, p.z)).toBe(0);
+  });
+});
+
+describe('clampToPark（野手が行ける範囲。フェーズBBB-77）', () => {
+  // それまでは本塁から半径98mの円で止めていた（フェンスが半径100mの円だった頃の名残）＝
+  // 中堅のフェンスの20m以上手前に見えない壁があった。
+  it('中堅のフェンス際（壁の1m手前）まで行ける＝98mで止まらない', () => {
+    for (const park of BALLPARKS) {
+      const fence = outerWallDistance(park, 0);
+      const p = pointAt(0, fence - FIELDER_WALL_MARGIN - 0.5);
+      const before = { ...p };
+      clampToPark(park, p);
+      expect(p).toEqual(before);
+      expect(Math.hypot(p.x, p.z)).toBeGreaterThan(98);
+    }
+  });
+
+  it('壁の向こうへは出ない（どの方角でも外周の1m手前で止まる）', () => {
+    for (const park of BALLPARKS) {
+      for (const deg of [-80, -45, -20, 0, 20, 45, 80]) {
+        const p = pointAt(deg, 300);
+        clampToPark(park, p);
+        expect(Math.hypot(p.x, p.z)).toBeCloseTo(outerWallDistance(park, deg) - FIELDER_WALL_MARGIN, 6);
+      }
+    }
+  });
+
+  it('方角は保つ（壁の手前へ縮めるだけ）／本塁の上では何もしない', () => {
+    const park = BALLPARKS[0];
+    const p = pointAt(30, 400);
+    clampToPark(park, p);
+    expect(Math.atan2(p.x, -p.z) / DEG).toBeCloseTo(30, 9);
+    const home = { x: 0, z: 0 };
+    clampToPark(park, home);
+    expect(home).toEqual({ x: 0, z: 0 });
   });
 });

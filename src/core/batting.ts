@@ -23,6 +23,7 @@ import {
   type BatterSide,
   type PitchCall,
   type PitchFlight,
+  REFERENCE_PITCHER_NEUTRAL,
   RIGHT_BATTER_SIDE,
   batterFrameX,
   clampStance,
@@ -132,6 +133,13 @@ export const LAUNCH_TILT_DEG = 30;
  * 打球初速 = (BASE + CARRY×球速 + 長打力×`EXIT_POWER_BONUS`) × 質。
  * 速球ほど飛ぶ＝速球は打たれたときのリスクが大きい。
  *
+ * **ここで言う球速は「緩急」のほう**（フェーズBBB-85。`carriedPitchSpeed`）：乗るのは
+ * 基準の投手が同じ緩急で投げたときの球速で、**投手の球速（SPD）そのものは乗らない**。
+ * それまでは球の速い投手ほど打球が飛び、CPU打者のタイミングは投手ごとの相対で決まるので、
+ * **球速はCPU打者相手に損にしかなっていなかった**（計測：球速 0.3→0.9 で長打 7→16%/打席・
+ * 三振は 20% のまま。テストプレイ「CPUが長打を出しすぎる。こちらの投手は球速のスキルを
+ * 持っているのに」）。
+ *
  * **フェーズRR-66で 22→20 へ下げ、長打力の幅を 6→10 へ広げた**（テストプレイの
  * 「相変わらずホームランが出すぎる」）。それまで**長打力0.2の打者でも、CPUの初球
  * （必ず速球）を芯で捉えれば94%が本塁打**だった＝**打者の差（最大6m/s）が
@@ -191,13 +199,13 @@ export const AVG_MISHIT_RELIEF = 0.5;
 /**
  * 疲労MAXの投手から打ったときに打球初速へ上乗せされる量 m/s（フェーズB-11の「球威」）。
  *
- * **これが無いと疲労は打者にとって不利になる**：初速は `EXIT_PITCH_CARRY * 球速` を
- * 含むので、疲労で球速だけ落とすと打球はむしろ飛ばなくなる（「速球ほど打たれたときの
- * リスクが大きい」という既存の設計の裏返し）。疲労の球速低下ぶん（-4.2m/s × 0.5 =
- * -2.1m/s）を上回る +5 を置くことで、差し引き約 +3m/s ＝**長打力 +0.5 相当が全打者に
- * 乗る**（実測でフェンスを越えるか手前で失速するかが入れ替わる幅）。
+ * **フェーズBBB-85で 5→2.9**。B-11 の +5 は、疲労で球速が落ちるぶん打球が弱くなる
+ * （-4.2m/s × `EXIT_PITCH_CARRY` = -2.1m/s）のを上回らせるための値で、差し引きは +2.9m/s
+ * だった。いまは投手の球速そのものが打球に乗らない（`carriedPitchSpeed`）ので、落ちるぶんが
+ * 無い＝**差し引きの +2.9 をそのまま置く**。疲れた投手から打った打球は BBB-85 の前と同じ。
+ * `tests/batting.test.ts` がこの導出（5 − 0.5 × 0.35 × 12）を固定する。
  */
-export const EXIT_FATIGUE_BONUS = 5;
+export const EXIT_FATIGUE_BONUS = 2.9;
 
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
@@ -211,18 +219,35 @@ function clamp01(v: number): number {
  */
 export const BUNT_EXIT_SPEED = 11;
 /**
- * 押しバント（プッシュバント）の初速 m/s（十字キー上。フェーズY-46）。
+ * 押しバント（プッシュバント）の初速 m/s（十字キー上。フェーズY-46 → BBB-82で 17→13 →
+ * BBB-85で 13→13.5）。
  *
- * **値は `npm run balance:bunt` が決めた**＝ファウルライン際（±44°）へ転がしたとき、
- * **投手が拾い上げるまでの時間がいちばん長くなる**初速。速すぎると三塁手・一塁手の
- * 立っている塁まで転がって（18m/s以上）その場で拾われ、遅すぎれば従来どおり本塁の
- * すぐ近くで拾われる。17m/s のとき本塁から20mの地点・確保 1.90秒で、**捕手が盗塁を
- * 刺す経路（2.74秒）より守備が遅くなる**＝転がすことが走者を助ける側に初めて回る。
+ * **値は `npm run balance:bunt` が決めた**。ファウルライン際（±44°）へ転がすと、標準のバント
+ * （11m/s）より遠くで止まって**投手が拾い上げるまでの時間が延びる**（1.82→1.98秒・本塁から
+ * 12→14m）＝先頭の走者に 0.14秒が足される（標準のバントで生きるのは走力0.8以上の走者だけ、
+ * 押せば平均より少し速い走者から生きる）。捕手が盗塁を刺す経路（2.74秒）よりも守備は遅い。
  *
- * **方向を外すと逆に罰が来る**（これが押しのリスク）：正面〜-20°へ押すと**投手が
- * 空中で捕る小フライ**になり、-30°でも 0.82秒＝標準のバント（1.00秒）より速く拾われる。
+ * **BBB-82（野手の足を原作の 6.0m/s に）で解き直した**。Y-46 の 17m/s は「投手の確保が
+ * いちばん遅れる初速」で決めたが、投手が遅くなると：
+ * - **17m/s は三塁手の立つ塁の手前まで転がる**（投手が追いつけない）。そこから一塁へは遠いので
+ *   **足の速い打者（走力0.8以上＝名鑑176人中32人）が必ず内野安打になる**。
+ * - **16〜16.5m/s は投手の確保が 2.6秒前後まで遅れ、誰が打っても全員セーフ**（14〜15m/s でも
+ *   足の速い打者は生きる）＝アウトを差し出さない送りバント（Y-46 が「強すぎる」として塞いだ形）。
+ *
+ * そこで基準を**「いちばん足の速い打者でも一塁で刺される、いちばん大きい初速」**に置き直した
+ * （13.75 まで。余裕を取って 13＝最速の打者でも 0.16秒差でアウト）＝**バントはアウトと
+ * 引き換えの手**のまま。スクイズ（三塁走者の本塁突入）もこの初速では成立しない。
+ *
+ * **方向を外すと得は無い**：正面へ押すと投手の正面（0.87秒で拾われる＝標準の 0.98秒より速い）。
+ *
+ * **BBB-85（野手の足 6.0→7.0・CPU守備の反応 0.25→0.45秒）で 13→13.5**。投手の足が速くなった
+ * ぶん、13 のままだと基準速の走者が 0.10秒差でアウト（BBB-83 は 0.05秒差）まで離れた。
+ * **BBB-83 と同じ余裕になる初速**へ解き直した：13.5 で、いちばん足の速い打者は一塁で
+ * 0.16秒差のアウト・スクイズは 0.11秒差で不成立（どちらも BBB-83 と同じ値）、先頭の走者は
+ * 基準速で 0.08秒差のアウト・最速で 0.19秒差のセーフ（`npm run balance:bunt` の4c段目）。
+ * 14 まで上げると基準速の走者がほぼ同着（0.06秒差）になるが、スクイズが 0.06秒差まで近づく。
  */
-export const BUNT_PUSH_EXIT_SPEED = 17;
+export const BUNT_PUSH_EXIT_SPEED = 13.5;
 /**
  * バントの打ち上げ角（転がすので浅い）。
  * **フェーズRR-66で 7→8**：抗力を上げた（0.0006→0.0012）ぶん打球が早く死ぬので、
@@ -317,6 +342,29 @@ export interface SwingSample {
   swingTime: number;
   /** 通過時の球速 m/s */
   pitchSpeed: number;
+  /**
+   * その球を投げた投手の基準速 m/s（`PitchFlight.neutral`。フェーズBBB-85）。渡すと、打球に乗るのは
+   * **その投手の基準速からの緩急ぶん**だけになる（`carriedPitchSpeed`）。ゲーム本体は必ず渡す。
+   * 渡さなければ球速がそのまま乗る（投手を持たない素の球＝テストと一様な格子の計測）。
+   */
+  pitcherNeutral?: number;
+}
+
+/**
+ * 打球の強さに乗る球速 m/s＝**基準の投手（`REFERENCE_PITCHER_NEUTRAL`）が同じ緩急で投げたときの
+ * 球速**（フェーズBBB-85）。
+ *
+ * 速球は基準速より速いぶん飛び、遅い球は飛ばない（「速球ほど打たれたときのリスクが大きい」は
+ * そのまま）。**投手の球速（SPD）そのものは打球の強さに乗らない**＝球の速い投手ほど打たれたら
+ * 飛ぶ、にはしない。疲れて球速が落ちても、打球は弱くならない（球威の上乗せ `EXIT_FATIGUE_BONUS` は
+ * そのぶんを差し引いた値にしてある）。
+ *
+ * `pitcherNeutral` を渡さなければ球速そのもの＝投手を持たない素の球。
+ */
+export function carriedPitchSpeed(pitchSpeed: number, pitcherNeutral?: number): number {
+  return pitcherNeutral === undefined
+    ? pitchSpeed
+    : REFERENCE_PITCHER_NEUTRAL + (pitchSpeed - pitcherNeutral);
 }
 
 /** 打球の初速ベクトル（ワールド座標。外野方向は -Z） */
@@ -355,7 +403,7 @@ export function judgeSwing(
   pitcherFatigue = 0,
   stance = 0,
 ): BattedBallLaunch | null {
-  const { crossX, swingTime, pitchSpeed } = sample;
+  const { crossX, swingTime, pitchSpeed, pitcherNeutral } = sample;
   if (swingTime < SWING_STARTUP_SEC || swingTime > SWING_STARTUP_SEC + SWING_ACTIVE_SEC) {
     return null;
   }
@@ -380,7 +428,7 @@ export function judgeSwing(
     (1 - COURSE_SPEED_PENALTY * Math.abs(course) * relief);
   const speed =
     (EXIT_SPEED_BASE +
-      EXIT_PITCH_CARRY * pitchSpeed +
+      EXIT_PITCH_CARRY * carriedPitchSpeed(pitchSpeed, pitcherNeutral) +
       EXIT_POWER_BONUS * clamp01(batter.power) +
       EXIT_FATIGUE_BONUS * clamp01(pitcherFatigue)) *
     quality;

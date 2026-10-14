@@ -32,6 +32,10 @@
  * - **17m/s は帯の内側でいちばん遠くへ転がる値**（4b段目）＝弱いと捕手が空中で捕る
  *   小フライ、強いと三塁手の立っている三塁まで転がる。**正面へ押すと投手が空中で捕る**
  *   （4段目）＝押しは方向を当てて初めて得。
+ *   → **フェーズBBB-82（野手の足を原作の 6.0m/s に）で 17→13 へ解き直した**：投手が遅く
+ *   なって、17m/s は三塁手の手前まで転がる（足の速い打者が必ず内野安打）／16〜16.5m/s は
+ *   誰が打っても全員セーフ。基準を「いちばん足の速い打者でも一塁で刺される最大の初速」へ
+ *   置き直した（4c段目）。
  * - **CPUにはバントを入れない**（8段目）＝得になるのは「無死・走者一塁・長打力0.45以下」
  *   の1場面だけ（+0.6〜+1.6pt）で、しかも走者を同時に走らせる必要がある。
  *
@@ -86,7 +90,7 @@ import {
 import { chooseCpuPitchPlan } from '../../src/core/cpuPitcher';
 import { pitcherControl } from '../../src/core/roster';
 import { TEAMS, fielderRowStats, pitcherRowPitching } from '../../src/core/teams';
-import { CATCH_MIN_PLAY_SEC, CPU_POSSESSED_REACTION_SEC, SIM_DT, simulatePlay } from './sim';
+import { CATCH_MIN_PLAY_SEC, PICKUP_THROW_DELAY_SEC, SIM_DT, simulatePlay } from './sim';
 import {
   type PaDistribution,
   type ScoreProbability,
@@ -167,7 +171,11 @@ const TO_FIRST: Leg = { from: 'home', to: 'first' };
 interface Levers {
   /** 走者が打球の瞬間に持っているリード m（現状 0＝打球で塁に戻される） */
   lead: number;
-  /** 確保→送球の持ち替え s（現状は CPU の反応 0.25 のみ） */
+  /**
+   * 確保→送球の持ち替えへ**足すぶん** s。現状（0）でも拾ってからの持ち替え
+   * （`PICKUP_RELEASE_SEC`＝0.35秒。フェーズBBB-82）は入っている＝Y-46 の当時は CPU の反応
+   * 0.25秒だけだった。
+   */
   transfer: number;
   /** 打球の瞬間までに走っていた秒数（H-28のヒットエンドラン＝走らせてから転がす。現状 0） */
   head: number;
@@ -178,7 +186,7 @@ const lv = (o: Partial<Levers>): Levers => ({ ...NOW, ...o });
 /** その塁への送球1本が届く時刻（打球の瞬間から） */
 function throwArrival(f: Fielded, to: BaseKey, lv: Levers): number {
   return (
-    f.sec + CPU_POSSESSED_REACTION_SEC + lv.transfer + distance(f.pos, BASE_POSITIONS[to]) / THROW_SPEED
+    f.sec + PICKUP_THROW_DELAY_SEC + lv.transfer + distance(f.pos, BASE_POSITIONS[to]) / THROW_SPEED
   );
 }
 
@@ -197,7 +205,7 @@ function runnerArrival(leg: Leg, speed: number, l: Levers): number {
  */
 function retires(f: Fielded, leg: Leg, speed: number, l: Levers = NOW): boolean {
   if (f.spoiled !== null) return false;
-  const release = f.sec + CPU_POSSESSED_REACTION_SEC + l.transfer;
+  const release = f.sec + PICKUP_THROW_DELAY_SEC + l.transfer;
   const arriveRadiusSec = BASE_ARRIVE_RADIUS / speed;
   if (release >= runnerArrival(leg, speed, l) - arriveRadiusSec) return false;
   return throwArrival(f, leg.to, l) < runnerArrival(leg, speed, l);
@@ -445,6 +453,42 @@ for (let speed = 9; speed <= 21; speed += 1) {
   );
 }
 
+// ---- 4c. 押しの初速を解き直す（フェーズBBB-82。野手の足を原作の 6.0m/s にした後） ----
+//
+// 見るのは3つ：**先頭の走者（一塁→二塁）が生きるか**／**打者が一塁で生きてしまわないか**
+// （生きれば「アウトと引き換え」ではなくなる）／**三塁走者が還れてしまわないか**（スクイズ）。
+// 採る値＝**走力1.0の打者でも一塁で刺される、いちばん大きい初速**。
+{
+  console.log('\n=== 4c. 押しの初速（三塁線 -44°・リード 3.5m。余裕s＝正なら走者の勝ち） ===');
+  console.log(
+    `${'初速'.padEnd(8)}${'拾う'.padEnd(6)}` +
+      row(['確保s', '本塁から', '一→二 力0', '力0.5', '力1', '三→本 力1', '打者 力0.8', '打者 力1'], 11),
+  );
+  const margin = (f: Fielded, to: BaseKey, path: number, run: number) =>
+    throwArrival(f, to, NOW) - path / runnerSpeed(run);
+  for (const speed of [11, 12, 13, 13.5, 13.75, 14, 14.5, 15, 16, 16.5, 17, 17.2, 17.5, 18]) {
+    const f = fieldBunt(speed, -BUNT_MAX_DIRECTION_DEG);
+    if (f === null || f.spoiled !== null) {
+      console.log(`${String(speed).padEnd(8)}${f?.spoiled ?? '拾われない'}`);
+      continue;
+    }
+    const led = BASE_PATH - STEAL_LEAD;
+    const cells = [
+      f.sec.toFixed(2),
+      `${f.depth.toFixed(0)}m`,
+      margin(f, 'second', led, 0).toFixed(2),
+      margin(f, 'second', led, 0.5).toFixed(2),
+      margin(f, 'second', led, 1).toFixed(2),
+      margin(f, 'home', led, 1).toFixed(2),
+      margin(f, 'first', BASE_PATH, 0.8).toFixed(2),
+      margin(f, 'first', BASE_PATH, 1).toFixed(2),
+    ];
+    const mark = speed === BUNT_PUSH_EXIT_SPEED ? ' ←押し' : speed === BUNT_EXIT_SPEED ? ' ←標準' : '';
+    console.log(`${String(speed).padEnd(8)}${String(f.by).padEnd(6)}${row(cells, 11)}${mark}`);
+  }
+  console.log('   ＝16〜16.5 は誰が打っても全員セーフ／17 は三塁手が拾い、足の速い打者が生きる。');
+}
+
 // ---- 5. レバーE：一塁手・三塁手がバントに突っ込む ----
 //
 // 「塁カバー4人（説明書p20）が固定なのでバントに突っ込まない」ことが有利に働いている
@@ -490,7 +534,7 @@ function groundoutWithTransfer(
   transfer: number,
   speed = RUNNER_SPEED,
 ): boolean {
-  const release = fielded.sec + CPU_POSSESSED_REACTION_SEC + transfer;
+  const release = fielded.sec + PICKUP_THROW_DELAY_SEC + transfer;
   if (release >= (BASE_PATH - BASE_ARRIVE_RADIUS) / speed) return false;
   return release + distance(fielded.pos, BASE_POSITIONS.first) / THROW_SPEED < BASE_PATH / speed;
 }
@@ -557,10 +601,10 @@ const COMBOS: Combo[] = [
   { label: 'F 走らせる(頭0.45)のみ', l: lv({ head: 0.45 }), speed: LEGACY_EXIT_SPEED },
   { label: 'A+F', l: lv({ lead: STEAL_LEAD, head: 0.45 }), speed: LEGACY_EXIT_SPEED },
   { label: 'A+B(0.35)', l: lv({ lead: STEAL_LEAD, transfer: 0.35 }), speed: LEGACY_EXIT_SPEED },
-  { label: 'A+D(押す17)', l: lv({ lead: STEAL_LEAD }), speed: 17 },
-  { label: 'A+F(頭0.25)+D(押す17)', l: lv({ lead: STEAL_LEAD, head: 0.25 }), speed: 17 },
-  { label: 'A+F(頭0.45)+D(押す17)', l: lv({ lead: STEAL_LEAD, head: 0.45 }), speed: 17 },
-  { label: 'D(押す17)のみ', l: NOW, speed: 17 },
+  { label: 'A+D(押す)', l: lv({ lead: STEAL_LEAD }), speed: BUNT_PUSH_EXIT_SPEED },
+  { label: 'A+F(頭0.25)+D(押す)', l: lv({ lead: STEAL_LEAD, head: 0.25 }), speed: BUNT_PUSH_EXIT_SPEED },
+  { label: 'A+F(頭0.45)+D(押す)', l: lv({ lead: STEAL_LEAD, head: 0.45 }), speed: BUNT_PUSH_EXIT_SPEED },
+  { label: 'D(押す)のみ', l: NOW, speed: BUNT_PUSH_EXIT_SPEED },
 ];
 
 console.log('\n=== 7. 組み合わせ：送りバントが成立するか（狙いは三塁線＝-44°） ===');
@@ -635,7 +679,12 @@ function buntScoreProb(
   speed = RUNNER_SPEED,
 ): number {
   let best = 0;
-  for (const deg of [-BUNT_MAX_DIRECTION_DEG, ...AIMS.map((aim) => aim * LEGACY_DIRECTION_DEG)]) {
+  // **打者が実際に出せる角度だけを見る**（フェーズBBB-82で直した）：狙いは十字キーの
+  // 左・無し・右の3通り（`judgeBunt`）＝Y-46 の前は ±38°、いまは ±44°。それまでは両方を
+  // 混ぜて最良を採っていたので、いまは出せない -38° の押しバント（投手がいちばん遅れる）が
+  // 押しの値打ちに数えられていた。
+  const maxDeg = exit === LEGACY_EXIT_SPEED && l === NOW ? LEGACY_DIRECTION_DEG : BUNT_MAX_DIRECTION_DEG;
+  for (const deg of AIMS.map((aim) => aim * maxDeg)) {
     const f = fieldBunt(exit, deg);
     if (f === null || f.spoiled !== null) continue;
     const r = buntOutcome(f, state, speed, l);
@@ -648,7 +697,7 @@ function buntScoreProb(
 
 console.log('\n=== 8. 得点確率での損得（正＝バントのほうが1点入りやすい。X-45の4段目の測り直し） ===');
 for (const c of COMBOS.filter((x) =>
-  ['Y-46前', 'A+D(押す17)', 'A+F(頭0.25)+D(押す17)'].includes(x.label),
+  ['Y-46前', 'A+D(押す)', 'A+F(頭0.25)+D(押す)'].includes(x.label),
 )) {
   console.log(`\n   ${c.label}：`);
   console.log(`${'塁状況'.padEnd(12)}${'アウト'.padEnd(6)}${row(POWERS.map((p) => `力${p}`), 8)}`);
@@ -656,11 +705,17 @@ for (const c of COMBOS.filter((x) =>
 
     for (const outs of [0, 1, 2]) {
       const bunt = buntScoreProb(state, outs, c.l, c.speed);
+      // 俊足（走力1.0）の走者・打者なら（BBB-82：野手が遅くなって、足で帰結が分かれる）
+      const fast = buntScoreProb(state, outs, c.l, c.speed, runnerSpeed(1));
       const cells = POWERS.map((power) => {
         const diff = bunt - paScoreProb(distOf(power), outs, state, scoreTable);
         return `${diff >= 0 ? '+' : ''}${(diff * 100).toFixed(1)}`;
       });
-      console.log(`${baseStateLabel(state).padEnd(12)}${String(outs).padEnd(6)}${row(cells, 8)}`);
+      const fastDiff = fast - paScoreProb(distOf(0.45), outs, state, scoreTable);
+      console.log(
+        `${baseStateLabel(state).padEnd(12)}${String(outs).padEnd(6)}${row(cells, 8)}` +
+          `   俊足・力0.45: ${fastDiff >= 0 ? '+' : ''}${(fastDiff * 100).toFixed(1)}`,
+      );
     }
   }
 }

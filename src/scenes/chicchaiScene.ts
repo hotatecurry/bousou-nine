@@ -18,8 +18,9 @@
  * 全面改修。差分表はPROGRESS.md参照）：
  * - 塁カバー4人（捕手=本塁/一塁手=一塁/二塁手=二塁/三塁手=三塁）は自動で塁に入る。
  * - 残り5人（P/SS/LF/CF/RF）は十字キーで「全員が同じ方向へ」一斉移動する
- *   （説明書p20「+で内・外野手をコントロール」）。CPU守備は最寄り野手が目標へ
- *   向かう方向を全員に適用する＝人間と同じ動かし方（コードパスを分けない）。
+ *   （説明書p20「+で内・外野手をコントロール」）。CPU守備は、いちばん早く球に触れる野手が
+ *   球と出会う点へ向かう方向を全員に適用する（フェーズBBB-83の先回り。`fielding.ts` の
+ *   `cpuChase`）＝人間と同じ動かし方（コードパスを分けない）。
  * - 捕球はボタン入力なしの自動。塁カバー4人も含めた全野手が捕球候補
  *   （どの野手でもボールに触れれば捕る）。Aは送球専用。
  * - 送球はA+十字キーの絶対塁指定（上=二塁/左=三塁/右=一塁/下=本塁、説明書p21）。
@@ -59,6 +60,7 @@ import * as THREE from 'three';
 import { type Ballpark, DEFAULT_BALLPARK, fallbackHit } from '../core/ballpark';
 import { type BattedBall, WALL_RESTITUTION, isFairPosition, stepBattedBall } from '../core/batting';
 import {
+  clampToPark,
   FOUL_BARRIER_HEIGHT,
   normalizeDeg,
   outerWallDistance,
@@ -94,6 +96,7 @@ import {
   FINE_PLAY_DIVE_SPEED,
   FINE_PLAY_JUMP_RECOVERY_SEC,
   FLY_CATCH_RELEASE_SEC,
+  PICKUP_RELEASE_SEC,
   LEAD_SPEED,
   MAX_LEAD,
   RUNNER_SPEED,
@@ -109,6 +112,19 @@ import {
   chooseCpuHoldRelease,
   chooseCpuPickoffThrow,
   chooseCpuExtraBases,
+  chooseCpuStretches,
+  chooseStretchRunners,
+  predictSecureAt,
+  shouldCpuRoundBase,
+  CATCH_MIN_PLAY_SEC,
+  CPU_FIELD_REACTION_SEC,
+  cpuChase,
+  predictBallPath,
+  type BallPathSample,
+  type ChasePlan,
+  type CpuStretchCandidate,
+  type DefenseBallState,
+  type StretchCandidate,
   chooseCpuRundown,
   chooseCpuTagUp,
   chooseCpuThrowTarget,
@@ -134,12 +150,14 @@ import {
   sendableRunnerBases,
   shouldCpuActivateCatchEffect,
   shouldCpuBreakForNextBase,
+  groupMoveDirection,
   shouldCpuHold,
   shouldCpuRetreat,
   stealableBases,
   tagTarget,
   tagsOnTheWay,
   throwRetiresRunner,
+  isCatchableFly,
 } from '../core/fielding';
 import {
   type BaseRunners,
@@ -441,15 +459,6 @@ const TAG_UP_WINDOW_SEC = 1.8;
 /** 送球ボールの飛行高さ（見た目のみ。判定は resolveDefensePlay の時間競争で行う） */
 const THROW_BALL_HEIGHT = 1.2;
 /**
- * 打球発生直後、捕球判定を無効にする時間。全野手を捕球候補にしたことで、
- * 本塁のすぐ後ろに立つ捕手（接触点から約2.5m＝捕球半径2.6mの内側）が
- * 打った瞬間のボールを初回フレームで「捕って」しまい、全打球が即フライアウトに
- * なる不具合があった。バットを離れて最初の数百ミリ秒は捕球なしとすることで、
- * 捕手の即捕りだけを防ぎつつ、捕手がバント・ボテボテのゴロを拾う正当なプレーは
- * 残す（0.3秒あればボールは最速の打球でも十数メートル先へ抜けている）。
- */
-const CATCH_MIN_PLAY_SEC = 0.3;
-/**
  * ボールが静止してから「守備が間に合わなかった」と見なして距離分類のヒットを
  * 確定するまでの猶予。この間に野手が追いつけば拾って（自動捕球）送球できる。
  * 値は「外野の定位置から静止球までのおおよその距離 ÷ FIELDER_SPEED」から逆算
@@ -475,10 +484,6 @@ const AFTERMATH_COAST_SEC = 0.6;
  * 小走り＝プレーがもう終わっていることが動きで分かる
  */
 const AFTERMATH_JOG_SCALE = 0.55;
-/** 決着してから、ボールを持った野手が投手へ返し始めるまで（見た目だけ） */
-const AFTERMATH_TOSS_DELAY_SEC = 0.45;
-/** 投手へ返す山なりの送球の速さ m/s（見た目だけ。本物の送球 `THROW_SPEED` よりずっと緩い） */
-const AFTERMATH_TOSS_SPEED = 15;
 /** 余韻の間、走者がこの距離まで塁に寄ったら止める（m） */
 const AFTERMATH_STOP_DISTANCE = 0.05;
 /** CPU守備が確保後に送球するまでの反応時間（人間の1.5秒待ちより短く即応させる） */
@@ -528,8 +533,12 @@ const DROPKICK_KICK_SEC = 0.45;
  * ボールがどこまで飛ぶかとは本来無関係でよい。
  */
 const THROW_POSE_SEC = 0.4;
-/** 操作野手が場外へ出ないようにする移動範囲 */
-const FIELDER_BOUND_RADIUS = 98;
+/**
+ * 塁の上のCPU走者が「いま次の塁へ行けるか」を見る間隔 秒（フェーズBBB-78）。拾うまでの見込み
+ * （`predictSecureAt`）は打球と野手を影で回すので毎フレームは解かない。見込みの単位は秒で、
+ * 余白（`CPU_TAG_UP_MARGIN_SEC`＝0.14秒）より十分短ければ判断は変わらない。
+ */
+const CPU_ROUND_CHECK_SEC = 0.1;
 
 /**
  * carrying＝ランダンプレイ（説明書p25）でボールを持った野手が塁へダッシュしている最中。
@@ -689,6 +698,14 @@ interface RunnerVisual {
    * 止まる／走るを繰り返して守備の送球を無限に無駄にでき、挟殺が終わらない。
    */
   holdUsed: boolean;
+  /**
+   * いま向かっている塁を**踏んだら、止まらずにあといくつ先の塁まで行くか**（フェーズBBB-77）。
+   * 0＝その塁で止まる。人間は十字キー＋J（`chooseStretchRunners`）、CPUは打球の瞬間
+   * （`chooseCpuStretches`）に積む。**踏むまでは区間を変えない**＝最初の塁まではフォースの
+   * まま（内野ゴロで押しても、一塁へ投げられれば従来どおり刺される）。踏んだ瞬間に
+   * `continueStretch` が次の区間（タッチプレー）へ切り替える。
+   */
+  stretch: number;
 }
 
 /**
@@ -710,6 +727,8 @@ interface RunnerVisual {
  *   'stealThrow' = 盗塁されている（A+方向で塁へ送球。説明書p13）。
  * でっかいモードで攻撃側が人間のとき（main.ts が出す。フィールドプレー中ではない）：
  *   'steal' = 走者がいて盗塁を仕掛けられる（投球中にB+方向）。
+ *   'stealQueued' = 盗塁を押したが、まだ投手が本塁へ踏み出していない（フェーズBBB-76。
+ *     走り出すのは踏み出しの絵から＝押したことが画面のどこにも出ない間を埋める）。
  *   'takeLead' = **まだ投げていない**うちにリードを取りに行ける（Bでにらみ合いへ。
  *     フェーズKK-58）。'steal' と**同じ枠を入れ替える**＝同じBが投球前と投球中で違う
  *     意味になるので、両方を並べると「いまどちらが効くのか」が読めない
@@ -721,6 +740,7 @@ interface RunnerVisual {
  */
 export type PlayPromptKind =
   | 'tagUp'
+  | 'stretch'
   | 'recall'
   | 'hold'
   | 'holding'
@@ -736,6 +756,7 @@ export type PlayPromptKind =
   | 'lead'
   | 'takeLead'
   | 'steal'
+  | 'stealQueued'
   | 'battingEffect'
   | 'bunt'
   | 'buntTwoStrikes'
@@ -810,11 +831,16 @@ export interface FieldPlayController {
    * carried は持ち越したリード（フェーズL-32。省略時は従来どおり全員0から育つ）。
    * これが無いと、**投手はけん制モードに入り直すだけで走者のリードを0に戻せてしまう**
    * ＝深いリードを我慢して勝ち取った報酬が、投げずに引き返すだけで消える。
+   *
+   * cpuStealing は**次の球で走るつもりのCPU走者の塁**（フェーズBBB-81。`chooseCpuSteals` の
+   * 答えをそのまま渡す）。**刺される深さまでリードを取るのはこの走者だけ**で、それ以外の
+   * CPU走者は必ずセーフになる深さで止まる（`cpuLeadDistance`）。省略時は誰も走らない。
    */
   startPickoff(
     runners: BaseRunners,
     outs: number,
     carried?: Partial<Record<'first' | 'second' | 'third', number>>,
+    cpuStealing?: ReadonlyArray<'first' | 'second' | 'third'>,
   ): void;
   /**
    * 盗塁（説明書p13「盗塁しようとすると"ちっちゃいモード"に変わる」）。投球中に走者が
@@ -1129,6 +1155,11 @@ export function createFieldPlayController(opts: {
   let pickoffTimer = 0;
   /** けん制モードで「誰も塁を離れていない」状態が続いた秒数（フェーズII-56） */
   let pickoffIdleTimer = 0;
+  /**
+   * 次の球で走るつもりのCPU走者の塁（フェーズBBB-81。`startPickoff` が受け取る）。
+   * **刺される深さまでリードを取るのはこの走者だけ**（`updateLeads`）。
+   */
+  let cpuStealIntent: ReadonlySet<'first' | 'second' | 'third'> = new Set();
   /** バイク（フェーズF-26-3）の点火判定：人間の攻撃側がJを押し続けている秒数 */
   let bikeHoldSec = 0;
   /**
@@ -1176,6 +1207,10 @@ export function createFieldPlayController(opts: {
    * 仕留められなくても次からは送球に戻る＝走って追い続けてプレーが終わらない、が起きない。
    */
   let cpuRundownUsed = false;
+  /** 塁の上のCPU走者が次の塁を見る計時（フェーズBBB-78。`CPU_ROUND_CHECK_SEC` ごと） */
+  let cpuRoundTimer = 0;
+  /** 転がる球を拾うまでの見込みの、このフレームぶんの控え（`looseSecure`） */
+  let looseSecureMemo: { elapsed: number; value: LandingPrediction } | null = null;
   /**
    * このプレーでCPU守備が一度でも送球した（フェーズK-31）。
    *
@@ -1245,16 +1280,17 @@ export function createFieldPlayController(opts: {
    */
   let ballInStands = false;
   /**
-   * 余韻の間に**ボールを投手へ返す**山なりの送球（見た目だけ。フェーズWW-71）。
-   * アウトが決まった後に野手の手の中で止まったままだと、その間の画面が静止画になる。
-   */
-  let returnToss: { from: Vec2; to: Vec2; t: number; dur: number } | null = null;
-  let returnTossDone = false;
-  /**
    * 直前のフレームの一斉移動の向き（フェーズWW-71）。決着後の野手はこの向きのまま惰性で
    * 止まっていく＝**走っていた野手が決着の瞬間に急停止して固まる**（一時停止に見える）を避ける。
    */
   let lastGroupDir: Vec2 = { x: 0, z: 0 };
+  /**
+   * 打球のこの先の通り道（フェーズBBB-83。**CPU守備の先回り**の材料）。打球の物理は決定的なので
+   * 打った瞬間に一度だけ解く（時計は `elapsed`）。人間の守備のとき・打球のプレーでないときは null。
+   */
+  let ballPath: BallPathSample[] | null = null;
+  /** CPU守備のいまの先回りの計画（追う役・出会う点・捕り方）。ファインプレイの判断が読む */
+  let cpuChasePlan: ChasePlan | null = null;
   let elapsed = 0;
   /** ボールが静止してからの経過秒（RESTING_PICKUP_GRACE_SEC との比較用） */
   let restingT = 0;
@@ -1358,7 +1394,7 @@ export function createFieldPlayController(opts: {
    * 原作の「いったん次の塁を踏むと前の塁に戻れない」（説明書p19）に従い、次の塁へ
    * 到達済み（arrived）の走者は除く。刺された走者・すでに帰塁中の走者も対象外。
    */
-  function recallableBases(): Array<'first' | 'second' | 'third'> {
+  function recallableBases(includeStretch = true): Array<'first' | 'second' | 'third'> {
     const sent = [...sentRunners.keys()].filter((from) => {
       const v = findVisual(from);
       // **1プレーに1回しか引き返せない**（フェーズK-31の `retreatUsed`）。仕掛け直した走者を
@@ -1371,7 +1407,18 @@ export function createFieldPlayController(opts: {
     // で変わらない（十字キーは塁の絶対指定＝説明書p19）。仕掛けた走者より後ろに並べるので、
     // 無入力のKは行き過ぎた走者を優先して戻す（いちばん刺されやすいのがこの走者）。
     const overrun = overrunRunners().map((v) => v.forced!.to as 'first' | 'second' | 'third');
-    if (playKind !== 'pickoff') return [...sent, ...overrun];
+    // 先の塁の予約がある走者（まだ踏んでいない塁で「止まる」＝予約の取り消し）と、先の塁へ
+    // 向かっている走者（踏んだ塁へ戻る）。フェーズBBB-77。CPU走者の引き返しは自分で
+    // 別に見る（`updateCpuRetreat`）ので、ここへは人間のKのときだけ混ぜる。
+    const stretch: Array<'first' | 'second' | 'third'> = [];
+    if (includeStretch) {
+      for (const v of runnerVisuals) {
+        if (v.out || v.arrived || v.returning || v.forced === null) continue;
+        if (v.stretch > 0 && v.forced.to !== 'home') stretch.push(v.forced.to);
+        else if (isStretchLeg(v) && !v.retreatUsed) stretch.push(v.forced.from as 'first' | 'second' | 'third');
+      }
+    }
+    if (playKind !== 'pickoff') return [...sent, ...stretch, ...overrun];
     // けん制モードでは「リードしている（＝塁を離れている）走者」も帰塁の対象になる。
     return [
       ...sent,
@@ -1428,8 +1475,9 @@ export function createFieldPlayController(opts: {
   /**
    * けん制モードのリードの進行。塁上の走者だけが LEAD_SPEED でじりじり塁を離れる
    * （走り出した走者・帰塁中の走者は通常の走塁処理が動かすのでここでは触らない）。
-   * リードの上限は人間なら MAX_LEAD、CPU走者なら塁と**その走者の足**で決まる
-   * cpuLeadDistance（フェーズS-40。それまでは走力によらず 5.2m / 3.6m の固定2値だった）。
+   * リードの上限は人間なら MAX_LEAD、CPU走者なら塁と**その走者の足**、それに**次の球で
+   * 走るつもりか**（フェーズBBB-81）で決まる cpuLeadDistance（フェーズS-40。それまでは
+   * 走力によらず 5.2m / 3.6m の固定2値だった）。
    * 渡す `v.speed` は移動にも送球との時間競争にも使っている値そのものなので、
    * 「深く出ると判断した前提」と「実際に戻る速さ」が構造的に食い違わない。
    */
@@ -1447,7 +1495,10 @@ export function createFieldPlayController(opts: {
       if (v.stumbleSec > 0) continue;
       const from = v.origin as 'first' | 'second' | 'third';
       if (attackIsHuman && held !== leadDirectionBase(from)) continue;
-      const limit = attackIsHuman ? MAX_LEAD : cpuLeadDistance(from, v.speed);
+      // CPU走者が刺される深さまで出るのは、次の球で走るつもりのときだけ（フェーズBBB-81）
+      const limit = attackIsHuman
+        ? MAX_LEAD
+        : cpuLeadDistance(from, v.speed, undefined, cpuStealIntent.has(from));
       v.lead = Math.min(v.lead + LEAD_SPEED * d, limit);
       // **一度でも塁を離れたかを覚えておく**（フェーズII-56）。持ち越し（L-32）は
       // 「離れた走者が最後にどこにいたか」なので、**一度も離れていない走者は
@@ -1543,6 +1594,10 @@ export function createFieldPlayController(opts: {
     // 猶予が短く、押せること自体を知らなければ選択肢として存在しないため。帰塁（K）は
     // いつでも押せる標準操作なので、案内が一時的に隠れても失われる判断が無い。
     if (dropkickableRunners().length > 0) return 'dropkick';
+    // 打者走者・押し出された走者が、向かっている塁を踏んでそのまま次の塁へ行ける
+    // （フェーズBBB-77）。それまでは野手が拾えば打者走者は必ず一塁で止まっていたので、
+    // 押せることを知らなければ選択肢として存在しない（意思決定材料は隠さない）。
+    if (stretchHintActive()) return 'stretch';
     if (recallable.length === 0) return null;
     // 止まれる走者がいるなら、帰塁と一緒に「止まる」も案内する（フェーズN-34）。
     // 帰塁を消さずに1つの2行に収めるのは、**この2つが同じ場面の2つの逃げ道**だから
@@ -1676,6 +1731,18 @@ export function createFieldPlayController(opts: {
     return throwHoldTimer >= ballArriveSec;
   }
 
+  /**
+   * **地面の球を拾った直後の持ち替え**（フェーズBBB-82。`PICKUP_RELEASE_SEC`）。フライの捕球・
+   * 盗塁の捕手と同じ1つのタイマー（`throwHoldSec`）に乗せるので、待ちの間に押した送球は
+   * 予約され（`queuedThrowBase`）、CPU守備は反応の時間と長いほうを待ち、CPU走者の見込み
+   * （`cpuDefenseBallState` の `delaySec`）にもそのまま入る。
+   */
+  function startPickupRelease(): void {
+    throwHoldSec = PICKUP_RELEASE_SEC;
+    throwHoldTimer = 0;
+    ballArriveSec = 0;
+  }
+
   /** 送球・確保のたびに待ちを解除する（次の確保は普通にすぐ投げられる） */
   function clearThrowHold(): void {
     throwHoldSec = 0;
@@ -1786,14 +1853,13 @@ export function createFieldPlayController(opts: {
     p.z += dz * k;
   }
 
-  /** 場外へ出ないよう位置を丸める（一斉移動でも各自が個別にクランプされる） */
+  /**
+   * 場外へ出ないよう位置を丸める（一斉移動でも各自が個別にクランプされる）。
+   * **その球場の壁の内側まで**（`clampToPark`。フェーズBBB-77。それまでは半径98mの円で、
+   * 中堅のフェンスの20m以上手前に見えない壁があった）。
+   */
   function clampToField(p: Vec2): void {
-    const r = Math.hypot(p.x, p.z);
-    if (r > FIELDER_BOUND_RADIUS) {
-      const scale = FIELDER_BOUND_RADIUS / r;
-      p.x *= scale;
-      p.z *= scale;
-    }
+    clampToPark(ballpark(), p);
   }
 
   /**
@@ -1809,7 +1875,21 @@ export function createFieldPlayController(opts: {
    *
    * 跳んでいる／蹴り倒されている野手は、どちらの列からも外れる（動けないことの実体）。
    */
-  function updateFielderMovement(d: number, cpuTarget: Vec2 | null): void {
+  /**
+   * CPU守備の先回りの準備（フェーズBBB-83）。打球のプレーが始まる所（`launch`・
+   * `convertToBattedBall`）で呼ぶ。人間の守備には要らない（向きは十字キーが決める）。
+   */
+  function startCpuChase(initial: BattedBall): void {
+    cpuChasePlan = null;
+    ballPath = isDefenseHuman() ? null : predictBallPath(initial, ballpark(), 1 / 60, MAX_PLAY_SEC);
+  }
+
+  /**
+   * @param batted 打球を追っているか（`'flying'` の局面）。CPU守備はこのときだけ**先回り**し、
+   *   打った直後は反応の遅れ（`CPU_FIELD_REACTION_SEC`）のぶん動かない。こぼれ球（`'loose'`）は
+   *   従来どおり、いちばん近い野手を球へ向ける。
+   */
+  function updateFielderMovement(d: number, cpuTarget: Vec2 | null, batted = false): void {
     for (const [id, base] of Object.entries(BASE_COVER_ASSIGNMENTS) as Array<
       [FielderId, BaseKey]
     >) {
@@ -1826,26 +1906,41 @@ export function createFieldPlayController(opts: {
       }
     }
 
-    // 一斉移動の方向を決める（人間：十字キー / CPU：最寄り野手→目標の正規化ベクトル。
-    // CPUの最寄り野手は目標のごく近くで1ステップ幅の微振動をし得るが、振動幅は
+    // 一斉移動の方向を決める（人間：十字キー / CPU：追う役→目標の正規化ベクトル。
+    // CPUの追う役は目標のごく近くで1ステップ幅の微振動をし得るが、振動幅は
     // 捕球半径よりはるかに小さく、その前に自動捕球が成立するため実害はない）
     let moveDir: Vec2 = { x: 0, z: 0 };
     if (isDefenseHuman()) {
-      moveDir = padToWorldDir(defensePad.direction().x, defensePad.direction().y);
+      // **斜めでも速さは同じ**（フェーズBBB-81。`groupMoveDirection`）。それまでは上下・左右の
+      // 入力をそのまま足していたので、斜めに動かすと野手が 1.41倍（12m/s）で走っていた＝
+      // CPU走者の見込み（野手は 8.5m/s）より人間の守備だけが速く、「間に合う」と見て
+      // 走ったCPU走者が刺されていた
+      const dir = defensePad.direction();
+      moveDir = groupMoveDirection(dir.x, dir.y);
     } else if (cpuTarget) {
       // 追う役は動ける野手から選ぶ（倒れている野手を基準にすると、動けない者の位置で
       // 全員の向きが決まってしまう）。全員倒れているときだけ従来どおり全員から選ぶ。
-      const movable = CONTROLLABLE_FIELDERS.filter((id) => !isFielderDown(id));
+      // **跳んでいる・起き上がっている最中の野手も追う役にしない**（フェーズBBB-83）＝跳び込んで
+      // 外した野手は起き上がるまで走れないので、その間は次に早く球に触れる野手が追う。
+      const movable = CONTROLLABLE_FIELDERS.filter((id) => !isFielderDown(id) && !isFinePlayBusy(id));
       const pool = movable.length > 0 ? movable : CONTROLLABLE_FIELDERS;
-      const controllablePositions = Object.fromEntries(
-        pool.map((id) => [id, fielderPos[id]]),
-      ) as Record<FielderId, Vec2>;
-      const chaser = nearestFielder(cpuTarget, controllablePositions);
-      const p = fielderPos[chaser];
-      const dx = cpuTarget.x - p.x;
-      const dz = cpuTarget.z - p.z;
-      const dist = Math.hypot(dx, dz);
-      if (dist > CPU_SEEK_EPSILON) moveDir = { x: dx / dist, z: dz / dist };
+      // 打球は**先回り**（フェーズBBB-83）：いちばん早く球に触れる野手が、球と出会う点へ向かう。
+      // それまでは「いま球にいちばん近い野手を球へ向ける」だけだったので、内野を抜けた球を
+      // 投手が後ろから追いかけ、外野手は同じ向き＝球から遠ざかるほうへ下がっていた
+      // （単打のはずの当たりが二塁打・三塁打になっていた）。
+      const chase = cpuChase(
+        fielderPos,
+        cpuTarget,
+        batted ? ballPath : null,
+        elapsed,
+        pool,
+        ballpark(),
+        CPU_SEEK_EPSILON,
+        batted ? Math.max(0, CPU_FIELD_REACTION_SEC - elapsed) : 0,
+        catchBonusOf,
+      );
+      moveDir = chase.dir;
+      cpuChasePlan = chase.plan;
     }
     for (const id of CONTROLLABLE_FIELDERS) {
       if (isFinePlayBusy(id) || isFielderDown(id)) continue;
@@ -2025,6 +2120,7 @@ export function createFieldPlayController(opts: {
       retreatUsed: false,
       holding: false,
       holdUsed: false,
+      stretch: 0,
       ...runnerSkillFields(id),
     };
   }
@@ -2075,6 +2171,7 @@ export function createFieldPlayController(opts: {
         retreatUsed: false,
         holding: false,
         holdUsed: false,
+        stretch: 0,
         ...runnerSkillFields(id),
       });
     }
@@ -2152,8 +2249,9 @@ export function createFieldPlayController(opts: {
     ballFreeAtFinish = false;
     ballInStands = false;
     lastGroupDir = { x: 0, z: 0 };
-    returnToss = null;
-    returnTossDone = false;
+    ballPath = null;
+    cpuChasePlan = null;
+    cpuStealIntent = new Set();
     soundPhase = null;
     playKind = 'batted';
     pickoffTimer = 0;
@@ -2193,8 +2291,6 @@ export function createFieldPlayController(opts: {
     // **ファウルは長め**（打球がどこへ行ったかを見てから戻る。フェーズWW-71）
     pauseT = result.kind === 'foul' ? FOUL_RESULT_PAUSE_SEC : PLAY_RESULT_PAUSE_SEC;
     aftermathT = 0;
-    returnToss = null;
-    returnTossDone = false;
     tagUpChanceOpen = false;
     clearPlayPrompt();
     // ファウルは**プレーが無かったことになる**ので、走っていた走者は元の塁へ、打者走者は
@@ -2220,48 +2316,17 @@ export function createFieldPlayController(opts: {
   function updateAftermath(d: number): void {
     aftermathT += d;
     // ボール：誰の手にも無ければ転がり続ける（フェンスで跳ね返るのも同じ物理）。
-    // 野手の手の中にあれば、少し置いてから**投手へ山なりに返す**（アウトの後の球回し）
+    // 野手の手の中にあれば、**持ったまま**でっかいモードへ戻る。WW-71 はここで投手へ
+    // 山なりに返していたが、プレーが決着した後の送球は余計に見える（テストプレイ「二塁へ
+    // 送ってセーフになった後、いちいち二塁の選手が球を送る様子が流れる」＝フェーズBBB-80で廃止）
     if (ballFreeAtFinish && ballState) {
       if (!ballState.resting && !ballInStands) {
         ballState = stepAftermathBall(ballState, d);
         syncBall(ballState);
       }
-    } else if (returnToss) {
-      returnToss.t = Math.min(returnToss.dur, returnToss.t + d);
-      const k = returnToss.t / returnToss.dur;
-      const x = returnToss.from.x + (returnToss.to.x - returnToss.from.x) * k;
-      const z = returnToss.from.z + (returnToss.to.z - returnToss.from.z) * k;
-      // 山なり（最高点は距離の1/8。球回しの軽い送球に見える高さ）
-      const span = distance(returnToss.from, returnToss.to);
-      const y = THROW_BALL_HEIGHT + 4 * (span / 8) * k * (1 - k);
-      ball.position.set(x, y, z);
-      if (k >= 1) {
-        returnToss = null;
-        returnTossDone = true;
-        holderId = 'P';
-      }
     } else if (holderId !== null) {
       const p = fielderPos[holderId];
       ball.position.set(p.x, THROW_BALL_HEIGHT, p.z);
-      if (
-        !returnTossDone &&
-        holderId !== 'P' &&
-        aftermathT >= AFTERMATH_TOSS_DELAY_SEC &&
-        !isFielderDown(holderId)
-      ) {
-        const to = fielderPos.P;
-        const span = distance(p, to);
-        if (span > 1) {
-          returnToss = { from: { ...p }, to: { ...to }, t: 0, dur: span / AFTERMATH_TOSS_SPEED };
-          throwPose = {
-            id: holderId,
-            sec: THROW_POSE_SEC,
-            arm: throwArmFor(holderId),
-            yaw: Math.atan2(to.x - p.x, to.z - p.z),
-          };
-          holderId = null;
-        }
-      }
     }
     // 野手：決着した瞬間の一斉移動の向きのまま惰性で止まり、それから**守備位置へ歩いて戻る**
     // （プレーが終わったことが動きで分かる。急停止させると全員が固まって一時停止に見える）
@@ -2693,10 +2758,15 @@ export function createFieldPlayController(opts: {
     const baseRunners: BaseRunners = { first: null, second: null, third: null };
     let runs = 0;
     let outsAdded = 0;
+    /** 打者走者が最後に落ち着いた塁（二塁・三塁なら長打のバナー。フェーズBBB-77） */
+    let batterBase: BaseKey | null = null;
     for (const v of runnerVisuals) {
       if (v.out) {
         outsAdded += 1;
         continue;
+      }
+      if (v.origin === 'batter' && v.forced) {
+        batterBase = v.holding && v.forced.from !== 'batter' ? v.forced.from : v.forced.to;
       }
       if (v.forced) {
         // **止まったまま畳まれた走者は、最後に踏んだ塁（起点）に落ち着く**（フェーズN-34）。
@@ -2704,8 +2774,10 @@ export function createFieldPlayController(opts: {
         // 止まっていただけの走者が塁を1つもらえてしまう（＝止まるのが得になり、
         // 「1人を差し出す」という手の意味が反転する）。**打者走者だけは例外で従来どおり**
         // ＝常にフォースなので送球で刺せる＝畳む前に必ず決着しており、ここには来ない。
-        if (v.holding && v.origin !== 'batter') {
-          baseRunners[v.origin] = v.id;
+        // 戻る先＝**この区間の始まりの塁**（自分で仕掛けた進塁なら起点、先の塁へ向かって
+        // いた走者なら踏んだ塁。フェーズBBB-77）。
+        if (v.holding && v.forced.from !== 'batter') {
+          baseRunners[v.forced.from] = v.id;
         } else if (v.forced.to === 'home') runs += 1;
         else baseRunners[v.forced.to] = v.id;
       } else if (v.origin !== 'batter') {
@@ -2719,7 +2791,11 @@ export function createFieldPlayController(opts: {
       finish({ kind: 'runnerPlay', outsAdded, runs, baseRunners, leads: finalLeads() });
       return;
     }
-    finish({ kind: 'result', outsAdded, runs, baseRunners });
+    // 打者走者が塁を踏んで先の塁まで行った＝二塁打・三塁打（フェーズBBB-77）。バナーと音だけ
+    // （`hit` は演出の印で、判定には一切効かない＝塁と得点は上の baseRunners/runs がすべて）。
+    const hit: HitType | undefined =
+      batterBase === 'second' ? 'double' : batterBase === 'third' ? 'triple' : undefined;
+    finish(hit ? { kind: 'result', outsAdded, runs, baseRunners, hit } : { kind: 'result', outsAdded, runs, baseRunners });
   }
 
   /**
@@ -3122,6 +3198,7 @@ export function createFieldPlayController(opts: {
     holderId = catcher;
     possessedTimer = 0;
     holdSafeTimer = 0;
+    startPickupRelease();
     const p = fielderPos[catcher];
     ball.position.set(p.x, BALL_RADIUS, p.z);
   }
@@ -3193,7 +3270,8 @@ export function createFieldPlayController(opts: {
     // 見送れば盗塁が決まる」という**守備側の判断そのものが消える**。
     if (!canThrowNow()) return;
     const carrier = fielderPos[holderId];
-    for (const from of recallableBases()) {
+    const throwDelaySec = Math.max(0, throwHoldSec - throwHoldTimer);
+    for (const from of recallableBases(false)) {
       const v = findVisual(from);
       // 引き返せるのは「自分の意思で仕掛けた走者」だけ（フォースされた走者に戻る塁は無い）。
       // バイクでオーバーラン中の走者は既存の自動帰塁（updateCpuOverrunReturn）の担当。
@@ -3214,6 +3292,20 @@ export function createFieldPlayController(opts: {
       // `retreatUsed` は `startRunnerReturn` が立てる（人間の帰塁と同じ1本の経路）
       startRunnerReturn(from);
     }
+    // 先の塁へ向かっている走者（フェーズBBB-77）も同じ規則で、**踏んだ塁へ**戻る
+    for (const v of runnerVisuals) {
+      if (!isStretchLeg(v) || v.retreatUsed || v.returning || v.overrun) continue;
+      if (v.out || v.arrived || v.stumbleSec > 0) continue;
+      const decided = shouldCpuRetreat({
+        carrier,
+        runner: v.pos,
+        ahead: BASE_POSITIONS[v.forced!.to],
+        behind: BASE_POSITIONS[v.forced!.from as 'first' | 'second' | 'third'],
+        speed: runSpeed(v),
+        throwDelaySec,
+      });
+      if (decided) startStretchReturn(v);
+    }
   }
 
   /**
@@ -3233,9 +3325,12 @@ export function createFieldPlayController(opts: {
     if (!canThrowNow()) return;
     const carrier = fielderPos[holderId];
     for (const v of liveRunners()) {
-      if (v.overrun || v.stumbleSec > 0 || v.origin === 'batter') continue;
+      if (v.overrun || v.stumbleSec > 0) continue;
       if (v.forced === null || v.forcePlay) continue; // フォース走者は止まっても塁へ投げられて終わり
-      const behind = BASE_POSITIONS[v.origin as 'first' | 'second' | 'third'];
+      // 戻る先は**この区間の始まりの塁**（自分で仕掛けた進塁なら起点、先の塁へ向かって
+      // いる走者なら踏んだ塁。フェーズBBB-77）。打者走者の最初の区間はフォースなのでここへ来ない。
+      if (v.forced.from === 'batter') continue;
+      const behind = BASE_POSITIONS[v.forced.from];
       const chase = {
         carrier,
         runner: v.pos,
@@ -3257,7 +3352,8 @@ export function createFieldPlayController(opts: {
         if (release === 'ahead') startRunnerResume(v);
         else if (release === 'behind') {
           startRunnerResume(v);
-          startRunnerReturn(v.origin as 'first' | 'second' | 'third');
+          if (isStretchLeg(v)) startStretchReturn(v);
+          else startRunnerReturn(v.origin as 'first' | 'second' | 'third');
         }
         continue;
       }
@@ -3326,6 +3422,241 @@ export function createFieldPlayController(opts: {
     }
   }
 
+  // ---- 塁を踏んでそのまま次の塁へ（フェーズBBB-77。`core/fielding.ts` の同名の節） ----
+
+  /**
+   * 先の塁へ向かう区間か（＝自分で仕掛けた進塁でも帰塁でもなく、**塁を踏んで止まらずに
+   * 続けている区間**）。起点の塁と区間の始まりが違うことで見分ける（打者走者は起点が本塁
+   * なので、一塁を踏んだ後の区間は必ずこれになる）。
+   */
+  function isStretchLeg(v: RunnerVisual): boolean {
+    return v.forced !== null && v.forced.from !== v.origin && v.forced.from !== v.forced.to;
+  }
+
+  /** その走者がいまの予約どおり走ったら最後に止まる塁 */
+  function stretchedEnd(v: RunnerVisual): BaseKey {
+    let at: BaseKey = v.forced!.to;
+    for (let i = 0; i < v.stretch && at !== 'home'; i++) at = advancedBase(at);
+    return at;
+  }
+
+  /**
+   * J で先の塁へ向かえるかを決める材料（`chooseStretchRunners`）。**打球のプレーだけ**
+   * ＝けん制・盗塁には打者走者も押し出しも無いので、走塁の操作は従来のまま。
+   * 塁上に残る走者も「その塁に留まる人」として必ず並べる（先の塁が空いているかの材料）。
+   */
+  function stretchCandidates(): StretchCandidate[] {
+    if (playKind !== 'batted') return [];
+    const out: StretchCandidate[] = [];
+    for (const v of runnerVisuals) {
+      if (v.out) continue;
+      if (v.forced === null) {
+        if (v.origin !== 'batter') out.push({ from: v.origin, to: v.origin, forced: false, canStretch: false });
+        continue;
+      }
+      const to = stretchedEnd(v);
+      out.push({
+        from: v.origin,
+        to,
+        forced: v.forcePlay,
+        canStretch:
+          !v.returning && !v.holding && !v.overrun && v.stumbleSec === 0 && to !== 'home',
+      });
+    }
+    return out;
+  }
+
+  /** 方向なしの J で先の塁へ向かえる走者がいる（ヒント `stretch` を出す条件） */
+  function stretchHintActive(): boolean {
+    if (phase === null || phase === 'resolved') return false;
+    return chooseStretchRunners(stretchCandidates(), null).length > 0;
+  }
+
+  /**
+   * 先の塁へ向かう予約を1つ積む。**もう塁に着いて止まっている走者は、その場から次の区間を
+   * 走り出す**（打球を見てから一塁で止まった打者走者を、二塁へ走らせ直せる）。
+   */
+  function startRunnerStretch(v: RunnerVisual): void {
+    v.stretch += 1;
+    if (v.arrived && v.forced !== null && v.forced.to !== 'home') {
+      v.arrived = false;
+      continueStretch(v);
+    }
+  }
+
+  /**
+   * 踏んだ塁から次の塁への区間に切り替える。**ここから先はタッチプレー**（その先へ押し出す
+   * 走者はいない）＝塁へ投げられただけでは刺されず、塁で待つ野手のタッチで決まる
+   * （K-31。引き返せば送球を無駄にできるのも、止まれるのも従来の進塁と同じ）。
+   */
+  function continueStretch(v: RunnerVisual): void {
+    const from = v.forced!.to as 'first' | 'second' | 'third';
+    v.stretch = Math.max(0, v.stretch - 1);
+    v.forced = { from, to: advancedBase(from) };
+    v.forcePlay = false;
+    v.arrived = false;
+    v.target = BASE_POSITIONS[v.forced.to];
+  }
+
+  /**
+   * いまの守備のボールの状況（フェーズBBB-78。`shouldCpuRoundBase` へ渡す）。
+   *
+   * 打球が**まだ地面に落ちていない**ときは null＝フライを捕られるかもしれないので、先の塁へは
+   * 打球の瞬間の見込み（`chooseCpuStretches`）どおりにしか行かない。転がっている球は
+   * **いまの野手の位置から、守備が最善に追って拾うまで**を見込む（`predictSecureAt` に
+   * 今の位置を渡す。同じフレームの中では一度だけ解く）。
+   */
+  function cpuDefenseBallState(): DefenseBallState | null {
+    if (phase === 'throwing' && throwState) {
+      return {
+        kind: 'throw',
+        target: throwState.target,
+        remainingSec: distance(throwState.pos, BASE_POSITIONS[throwState.target]) / THROW_SPEED,
+      };
+    }
+    if ((phase === 'possessed' || phase === 'carrying') && holderId !== null) {
+      return {
+        kind: 'held',
+        carrier: fielderPos[holderId],
+        delaySec: Math.max(0, throwHoldSec - throwHoldTimer, ballArriveSec - throwHoldTimer),
+      };
+    }
+    if (phase === 'flying' && ballState && ballState.landing !== null) {
+      return { kind: 'loose', secure: looseSecure(ballState) };
+    }
+    if (phase === 'loose') {
+      // ドロップキックで落ちた球は地面に止まっている（`looseBallPos`）
+      const resting: BattedBall = {
+        x: looseBallPos.x,
+        y: 0,
+        z: looseBallPos.z,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        landing: { ...looseBallPos },
+        over: null,
+        resting: true,
+        bunt: false,
+      };
+      return { kind: 'loose', secure: looseSecure(resting) };
+    }
+    return null;
+  }
+
+  /** 転がる球を拾うまでの見込み（同じフレームで何度も解かない） */
+  function looseSecure(ball: BattedBall): LandingPrediction {
+    if (looseSecureMemo && looseSecureMemo.elapsed === elapsed) return looseSecureMemo.value;
+    // 見込みは**相手の守備の動きを写す**（フェーズBBB-83）＝CPU守備なら先回り、人間の守備なら
+    // 従来どおり「いちばん近い野手を球へ向ける」動き
+    const value = isDefenseHuman()
+      ? predictSecureAt(ball, ballpark(), 1 / 60, 12, fielderPos)
+      : predictSecureAt(
+          ball,
+          ballpark(),
+          1 / 60,
+          12,
+          fielderPos,
+          'intercept',
+          Math.max(0, CPU_FIELD_REACTION_SEC - elapsed),
+        );
+    looseSecureMemo = { elapsed, value };
+    return value;
+  }
+
+  /** 自分以外の走者が `base` に留まる（立っている・向かっている）か */
+  function baseHeldByAnother(self: RunnerVisual, base: BaseKey): boolean {
+    return runnerVisuals.some((r) => {
+      if (r === self || r.out) return false;
+      const at = r.forced === null ? r.origin : r.forced.to;
+      return at === base;
+    });
+  }
+
+  /**
+   * CPU走者が、いま踏んだ（立っている）塁から次の塁へ行くか（フェーズBBB-78。
+   * `shouldCpuRoundBase`）。打球のプレーだけ（けん制・盗塁は別の規則）・フライ捕球の後
+   * （タッチアップの局面）は見ない。次の塁に他の走者が留まるなら行かない。打球が
+   * まだ落ちていなければ、打球の瞬間の見込み（`v.stretch`）どおり。
+   */
+  function cpuRoundsBase(v: RunnerVisual, base: 'first' | 'second' | 'third'): boolean {
+    if (playKind !== 'batted' || tagUpActive) return false;
+    const next = advancedBase(base);
+    if (next !== 'home' && baseHeldByAnother(v, next)) return false;
+    const defense = cpuDefenseBallState();
+    if (defense === null) return v.stretch > 0;
+    return shouldCpuRoundBase({ runner: v.pos, base, speed: runSpeed(v), defense });
+  }
+
+  /**
+   * 塁の上にいるCPU走者が、**ボールが地面に落ちた後に**次の塁へ行けるようになったら行く
+   * （フェーズBBB-78）。打球の瞬間に「ここで止まる」と決めた走者でも、守備がボールへ
+   * 着くのが見込みより遅ければ（人間の守備）ここで走り出す。打球の瞬間に動かなかった
+   * 走者（フォースでなく、仕掛けもしなかった走者）も同じ。拾うまでの見込みは打球と野手を
+   * 影で回すので、毎フレームではなく `CPU_ROUND_CHECK_SEC` ごとに見る。
+   */
+  function updateCpuRoundBases(d: number): void {
+    if (isOffenseHuman() || playKind !== 'batted' || tagUpActive) return;
+    if (phase !== 'flying' && phase !== 'loose' && phase !== 'possessed' && phase !== 'carrying' && phase !== 'throwing') return;
+    cpuRoundTimer += d;
+    if (cpuRoundTimer < CPU_ROUND_CHECK_SEC) return;
+    cpuRoundTimer = 0;
+    if (cpuDefenseBallState() === null) return;
+    for (const v of runnerVisuals) {
+      if (v.out || v.returning || v.holding || v.overrun || v.stumbleSec > 0) continue;
+      let base: 'first' | 'second' | 'third' | null = null;
+      if (v.forced === null) base = v.origin === 'batter' ? null : v.origin;
+      else if (v.arrived && v.forced.to !== 'home') base = v.forced.to as 'first' | 'second' | 'third';
+      if (base === null || !cpuRoundsBase(v, base)) continue;
+      if (v.forced === null) startRunnerAdvance(base);
+      else continueStretch(v);
+    }
+  }
+
+  /**
+   * 先の塁へ向かっていた走者を、**踏んだ塁へ**戻す（K＋方向／CPUの引き返し）。
+   * 自分で仕掛けた進塁の帰塁（`startRunnerReturn`）と同じ扱いで、戻る途中はその塁へ
+   * 投げられれば刺される・1プレーに1回だけ（K-31の `retreatUsed`）。
+   */
+  function startStretchReturn(v: RunnerVisual): void {
+    const base = v.forced!.from as 'first' | 'second' | 'third';
+    v.forced = { from: base, to: base };
+    v.forcePlay = false;
+    v.retreatUsed = true;
+    v.returning = true;
+    v.arrived = false;
+    v.holding = false;
+    v.stretch = 0;
+    v.target = BASE_POSITIONS[base];
+    v.overrun = false;
+    dismountBike(v);
+    possessedTimer = 0;
+    holdSafeTimer = 0;
+  }
+
+  /**
+   * K（帰塁）の塁指定を走者に解く。**先の塁の予約がある走者は「その塁で止まる」**
+   * （まだ踏んでいない塁へ「戻る」＝予約の取り消し）、**先の塁へ向かっている走者は
+   * 踏んだ塁へ戻る**。どちらでもなければ従来の帰塁へ（`startRunnerReturn`）。
+   */
+  function recallStretchRunner(base: 'first' | 'second' | 'third'): boolean {
+    const queued = runnerVisuals.find(
+      (v) => !v.out && !v.arrived && v.stretch > 0 && v.forced?.to === base && !v.returning,
+    );
+    if (queued) {
+      queued.stretch = 0;
+      return true;
+    }
+    const stretching = runnerVisuals.find(
+      (v) =>
+        !v.out && !v.arrived && !v.returning && !v.retreatUsed && isStretchLeg(v) && v.forced!.from === base,
+    );
+    if (stretching) {
+      startStretchReturn(stretching);
+      return true;
+    }
+    return false;
+  }
+
   /**
    * CPU攻撃側の「もう1つ先の塁を狙う」（フェーズX-45。`chooseCpuExtraBases`）。
    *
@@ -3345,20 +3676,51 @@ export function createFieldPlayController(opts: {
    * （`sendableRunnerBases`）。フォース走者は放っておいても走るので仕掛ける対象ではない。
    */
   function startCpuExtraBases(landing: LandingPrediction, chaser: FielderId): void {
+    // ボールが着地する時刻と、いちばん近い野手がそこへ着く時刻の遅いほう
+    const secureSec = Math.max(
+      landing.sec,
+      distance(FIELDER_HOME_POSITIONS[chaser], landing.point) / FIELDER_SPEED,
+    );
     const candidates = sendableRunnerBases(originalBases, forced, []);
-    if (candidates.length === 0) return;
-    const chosen = chooseCpuExtraBases(candidates, {
-      securePoint: landing.point,
-      // ボールが着地する時刻と、いちばん近い野手がそこへ着く時刻の遅いほう
-      secureSec: Math.max(
-        landing.sec,
-        distance(FIELDER_HOME_POSITIONS[chaser], landing.point) / FIELDER_SPEED,
-      ),
-      // 走力はその走者の見た目が持っている値そのもの（`chooseCpuTagUp` と同じ＝
-      // 「行けると判断した前提」と「実際に走る速さ」が食い違わない）
-      speedOf: (from) => findVisual(from)?.speed ?? RUNNER_SPEED,
-    });
-    for (const from of chosen) startRunnerAdvance(from);
+    if (candidates.length > 0) {
+      const chosen = chooseCpuExtraBases(candidates, {
+        securePoint: landing.point,
+        secureSec,
+        // 走力はその走者の見た目が持っている値そのもの（`chooseCpuTagUp` と同じ＝
+        // 「行けると判断した前提」と「実際に走る速さ」が食い違わない）
+        speedOf: (from) => findVisual(from)?.speed ?? RUNNER_SPEED,
+      });
+      for (const from of chosen) startRunnerAdvance(from);
+    }
+    // 塁を踏んでそのまま次の塁へ（フェーズBBB-77）。**同じ余白**で、打者走者・押し出された
+    // 走者・いま仕掛けた走者がどこまで行くかを決める（`chooseCpuStretches`）。前の走者から
+    // 順に見るので、前が止まる塁へ後ろは行かない。見込みは**転がる球をCPU守備と同じ動きで
+    // 追って拾う時刻**（`predictSecureAt`）＝着地の時刻（上の X-45）では実際より中央値で
+    // 2.55秒早く、一度も狙わなかった（`npm run balance:stretch`）。
+    const secure = isDefenseHuman()
+      ? predictSecureAt(ballState!, ballpark())
+      : predictSecureAt(
+          ballState!,
+          ballpark(),
+          1 / 60,
+          12,
+          FIELDER_HOME_POSITIONS,
+          'intercept',
+          CPU_FIELD_REACTION_SEC,
+        );
+    const stretches = chooseCpuStretches(
+      runnerVisuals.flatMap((v): CpuStretchCandidate[] => {
+        if (v.out) return [];
+        if (v.forced === null) {
+          return v.origin === 'batter'
+            ? []
+            : [{ from: v.origin, to: v.origin, forced: false, canStretch: false, start: { ...v.pos }, speed: v.speed }];
+        }
+        return [{ from: v.origin, to: v.forced.to, forced: v.forcePlay, canStretch: true, start: { ...v.pos }, speed: v.speed }];
+      }),
+      { securePoint: secure.point, secureSec: secure.sec },
+    );
+    for (const v of runnerVisuals) v.stretch = stretches.get(v.origin) ?? 0;
   }
 
   // ---- 塁間で止まる（フェーズN-34。説明書p25の挟殺の「逃げる側」） ----
@@ -3471,6 +3833,8 @@ export function createFieldPlayController(opts: {
     visual.retreatUsed = true;
     visual.returning = true;
     visual.arrived = false;
+    // 戻るなら先の塁の予約も消える（フェーズBBB-77）
+    visual.stretch = 0;
     // 止まっていた走者もKで引き返せる（フェーズN-34）＝逃げ方は既存の帰塁だけ、という
     // K-31の約束のまま。ここを戻さないと「戻る指示を出したのに止まったまま」になる。
     visual.holding = false;
@@ -3519,6 +3883,8 @@ export function createFieldPlayController(opts: {
       v.bikeUsed = false;
       v.overrun = false;
       dismountBike(v);
+      // 先の塁の予約も無かったことになる（フェーズBBB-77）＝タッチアップは塁から仕掛け直す
+      v.stretch = 0;
       v.pos = { ...base };
       v.target = { ...base };
       placeRunner(v, true);
@@ -3612,11 +3978,12 @@ export function createFieldPlayController(opts: {
     if (phase !== 'flying' || !ballState) return;
     // 打球発生直後は捕球無効（捕手の「即捕り」防止。CATCH_MIN_PLAY_SEC参照）
     if (elapsed < CATCH_MIN_PLAY_SEC) return;
-    // 飛球（ノーバウンド）はファウル地域上では捕らない（v1仕様：ファウルフライの
-    // 捕球アウトは対象外）。着地後のボールは、着地点がフェアなら生きた打球なので
-    // 現在地がファウル地域でも拾える（着地点ファウルは decideFallback が
-    // ファウル判定で先に決着させるため、ここには来ない）。
-    if (ballState.landing === null && !isFairPosition(ballState.x, ballState.z)) return;
+    // 飛球（ノーバウンド）は**ファウル地域でも捕ればアウト**（ファウルフライ。フェーズBBB-79。
+    // それまでは v1 の割り切りでフェアの上しか捕らず、落下点にいた野手の横を球が抜けて
+    // ファウルになっていた）。捕れないのはスタンドに入った球だけ（`isCatchableFly`）。
+    // 着地後のボールは、着地点がフェアなら生きた打球なので現在地がファウル地域でも拾える
+    // （着地点ファウルは decideFallback がファウル判定で先に決着させるため、ここには来ない）。
+    if (ballState.landing === null && !isCatchableFly(ballpark(), ballState.x, ballState.z)) return;
     // ファインプレイ中の1人だけリーチが伸びた状態で判定する（説明書p23）。
     // 蹴り倒されている野手（フェーズF-26-4）は候補から外れる（倒れたまま捕らない）。
     const catcher = nearestCatchableFielder(
@@ -3640,7 +4007,7 @@ export function createFieldPlayController(opts: {
         // **球は捕った野手の手の中へ**（テストプレイ「捕られたはずのボールが、捕った選手を
         // すり抜けてバウンドしていく」）。持ち主を書かずに畳むと、余韻（`updateAftermath`）が
         // 「誰の手にも無い球」として飛行を続けさせていた。持ち主が決まっていれば、余韻では
-        // 手の中に収まり、少し置いてから投手へ返される（アウトの後の球回し）
+        // 手の中に収まったまま、でっかいモードへ戻る
         holderId = catcher;
         const p = fielderPos[catcher];
         ball.position.set(p.x, THROW_BALL_HEIGHT, p.z);
@@ -3650,11 +4017,12 @@ export function createFieldPlayController(opts: {
       }
       return;
     }
-    // バウンド後の捕球＝ボールを確保。送球フェーズへ。
+    // バウンド後の捕球＝ボールを確保。送球フェーズへ（持ち替えの間は投げられない）。
     phase = 'possessed';
     holderId = catcher;
     possessedTimer = 0;
     holdSafeTimer = 0;
+    startPickupRelease();
     const p = fielderPos[catcher];
     ball.position.set(p.x, BALL_RADIUS, p.z);
     shadow.visible = false;
@@ -3679,7 +4047,6 @@ export function createFieldPlayController(opts: {
       pauseT = 0;
       elapsed = 0;
       restingT = 0;
-    restingNearest = Infinity;
       restingNearest = Infinity;
       possessedTimer = 0;
       tagUpActive = false;
@@ -3693,11 +4060,14 @@ export function createFieldPlayController(opts: {
       carryTarget = null;
       cpuRundownUsed = false;
       cpuThrewOnce = false;
+      cpuRoundTimer = 0;
+      looseSecureMemo = null;
       defenseOuts = 0;
       throwState = null;
       holdSafeTimer = 0;
       const landing = predictLandingAt(initial);
       landingPoint = landing.point;
+      startCpuChase(initial);
       // 一斉移動の対象（塁カバー4人を除く）のうち、着地予測にもっとも近い野手。
       // **X-45（CPUの余分な進塁）が守備の時間を見積もるのに使う**（守備側の見た目には
       // 使わない＝UU-69で「操作中の野手の目印」を外した）。
@@ -3726,10 +4096,11 @@ export function createFieldPlayController(opts: {
       syncBall(initial);
     },
 
-    startPickoff(baseRunners, outs, carried) {
+    startPickoff(baseRunners, outs, carried, cpuStealing = []) {
       // 持ち越したリード（フェーズL-32）があればそこから始める。無ければ従来どおり0＝
       // A-6で調整した「リードが育つのを待って投げる」タイミングの手触りは動かない。
       beginRunnerPlay('pickoff', baseRunners, outs, 'P', { ...carried });
+      cpuStealIntent = new Set(cpuStealing);
     },
 
     startSteal(baseRunners, outs, target, pitchRemainingSec, carried) {
@@ -3791,7 +4162,6 @@ export function createFieldPlayController(opts: {
       // 打球としての計時はここから（捕球無効の CATCH_MIN_PLAY_SEC も打った瞬間が起点）
       elapsed = 0;
       restingT = 0;
-    restingNearest = Infinity;
       restingNearest = Infinity;
       possessedTimer = 0;
       holdSafeTimer = 0;
@@ -3842,6 +4212,7 @@ export function createFieldPlayController(opts: {
 
       const landing = predictLanding(initial);
       landingPoint = landing;
+      startCpuChase(initial);
 
       ball.visible = true;
       ball.scale.setScalar(BALL_SCALE);
@@ -3900,9 +4271,9 @@ export function createFieldPlayController(opts: {
 
       // 野手の移動（捕球後は送球するまで静止＝ボールを持ったまま走らないv1仕様）。
       // 原作準拠（説明書p20）：塁カバー4人は自動で各塁へ入り、残り（P/SS/LF/CF/RF）は
-      // 十字キーで「全員が同じ方向へ」一斉移動する。CPU守備は、着地予測にもっとも
-      // 近い野手が目標（着地予測。着地後はボールの現在地）へ向かう方向を全員に適用する
-      // （＝人間の一斉移動と同じ動かし方をCPUがやる。コードパスを分けないための設計）。
+      // 十字キーで「全員が同じ方向へ」一斉移動する。CPU守備は、**いちばん早く球に触れる野手が
+      // 球と出会う点へ向かう方向**を全員に適用する（フェーズBBB-83の先回り。`cpuChase`）
+      // ＝人間の一斉移動と同じ動かし方をCPUがやる（コードパスを分けないための設計）。
       if (phase === 'flying') {
         // ファインプレイ中の野手は、跳んだ勢いで動き（ダイビング）、起き上がるまで
         // 一斉移動・塁カバーの対象から外れる（＝跳んで外したときのコスト）。
@@ -3915,13 +4286,19 @@ export function createFieldPlayController(opts: {
               ? { x: ballState.x, z: ballState.z }
               : landingPoint
             : null,
+          true,
         );
 
         // CPU守備のファインプレイ（説明書p23）：打球を先読みして「立っていては届かないが
         // 跳べば届く」ときだけ跳ぶ（決定的判断。無駄跳びをしないので起き上がりの隙は出ない）。
         if (!isDefenseHuman() && finePlay === null && ballState && elapsed >= CATCH_MIN_PLAY_SEC) {
           const choice = chooseCpuFinePlay(fielderPos, ballState, undefined, catchBonusOf);
-          if (choice) startFinePlay(choice.id, choice.kind, choice.dir);
+          // **走って手で捕れる見込みの野手は跳ばない**（フェーズBBB-83）。`chooseCpuFinePlay` は
+          // 立ち止まったときに届くかしか見ないので、落下点へ走っている最中の野手が「跳べば届く」
+          // 高さで早く跳んでしまい、そこで固まって捕れるフライを落としていた
+          const runsItDown =
+            cpuChasePlan !== null && cpuChasePlan.kind === 'fly' && choice?.id === cpuChasePlan.chaser;
+          if (choice && !runsItDown) startFinePlay(choice.id, choice.kind, choice.dir);
         }
 
         // CPU守備の一時効果（フェーズM-33。`ケモノガエリ`）：ファインプレイとまったく
@@ -4001,6 +4378,22 @@ export function createFieldPlayController(opts: {
             placeRunner(v);
             continue;
           }
+          // 塁を踏んだ。**先の塁へ行くなら止まらずに次の区間へ**（フェーズBBB-77）。
+          // バイクの行き過ぎより先に見る＝次の塁へ向かって走り抜けるので、ここでは止まらない
+          // （行き過ぎるのは最後に止まる塁）。人間の走者は自分の予約（J）どおり、CPU走者は
+          // **踏んだ瞬間の守備の状況で決め直す**（フェーズBBB-78。`cpuRoundsBase`＝三塁コーチの
+          // 「回せ／止まれ」。打球の瞬間に止まると決めていても、ボールがまだ遠ければ回る）。
+          if (!v.returning && v.forced.to !== 'home') {
+            const base = v.forced.to as 'first' | 'second' | 'third';
+            const go = isOffenseHuman()
+              ? v.stretch > 0 && !baseHeldByAnother(v, advancedBase(base))
+              : cpuRoundsBase(v, base);
+            if (go) {
+              continueStretch(v);
+              continue;
+            }
+            v.stretch = 0;
+          }
           // 曲がれないので塁で止まれず行き過ぎる。踏んだ塁は forced.to のまま
           if (v.bike && bikeOverrunsAt(v.forced.to)) {
             startOverrun(v);
@@ -4062,6 +4455,8 @@ export function createFieldPlayController(opts: {
       // 先に見るので、2つの規則が同じ場面で競合しない。
       updateCpuHold();
       updateCpuBreak();
+      // 塁の上のCPU走者が、ボールが遠いうちに次の塁へ（フェーズBBB-78）
+      updateCpuRoundBases(d);
 
       if (phase === 'loose') {
         // 叩き落とされたボールを拾いにいく局面。**野手の動かし方は打球の飛行中と同じ**で、
@@ -4418,10 +4813,18 @@ export function createFieldPlayController(opts: {
         ]),
         runningLegs(),
         baseFromPadDirection(x, y),
+        // 打者走者・押し出された走者は、いま向かっている塁を踏んでそのまま次の塁へ行ける
+        // （フェーズBBB-77）。「走れ」の側に入るので、行ける走者がいる間は J は止まる
+        // 指示にならない（N-34の順番のまま）。
+        stretchCandidates(),
       );
       if (command === null) return;
       if (command.kind === 'send') {
         for (const from of command.from) startRunnerAdvance(from as 'first' | 'second' | 'third');
+        for (const from of command.stretch ?? []) {
+          const v = findVisual(from);
+          if (v && !v.out) startRunnerStretch(v);
+        }
         return;
       }
       if (command.kind === 'resume') {
@@ -4451,6 +4854,9 @@ export function createFieldPlayController(opts: {
         startOverrunReturn(overrun);
         return;
       }
+      // 先の塁の予約・先の塁へ向かっている走者（フェーズBBB-77）は、まだ踏んでいない塁なら
+      // そこで止まり、踏んだ先へ向かっていれば踏んだ塁へ戻る。
+      if (recallStretchRunner(chosen)) return;
       startRunnerReturn(chosen);
     },
 

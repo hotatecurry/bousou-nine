@@ -35,6 +35,10 @@
     "balance:ball": "vite-node tools/balance/ball.ts",
     "balance:flight": "vite-node tools/balance/flight.ts",
     "balance:plate": "vite-node tools/balance/plate.ts",
+    "balance:stretch": "vite-node tools/balance/stretch.ts",
+    "balance:tell": "vite-node tools/balance/tellReport.ts",
+    "balance:speed": "vite-node tools/balance/speedReport.ts",
+    "balance:pace": "vite-node tools/balance/paceReport.ts",
     "balance:brawl": "vite-node tools/balance/brawlReport.ts"
   },
   "dependencies": {

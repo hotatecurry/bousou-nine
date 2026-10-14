@@ -31,6 +31,7 @@ import {
   PLATE_Z,
   RELEASE_Z,
   type PitchProfile,
+  neutralSpeedFor,
   speedForPitchSelection,
 } from '../../src/core/pitch';
 import {
@@ -96,11 +97,21 @@ const MODE_LABEL: Record<CpuSpeedMode, string> = {
 console.log('\n=== 1. 球速モードの費用（当てられたときの質）＝O-35のU字をSPD別に見る ===');
 console.log('   分母は当たった打球。ところざわ・長打力0.5・打率0.5。');
 console.log('   同じ「速球」でもSPDで実速が違う（速球派の速球48m/s vs 軟投派の速球36m/s）。');
+console.log('   **BBB-85 から、打球に乗るのは緩急ぶんだけ**＝当てられたときの質は、どのSPDでも同じになる。');
 console.log(`${'SPD'.padEnd(6)}${'モード'.padEnd(10)}${row(['実速', '安打率', 'HR率', 'ゴロアウト'])}`);
 for (const spd of [0, 0.5, 1]) {
   for (const mode of MODES) {
     const speed = speedForPitchSelection(MODE_SELECTION[mode], spd);
-    const s = summarize(sweep({ park: DEFAULT_BALLPARK, batter, pitchSpeed: speed, steps: 10 }));
+    // 打球に乗るのは緩急ぶんだけ（BBB-85）＝投手の基準速を一緒に渡す
+    const s = summarize(
+      sweep({
+        park: DEFAULT_BALLPARK,
+        batter,
+        pitchSpeed: speed,
+        pitcherNeutral: neutralSpeedFor(spd),
+        steps: 10,
+      }),
+    );
     console.log(
       `${String(spd).padEnd(6)}${MODE_LABEL[mode].padEnd(10)}` +
         row([
@@ -206,7 +217,15 @@ for (const { label, profile } of SAMPLE_PROFILES) {
     let hr = 0;
     for (const mode of modes) {
       const speed = speedForPitchSelection(MODE_SELECTION[mode], profile.speed);
-      const s = summarize(sweep({ park: DEFAULT_BALLPARK, batter, pitchSpeed: speed, steps: 8 }));
+      const s = summarize(
+        sweep({
+          park: DEFAULT_BALLPARK,
+          batter,
+          pitchSpeed: speed,
+          pitcherNeutral: neutralSpeedFor(profile.speed),
+          steps: 8,
+        }),
+      );
       hit += s.hitRate / modes.length;
       hr += s.homerunRate / modes.length;
     }

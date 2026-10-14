@@ -207,18 +207,8 @@ export type GameEvent =
   | {
       type: 'BRAWL_RESOLVED';
       loser: 'batter' | 'pitcher';
-      /**
-       * 死球送信直前（＝乱闘が起こらなければ確定していたはずの状態）のスナップショット。
-       * battingLineupIndex は打者側チームの打順インデックス（HIT_BY_PITCHで
-       * 楽観的に1つ進めていたものを、乱闘決着で「同じ打席が継続」する場合に戻すため）。
-       */
-      restore: {
-        count: Count;
-        bases: Bases;
-        /** 走者の識別（任意。PLAY_RESOLVED と同じ理由で、無ければ bases から合成する） */
-        baseRunners?: BaseRunners;
-        battingLineupIndex: number;
-      };
+      /** 死球の直前の状態（`hbpRestoreOf`）。乱闘の決着で死球そのものを無かったことにする */
+      restore: BrawlRestore;
     }
   | { type: 'FORFEIT'; loser: TeamSide }
   /**
@@ -578,6 +568,53 @@ function reduceRunnerPlayResolved(
 }
 
 /**
+ * 死球の直前の状態＝**乱闘が決着したら、死球そのものを無かったことにするための控え**
+ * （`BRAWL_RESOLVED` の `restore`）。死球（`reduceHitByPitch`）は起きた瞬間に進塁・得点・
+ * カウント・打順を確定させる（乱闘にならなければそのまま残る）ので、乱闘の決着で
+ * 「同じ打席が継続する」には、それらを全部ここから戻す。
+ *
+ * `rosters`・`score`・`lineScore` はフェーズBBB-81で足した（渡されなければその項目は
+ * 戻さない＝それまでと同じ）。それまでは打順の**番号**しか戻さなかったので、
+ * - **投手の打順に入った代打**が死球を受けると、打順スロットが現在の投手へ返されたまま
+ *   （`advanceBatter`）＝乱闘で戦うのも、再開後に打席に立つのも、代打ではなく投手だった
+ * - **満塁の死球の押し出しの1点**が、死球が無かったことになった後も残った
+ * - **一時効果**（M-33）が、同じ打席が続くのに消えていた
+ *
+ * 死球から乱闘の決着までに試合の状態を動かすのは死球そのものだけ（投球数・銃の発射は
+ * 死球より前に記録される）なので、ロスターはまるごと戻してよい。
+ */
+export interface BrawlRestore {
+  count: Count;
+  bases: Bases;
+  /** 走者の識別（任意。PLAY_RESOLVED と同じ理由で、無ければ bases から合成する） */
+  baseRunners?: BaseRunners;
+  /** 打者側チームの打順インデックス（死球で楽観的に1つ進めていたものを戻す） */
+  battingLineupIndex: number;
+  /** 死球の直前の両チームのロスター */
+  rosters?: { away: TeamRoster; home: TeamRoster };
+  /** 死球の直前の得点・スコアボード（満塁の死球は押し出しで1点入っている） */
+  score?: Score;
+  lineScore?: LineScore;
+}
+
+/**
+ * いまの状態から巻き戻し用の控えを起こす。**死球（`HIT_BY_PITCH`）を送る直前に呼ぶ。**
+ * 死球を受けた打者は `rosters[攻撃側].lineup[battingLineupIndex]`＝乱闘で戦う打者も
+ * ここから引く（死球の後のロスターから引くと、打順はもう進んでいる）。
+ */
+export function hbpRestoreOf(ctx: GameContext): BrawlRestore {
+  return {
+    count: ctx.count,
+    bases: ctx.bases,
+    baseRunners: ctx.baseRunners,
+    battingLineupIndex: ctx.rosters[battingTeam(ctx.half)].lineupIndex,
+    rosters: ctx.rosters,
+    score: ctx.score,
+    lineScore: ctx.lineScore,
+  };
+}
+
+/**
  * 乱闘決着。CLAUDE.md「打者敗北時：代打が同じカウント・同じ走者状況を引き継いで
  * 打席を継続（アウトにはならない）」「投手敗北時：援護投手が同じカウント・同じ
  * 打者で継投」の両方とも、要は「死球そのものが無かったことになり、同じ打席が
@@ -595,22 +632,22 @@ function reduceRunnerPlayResolved(
 function reduceBrawlResolved(
   ctx: GameContext,
   loser: 'batter' | 'pitcher',
-  restore: {
-    count: Count;
-    bases: Bases;
-    baseRunners?: BaseRunners;
-    battingLineupIndex: number;
-  },
+  restore: BrawlRestore,
 ): GameContext {
   const battingSide = battingTeam(ctx.half);
   const loserSide = loser === 'batter' ? battingSide : fieldingTeam(ctx.half);
 
   // 打順の巻き戻しは勝敗どちらのケースでも共通（「同じ打席が継続」するため）。
+  // **ロスターは死球の直前のものへ戻す**（フェーズBBB-81。`BrawlRestore.rosters`）：死球は
+  // 打順を進めるだけでなく、投手の打順スロットを現在の投手へ返し（＝そこにいた代打を
+  // 退かせ）、両チームの一時効果も落としている（`advanceLineup`）。打順の番号だけ戻すと
+  // 「同じ打席」の中身が代打から投手に入れ替わったまま続いていた。
+  const baseRosters = restore.rosters ?? ctx.rosters;
   const restoredBattingRoster = setLineupIndex(
-    ctx.rosters[battingSide],
+    baseRosters[battingSide],
     restore.battingLineupIndex,
   );
-  const rostersAfterRestore = { ...ctx.rosters, [battingSide]: restoredBattingRoster };
+  const rostersAfterRestore = { ...baseRosters, [battingSide]: restoredBattingRoster };
 
   const loserRoster = rostersAfterRestore[loserSide];
   const sub =
@@ -622,6 +659,9 @@ function reduceBrawlResolved(
     {
       ...ctx,
       count: restore.count,
+      // 満塁の死球の押し出しも無かったことになる（フェーズBBB-81。渡されなければ従来どおり）
+      score: restore.score ?? ctx.score,
+      lineScore: restore.lineScore ?? ctx.lineScore,
       rosters: { ...rostersAfterRestore, [loserSide]: sub.roster },
     },
     eventRunners(restore.bases, restore.baseRunners),

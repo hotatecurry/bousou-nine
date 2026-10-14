@@ -42,10 +42,23 @@ import {
   pickoffOutLead,
   stealSafeJumpSec,
 } from '../../src/core/fielding';
-import { CATCH_Z, RELEASE_Z, SPEED_FAST, SPEED_NEUTRAL, SPEED_SLOW } from '../../src/core/pitch';
+import {
+  CATCH_Z,
+  PITCH_WINDUP_SEC,
+  SPEED_FAST,
+  SPEED_NEUTRAL,
+  SPEED_SLOW,
+  flightSecondsUntil,
+  releasePitchFlight,
+} from '../../src/core/pitch';
+import { STEAL_GO_SEC } from '../../src/core/keyframes';
 
-/** ワインドアップの長さ（dekkaiScene.ts の WINDUP_SEC。あちらは非公開なので写す） */
-const WINDUP_SEC = 0.35;
+/**
+ * 走者が使えるモーションの長さ（フェーズBBB-76）。モーションは原作の70フレーム
+ * （`PITCH_WINDUP_SEC`）になったが、**走り出せるのは投手が本塁へ踏み出してから**
+ * （`STEAL_GO_SEC`）なので、持ち時間に足されるのはそこからリリースまで（26フレーム）。
+ */
+const WINDUP_SEC = PITCH_WINDUP_SEC - STEAL_GO_SEC;
 
 /**
  * 仕掛けられるいちばん早い瞬間＝ワインドアップに入った直後の「捕手に届くまでの残り時間」。
@@ -53,7 +66,9 @@ const WINDUP_SEC = 0.35;
  * （dekkaiScene.ts の timeToCatcher() と同じ式：残りモーション＋リリース点からの飛行）
  */
 function maxJumpSec(pitchSpeed: number): number {
-  return WINDUP_SEC + (CATCH_Z - RELEASE_Z) / pitchSpeed;
+  // 飛行は**ゲームが投げる球とまったく同じ球**で数える（dekkaiScene.ts の timeToCatcher と同じ
+  // `releasePitchFlight`＝時計とフォークの手元の失速込み。BBB-77で失速を足した）
+  return WINDUP_SEC + flightSecondsUntil(releasePitchFlight(0, pitchSpeed, 0), CATCH_Z);
 }
 
 const PITCHES: Array<[string, number]> = [
@@ -85,7 +100,7 @@ function section1(): void {
   console.log('\n=== 1. リードが盗塁の窓をどれだけ動かすか ===');
   console.log('窓 = 仕掛けた瞬間に必要な「投球の残り時間」s（小さいほど易しい）。');
   console.log(
-    `仕掛けられる上限 = ワインドアップ${WINDUP_SEC}s + 飛行時間：` +
+    `仕掛けられる上限 = ワインドアップ${WINDUP_SEC.toFixed(2)}s + 飛行時間：` +
       PITCHES.map(([name, speed]) => `${name} ${maxJumpSec(speed).toFixed(2)}s`).join(' / '),
   );
   console.log('「成立」= その窓に間に合う球種（＝その球なら盗塁が成立しうる）。\n');
@@ -127,7 +142,9 @@ function section2(): void {
   }
   console.log(
     '\n既定（3.5m）との差がそのまま「早めにKを押したことの損」になる。' +
-      '\n遅球にだけ穴が残るのは狙いどおり（投手が緩い球を選べば走者に付け入る隙がある）。',
+      '\nL-32の当時は遅球（0.80秒かかる球）にだけ穴が残っていたが、フェーズBBB-76で緩急の幅が原作どおり' +
+      '\n狭くなった（遅い球も 0.47秒で捕手に着く）ので、基準速の走者は**どの球にも走れなくなった**' +
+      '\n（遅球の上限 0.90秒 vs 窓 0.91秒＝0.01秒差）。俊足（8.2m/s）はどの球にも走れる。',
   );
 }
 

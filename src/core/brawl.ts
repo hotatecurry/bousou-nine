@@ -19,7 +19,8 @@
  * - **コンボ**：通常技を当てた（ガードされた）ときだけ必殺技へキャンセルできる。
  *   のけぞりが技の硬直より長ければ次の通常技が繋がる（目押し）。
  * - **ヒットストップ・のけぞり・ガード硬直・押し戻し・ダウン・起き上がり・ピヨり**。
- * - **ラウンド制**：2本先取・1ラウンド60秒（ユーザー判断）。時間切れは体力の割合で判定。
+ * - **1本勝負**：1ラウンド60秒（フェーズBBB-80。ユーザー判断「やっぱり乱闘は1ラウンド制で良い」。
+ *   XX-72 は2本先取だった）。時間切れは体力の割合で判定。引き分けなら延長のラウンド。
  *
  * ## 時計は1フレーム＝1/60秒（固定）
  *
@@ -64,8 +65,21 @@ export const OTHER_SIDE: Record<BrawlSide, BrawlSide> = { batter: 'pitcher', pit
 export const FPS = 60;
 /** 1ラウンドの秒数（ユーザー判断） */
 export const ROUND_SECONDS = 60;
-/** 先に取れば勝ちのラウンド数（2本先取。ユーザー判断） */
-export const ROUNDS_TO_WIN = 2;
+/**
+ * 先に取れば勝ちのラウンド数。**1本勝負**（フェーズBBB-80。2026-10-10 ユーザー判断「やっぱり乱闘は
+ * 1ラウンド制で良い」）。XX-72 は2本先取だった＝死球1つで最大3ラウンド（3分）止まっていた。
+ * 進行（`finishRound`・HUDの印・呼び出しの文言）はこの値から決まるので、戻すならここだけ。
+ */
+export const ROUNDS_TO_WIN = 1;
+
+/**
+ * ラウンドの始まりの呼び出し。1本勝負なら `一本勝負`、引き分けで続くラウンドは `延長戦`。
+ * 2本以上の勝負なら `第nラウンド`。呼び出し（main.ts）とHUDの時計の下の表示が同じ文言を使う。
+ */
+export function roundCallText(round: number): string {
+  if (ROUNDS_TO_WIN > 1) return `第${round}ラウンド`;
+  return round <= 1 ? '一本勝負' : '延長戦';
+}
 /**
  * 最大ラウンド数。引き分けのラウンドは誰にも数えないので、延々と続かないよう上限を置く。
  * 上限まで決まらなければ取ったラウンドの多いほう、それも同じなら**打者の勝ち**
@@ -1046,19 +1060,13 @@ function advancePhase(ctx: StepCtx): void {
       if (s.phaseT >= TIME_UP_FRAMES) finishRound(ctx, timeUpWinner(s));
       break;
     case 'roundEnd':
+      // ここへ来るのは決着しなかったラウンドだけ（決着のラウンドは `finishRound` が直接
+      // `matchEnd` へ送る）＝勝ち名乗りを見せたら次のラウンドへ
       if (s.phaseT >= ROUND_END_FRAMES) {
-        const decided = matchWinner(s);
-        if (decided) {
-          s.phase = 'matchEnd';
-          s.phaseT = 0;
-          s.winner = decided;
-          ctx.events.push({ k: 'matchEnd', winner: decided, loser: OTHER_SIDE[decided] });
-        } else {
-          s.round += 1;
-          resetForRound(s);
-          s.phase = 'intro';
-          s.phaseT = 0;
-        }
+        s.round += 1;
+        resetForRound(s);
+        s.phase = 'intro';
+        s.phaseT = 0;
       }
       break;
     case 'matchEnd':
@@ -1093,12 +1101,22 @@ function finishRound(ctx: StepCtx, winner: BrawlSide | 'draw'): void {
     const loser = s[OTHER_SIDE[winner]];
     if (loser.act.k !== 'ko') loser.act = { k: 'lose', t: 0 };
   }
+  // **決着のラウンドは勝ち名乗りを1回だけ**（フェーズBBB-80）：ラウンドの勝ち名乗り→乱闘の
+  // 勝ち名乗りと2回続けない。1本勝負では毎回ここを通る＝K.O.のあとすぐ決着の呼び出しになる。
+  const decided = matchWinner(s);
+  if (decided) {
+    s.phase = 'matchEnd';
+    s.phaseT = 0;
+    s.winner = decided;
+    ctx.events.push({ k: 'matchEnd', winner: decided, loser: OTHER_SIDE[decided] });
+    return;
+  }
   s.phase = 'roundEnd';
   s.phaseT = 0;
   ctx.events.push({ k: 'roundWin', winner });
 }
 
-/** 乱闘の勝者が決まったか（2本先取・上限ラウンド） */
+/** 乱闘の勝者が決まったか（`ROUNDS_TO_WIN` 本を先に取る・上限ラウンド） */
 function matchWinner(s: BrawlState): BrawlSide | null {
   for (const side of BRAWL_SIDES) if (s[side].roundWins >= ROUNDS_TO_WIN) return side;
   if (s.round >= MAX_ROUNDS) {
@@ -2097,7 +2115,19 @@ export function loadoutStrength(loadout: FighterLoadout): number {
 }
 
 /**
- * **CPUの打者が乱闘に持ち込むか**（フェーズWW-71。決定的・乱数不使用）。
+ * 普通の死球で、装備の条件を満たしたCPUの打者が乱闘に持ち込む確率（フェーズBBB-80。
+ * 2026-10-10 ユーザー判断「3回に1回」）。多い／少ないと感じたらこの1か所。
+ */
+export const CPU_BRAWL_CHANCE = 1 / 3;
+
+/**
+ * そのくじを引く系列の塩（`cpuBatter.ts` の `CPU_SWING_NOISE_SALT` と同じ考え方＝本編の乱数を
+ * 消費せず、試合のシードから別系列を起こす）。値そのものに意味は無い。
+ */
+export const CPU_BRAWL_ROLL_SALT = 0xb4a71;
+
+/**
+ * **CPUの打者が乱闘に持ち込むか**（フェーズWW-71。BBB-80でくじが付いた＝下の3つ目）。
  *
  * 乱闘に持ち込むかを決めるのは**殴られた打者側だけ**（テストプレイ「ぶつけておいて、
  * 乱闘するかどうかを投手の側が判断できるのはおかしい」）。人間の打者は自分で決め、
@@ -2105,15 +2135,26 @@ export function loadoutStrength(loadout: FighterLoadout): number {
  *
  * 1. **銃で撃たれたら必ずやり返す**（銃は狙って当てる手なので、黙って一塁へ歩く理由が無い）。
  * 2. **普通の死球は、装備が投手以上のときだけ**（負ければ退場＝勝てる見込みがあるときだけ）。
+ * 3. **そのうえで3回に1回だけ**（`CPU_BRAWL_CHANCE`。フェーズBBB-80）。
  *
- * 規則が決まっているので、**人間の投手はぶつける前に読める**（打者の乱闘の装備を見れば
- * 乱闘になるかが分かる）＝銃の予兆（F-26-2）・敬遠（Q-38）と同じ「読めるCPU」。
+ * 3つ目はテストプレイ「CPUがデッドボールになった際に、乱闘を仕掛けてくる確率がちょっと
+ * 高すぎる」から。2つ目だけだと、**スキルの無い同士（装備が同じ）では死球のたびに必ず**
+ * 仕掛けてきた。2026-10-10 ユーザー判断で**確率にした**（「同じ試合で2回目の死球から」
+ * 「装備が上回る打者だけ」は不採用）＝CLAUDE.md ⑪「CPUの規則は決定的」の2つ目の例外
+ * （1つ目は AAA-75 のCPU打者のタイミングのぶれ）。**くじ（`roll`。0以上1未満）は呼び出し側が
+ * 試合のシードから別系列で引いて渡す**（`CPU_BRAWL_ROLL_SALT`）ので、ここは純粋関数のまま＝
+ * シードを固定すれば試合は再現できる。装備で負けている打者が仕掛けてこないこと・銃なら
+ * 必ずやり返すことは、ぶつける前に読めるまま。
  */
 export function shouldCpuStartBrawl(opts: {
   byGun: boolean;
   batter: FighterLoadout;
   pitcher: FighterLoadout;
+  /** この死球のくじ（0以上1未満）。`CPU_BRAWL_CHANCE` 未満なら仕掛ける */
+  roll: number;
 }): boolean {
   if (opts.byGun) return true;
-  return loadoutStrength(opts.batter) >= loadoutStrength(opts.pitcher);
+  if (loadoutStrength(opts.batter) < loadoutStrength(opts.pitcher)) return false;
+  return opts.roll < CPU_BRAWL_CHANCE;
 }
+

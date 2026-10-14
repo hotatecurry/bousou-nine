@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { chooseCpuPitchPlan, planCpuPitchShape } from '../src/core/cpuPitcher';
-import { LEFT_BATTER_SIDE, RIGHT_BATTER_SIDE, SPEED_NEUTRAL } from '../src/core/pitch';
+import { LEFT_BATTER_SIDE, RIGHT_BATTER_SIDE } from '../src/core/pitch';
 import {
   courseReading,
   inSlowZone,
@@ -26,7 +26,7 @@ describe('軌道と通過点', () => {
     ]) {
       const plan = chooseCpuPitchPlan(count);
       const shape = planCpuPitchShape(plan, profile);
-      const path = predictCpuPitchPath(shape, 1.5, SPEED_NEUTRAL);
+      const path = predictCpuPitchPath(shape, 1.5);
       expect(Math.abs(plateCrossing(path).x - plan.targetX)).toBeLessThan(0.02);
     }
   });
@@ -34,7 +34,7 @@ describe('軌道と通過点', () => {
   it('軌道はリリースからミットまで続き、ミットの高さで終わる', () => {
     const plan = chooseCpuPitchPlan({ balls: 0, strikes: 1 });
     const shape = planCpuPitchShape(plan, profile);
-    const path = predictCpuPitchPath(shape, 1.5, SPEED_NEUTRAL);
+    const path = predictCpuPitchPath(shape, 1.5);
     expect(path.length).toBeGreaterThan(20);
     expect(path[0].y).toBeCloseTo(1.5, 5);
     expect(path[path.length - 1].y).toBeGreaterThan(0.8);

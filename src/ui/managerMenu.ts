@@ -43,6 +43,8 @@ import {
   ratingBar,
   remainingStaminaOf,
   skillsOf,
+  BOUNCING_FORK_LABEL,
+  pitcherForkBouncesOf,
 } from '../core/roster';
 import { skillDef } from '../core/skills';
 import { type Bases, forceAdvance } from '../core/rules';
@@ -181,12 +183,15 @@ export function describePitcherEntry(roster: TeamRoster, id: PlayerId): string {
   const stats = effectivePitching(roster, id);
   const role = stats && pitcherRole(stats.stamina) === 'starter' ? '先発' : '救援';
   const { speed, breaking, control } = pitcherStuffOf(roster, id);
-  return pitcherRow(
+  const row = pitcherRow(
     roster.players[id].name,
     role,
     `${Math.round(remainingStaminaOf(roster, id) * 100)}%`,
     [ratingBar(speed), ratingBar(breaking), ratingBar(control)],
   );
+  // ワンバウンドするフォークを持つ投手には印を添える（フェーズBBB-79。HUDの投手カードと
+  // 同じ文言）。表の列の後ろに付けるので、3本のバーの桁は他の行とずれない。
+  return pitcherForkBouncesOf(roster, id) ? `${row} ${BOUNCING_FORK_LABEL}` : row;
 }
 
 /**

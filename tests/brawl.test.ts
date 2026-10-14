@@ -24,6 +24,7 @@ import {
   MOVES,
   NO_PASSIVES,
   PROJECTILES,
+  ROUNDS_TO_WIN,
   ROUND_END_FRAMES,
   STAGE_HALF,
   TIME_UP_FRAMES,
@@ -33,6 +34,7 @@ import {
   createBrawlState,
   hurtboxOf,
   moveList,
+  roundCallText,
   stepBrawl,
 } from '../src/core/brawl';
 import { type FrameInput, NEUTRAL_INPUT } from '../src/core/brawlCommand';
@@ -296,29 +298,28 @@ describe('超必殺とゲージ', () => {
   });
 });
 
-describe('ラウンド制（2本先取・60秒）', () => {
-  it('KOで勝ち名乗り→次のラウンド、2本取ったら決着して負けた側が分かる', () => {
+describe('1本勝負（60秒。フェーズBBB-80。XX-72は2本先取だった）', () => {
+  it('1本取ったら決着＝K.O.のあと、次のラウンドへ行かずに勝ち名乗りへ', () => {
+    expect(ROUNDS_TO_WIN).toBe(1);
     let s = fightState();
-    // 投手の体力を1にして肘打ちで倒す（を2ラウンド）
-    for (let round = 1; round <= 2; round++) {
-      s = placeAt({ ...s, pitcher: { ...s.pitcher, hp: 1 } }, -0.45, 0.45);
-      s = run(s, 12, (i) => ({ batter: { p: i === 0 } })).state;
-      expect(s.phase).toBe('ko');
-      s = run(s, KO_FRAMES + ROUND_END_FRAMES + 2).state;
-      if (round === 1) {
-        expect(s.phase).toBe('intro');
-        expect(s.batter.roundWins).toBe(1);
-        expect(s.pitcher.hp).toBe(s.pitcher.maxHp);
-        s = run(s, INTRO_FRAMES + 1).state;
-      }
-    }
+    // 投手の体力を1にして肘打ちで倒す
+    s = placeAt({ ...s, pitcher: { ...s.pitcher, hp: 1 } }, -0.45, 0.45);
+    s = run(s, 12, (i) => ({ batter: { p: i === 0 } })).state;
+    expect(s.phase).toBe('ko');
+    const after = run(s, KO_FRAMES + 2);
+    s = after.state;
+    // ラウンドの勝ち名乗り（roundEnd）を挟まず、決着の呼び出しが1回だけ出る
     expect(s.phase).toBe('matchEnd');
+    expect(s.round).toBe(1);
+    expect(s.batter.roundWins).toBe(1);
+    expect(after.events.filter((e) => e.k === 'matchEnd')).toHaveLength(1);
+    expect(after.events.some((e) => e.k === 'roundWin')).toBe(false);
     s = run(s, MATCH_END_FRAMES + 1).state;
     expect(s.phase).toBe('done');
     expect(brawlLoser(s)).toBe('pitcher');
   });
 
-  it('時間切れは体力の割合が多いほうの勝ち（最大値が違っても割合で比べる）', () => {
+  it('時間切れは体力の割合が多いほうの勝ち（最大値が違っても割合で比べる）＝それで決着', () => {
     const tough: FighterLoadout = { ...DEFAULT_LOADOUT, maxHp: 240 };
     let s = fightState({ pitcher: tough });
     // 打者 60/120（50%）・投手 132/240（55%）＝投手の勝ち
@@ -327,6 +328,31 @@ describe('ラウンド制（2本先取・60秒）', () => {
     expect(s.phase).toBe('timeUp');
     s = run(s, TIME_UP_FRAMES + 1).state;
     expect(s.pitcher.roundWins).toBe(1);
+    expect(s.phase).toBe('matchEnd');
+    s = run(s, MATCH_END_FRAMES + 1).state;
+    expect(brawlLoser(s)).toBe('batter');
+  });
+
+  it('引き分け（時間切れで体力の割合が同じ）は決着せず、延長のラウンドへ', () => {
+    let s = fightState();
+    s = { ...s, timer: 1, batter: { ...s.batter, hp: 60 }, pitcher: { ...s.pitcher, hp: 60 } };
+    s = run(s, 2).state;
+    expect(s.phase).toBe('timeUp');
+    const after = run(s, TIME_UP_FRAMES + 1);
+    s = after.state;
+    expect(s.phase).toBe('roundEnd');
+    expect(after.events.some((e) => e.k === 'roundWin' && e.winner === 'draw')).toBe(true);
+    s = run(s, ROUND_END_FRAMES + 1).state;
+    expect(s.phase).toBe('intro');
+    expect(s.round).toBe(2);
+    expect(s.batter.hp).toBe(s.batter.maxHp);
+    expect(s.batter.roundWins + s.pitcher.roundWins).toBe(0);
+  });
+
+  it('呼び出しの文言：最初は「一本勝負」、引き分けの後は「延長戦」', () => {
+    expect(roundCallText(1)).toBe('一本勝負');
+    expect(roundCallText(2)).toBe('延長戦');
+    expect(roundCallText(3)).toBe('延長戦');
   });
 });
 

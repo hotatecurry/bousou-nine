@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   type AtBatMarker,
   CALL_BANNER_SEC,
-  CONTACT_FOLLOW_SEC,
+  CONTACT_BLACKOUT_SEC,
+  CONTACT_HOLD_SEC,
   CPU_BRAWL_DECISION_SEC,
   CPU_PITCH_INTERVAL_SEC,
   FOUL_RESULT_PAUSE_SEC,
@@ -85,9 +86,12 @@ describe('テンポの定数（原作の実測値を入れ替えても壊して�
     expect(FOUL_RESULT_PAUSE_SEC).toBeGreaterThan(PLAY_RESULT_PAUSE_SEC);
   });
 
-  it('打った瞬間からカットまでは短い（打球が飛び出すのを見せるだけ＝待たせない。WW-71）', () => {
-    // 守備のプレーは接触の瞬間から始まるので、ここが長いとカットの後で球が大きく巻き戻って見える
-    expect(CONTACT_FOLLOW_SEC).toBeLessThan(0.25);
+  it('打った瞬間の絵は2フレーム・黒は7フレーム（原作の実測。BBB-76）', () => {
+    // 原作の打った映像：バットに球が来た絵を2フレーム見せ、7フレーム真っ黒になってから守備の画面
+    expect(CONTACT_HOLD_SEC * 60).toBeCloseTo(2, 9);
+    expect(CONTACT_BLACKOUT_SEC * 60).toBeCloseTo(7, 9);
+    // 合わせても0.2秒に満たない＝WW-71が嫌った「切り替わる前の一時停止」にはならない長さ
+    expect(CONTACT_HOLD_SEC + CONTACT_BLACKOUT_SEC).toBeLessThan(0.2);
   });
 
   it('すべての「間」は正の値（0にすると原作より速い従来の挙動に戻る）', () => {
@@ -96,7 +100,8 @@ describe('テンポの定数（原作の実測値を入れ替えても壊して�
       CPU_PITCH_INTERVAL_SEC,
       PLAY_RESULT_PAUSE_SEC,
       FOUL_RESULT_PAUSE_SEC,
-      CONTACT_FOLLOW_SEC,
+      CONTACT_HOLD_SEC,
+      CONTACT_BLACKOUT_SEC,
       CPU_BRAWL_DECISION_SEC,
       CALL_BANNER_SEC,
       GUN_TELEGRAPH_SEC,

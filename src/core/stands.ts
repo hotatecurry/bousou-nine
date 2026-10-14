@@ -75,6 +75,33 @@ export function outerWallDistance(park: Ballpark, deg: number): number {
   return Math.min(cap, line);
 }
 
+/**
+ * 野手が壁からどれだけ手前で止まるか m（フェーズBBB-77）。体の厚み＋ちっちゃいモードで
+ * 2.5倍に描くぶん（LL-59）が壁にめり込んで見えない程度。
+ */
+export const FIELDER_WALL_MARGIN = 1;
+
+/**
+ * 野手（と、こぼれた球）を**その球場の壁の内側**へ丸める（フェーズBBB-77。テストプレイ
+ * 「守りの時に、フェンスのかなり手前でブロックされたようになる」）。
+ *
+ * それまでは**本塁から半径98mの円**で止めていた＝フェンスが半径100mの円1つだった頃（C-14の
+ * 前）の名残で、中堅のフェンス（ところざわ120m・だいそうげん130m）の**20m以上手前**に
+ * 見えない壁があった。いまは外周（`outerWallDistance`＝フェンスとファウル地域の柵）の
+ * `FIELDER_WALL_MARGIN` 手前まで行ける。**判定にも効く**（フェンス際の打球に追いつける）＝
+ * シーン（`chicchaiScene.ts`）と計測（`tools/balance/sim.ts`）が同じこの関数を通る。
+ */
+export function clampToPark(park: Ballpark, p: { x: number; z: number }): void {
+  const r = Math.hypot(p.x, p.z);
+  if (r < 1e-9) return;
+  const bound = outerWallDistance(park, Math.atan2(p.x, -p.z) / DEG) - FIELDER_WALL_MARGIN;
+  if (r > bound) {
+    const k = bound / r;
+    p.x *= k;
+    p.z *= k;
+  }
+}
+
 /** スタンド最前列までの距離 m（壁の外側に通路ぶんのすきまを空ける） */
 export function standFrontDistance(park: Ballpark, deg: number): number {
   return outerWallDistance(park, deg) + STAND_GAP;

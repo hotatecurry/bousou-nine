@@ -23,6 +23,7 @@ import {
 } from '../src/core/cpuPitcher';
 import {
   BATTER_ZONE_MIN_X,
+  BREAK_STRENGTH,
   NEUTRAL_PITCH_PROFILE,
   type PitchProfile,
   RUBBER_HALF_RANGE,
@@ -245,13 +246,15 @@ describe('planCpuPitchShape: 打者に理不尽でないこと', () => {
     }
   });
 
-  it('曲がりはゾーン半幅と同じ桁（見えるが、荒唐無稽ではない）', () => {
-    // `npm run balance:cpubreak`：名鑑96人でフォーク 0.48〜0.89m・速球 0.25〜0.44m。
+  it('曲がりはゾーン半幅と同じ桁 × BREAK_STRENGTH（見えるが、荒唐無稽ではない）', () => {
+    // `npm run balance:cpubreak`：P-37 のときは名鑑96人でフォーク 0.48〜0.89m・速球 0.25〜0.44m。
+    // BBB-77 で曲がり全体を3割にした（自分の球もCPUの球も。ユーザー判断）ので、いまは
+    // フォーク 0.14〜0.27m・速球 0.07〜0.13m。帯も同じ割合で縮める。
     const widths = ROSTER_PROFILES.map(
       (p) => planCpuPitchShape(chooseCpuPitchPlan({ balls: 0, strikes: 1 }), p).breakWidth,
     );
-    expect(Math.min(...widths)).toBeGreaterThan(STRIKE_ZONE_HALF_WIDTH * 0.8);
-    expect(Math.max(...widths)).toBeLessThan(STRIKE_ZONE_HALF_WIDTH * 2.5);
+    expect(Math.min(...widths)).toBeGreaterThan(STRIKE_ZONE_HALF_WIDTH * 0.8 * BREAK_STRENGTH);
+    expect(Math.max(...widths)).toBeLessThan(STRIKE_ZONE_HALF_WIDTH * 2.5 * BREAK_STRENGTH);
   });
 });
 

@@ -3,14 +3,15 @@
  *
  * - **上端に体力ゲージ2本**（打者＝左／投手＝右。右のゲージは右から減る）。**減った直後は
  *   黄色い「減りしろ」が残り、少し遅れて追いつく**＝どれだけ食らったかが一目で分かる。
- * - その下に**名前と取ったラウンドの印**（2本先取）、真ん中に**残り時間**（10秒を切ると赤）。
+ * - その下に**名前と取ったラウンドの印**（2本以上の勝負のときだけ。いまは1本勝負＝BBB-80）、真ん中に**残り時間**（10秒を切ると赤）。
  * - **超必殺のゲージ**（超必殺を持っている選手だけ。満タンで明滅して `超必殺OK`）。
  * - **連続技の数**（2ヒット目から、当てている側に `3ヒット!`）。
- * - **大きな呼び出し**（`第1ラウンド`／`ファイト！`／`K.O.`／`タイムアップ`／`〇〇の勝ち`）。
+ * - **大きな呼び出し**（`一本勝負`／`ファイト！`／`K.O.`／`タイムアップ`／`〇〇 乱闘に勝利！`）。
  *
  * 文字はすべて canvas のドット文字（WW-71の約束）。**真実は `core/brawl.ts` の状態**で、
  * ここは毎フレーム渡された形を描くだけ（減りしろの遅れだけが見た目の時計）。
  */
+import { roundCallText } from '../../core/brawl';
 import type { BrawlHudFighter, BrawlHudView } from '../../scenes/brawlScene';
 import { createPixelLabel, uiScale } from './pixelText';
 
@@ -169,7 +170,8 @@ export function createBrawlHud(parent: HTMLElement): BrawlHud {
     p.fill.style.background = ratio <= 0.25 ? (Math.floor(realTime * 6) % 2 === 0 ? '#ff4a3a' : '#c02a20') : '#2fd35a';
     p.name.setText(f.raging ? `${f.name} 怒` : f.name, { color: f.raging ? '#ff7a6a' : '#ffffff' });
     p.pips.forEach((pip, i) => {
-      pip.style.display = i < roundsToWin ? 'block' : 'none';
+      // 1本勝負なら印は出さない（1つきりの印は決着の瞬間にしか灯らない＝何も伝えない）
+      pip.style.display = roundsToWin > 1 && i < roundsToWin ? 'block' : 'none';
       pip.style.background = i < f.roundWins ? '#ffd23a' : '#222';
     });
     p.meterWrap.style.display = f.hasSuper ? 'flex' : 'none';
@@ -204,7 +206,7 @@ export function createBrawlHud(parent: HTMLElement): BrawlHud {
         timer.setText(String(Math.max(0, view.timer)).padStart(2, '0'), {
           color: view.timer <= 10 ? '#ff5a4a' : '#ffffff',
         });
-        roundLabel.setText(`第${view.round}ラウンド`);
+        roundLabel.setText(roundCallText(view.round));
       }
       if (calloutLeft > 0) {
         calloutLeft -= dt;

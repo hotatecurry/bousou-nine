@@ -267,7 +267,7 @@ export function createBrawlController(opts: {
   isHuman: (side: BrawlSide) => boolean;
   /** エンジンのイベント（音・HUDの呼び出し用） */
   onEvents?: (events: readonly BrawlEvent[], state: BrawlState) => void;
-  /** 決着（2本先取）が確定し、勝ち名乗りを見せた後に一度だけ呼ぶ */
+  /** 決着が確定し、勝ち名乗りを見せた後に一度だけ呼ぶ */
   onResolved: (loser: BrawlSide) => void;
 }): BrawlController {
   const { camera, pads, isHuman, onEvents, onResolved } = opts;

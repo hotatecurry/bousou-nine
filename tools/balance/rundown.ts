@@ -271,7 +271,7 @@ function groundOutMargin(throwSpeed: number, fieldSec: number): number {
 function main(): void {
   const speeds = [THROW_SPEED, 30, 26, 22, 18, 14, 10];
   console.log('\n=== 1. 「送球で刺せない／走れば追える」帯の広さ（打球のプレーの格子） ===');
-  console.log('走者は基準速 7.5m/s、野手の足は 8.5m/s。割合は格子点に対するもの。\n');
+  console.log(`走者は基準速 ${RUNNER_SPEED}m/s、野手の足は ${FIELDER_SPEED}m/s。割合は格子点に対するもの。\n`);
   const widths = [10, 12, 14, 12];
   const row = (cells: (string | number)[]): void =>
     console.log(cells.map((c, i) => String(c).padStart(widths[i])).join(' '));

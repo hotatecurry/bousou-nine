@@ -62,6 +62,46 @@ describe('chooseCpuPitchPlan（カウントに応じた投球方針）', () => {
   });
 });
 
+describe('ワンバウンドするフォークは投手有利のカウントだけ（フェーズBBB-79。ユーザー判断）', () => {
+  const COUNTS = [0, 1, 2, 3].flatMap((balls) => [0, 1, 2].map((strikes) => ({ balls, strikes })));
+  const bouncing = { bouncingFork: true };
+
+  it('ストライク先行のカウント（0-1・0-2・1-2）でだけフォークを投げる', () => {
+    for (const count of COUNTS) {
+      for (const style of ['balanced', 'power', 'breaking'] as const) {
+        const plan = chooseCpuPitchPlan(count, style, NEUTRAL_RATING, 0, bouncing);
+        if (plan.speed === 'slow') expect(count.strikes).toBeGreaterThan(count.balls);
+      }
+    }
+    // 0-1 の外す1球（SS-67）と、技巧派の 0-2・1-2 の決め球（S-40）はフォークのまま
+    expect(chooseCpuPitchPlan({ balls: 0, strikes: 1 }, 'balanced', NEUTRAL_RATING, 0, bouncing).speed).toBe('slow');
+    expect(chooseCpuPitchPlan({ balls: 1, strikes: 2 }, 'breaking', NEUTRAL_RATING, 0, bouncing).speed).toBe('slow');
+  });
+
+  it('それ以外のカウントでフォークになるはずの球は基準速（ストライクを取りに行く球）', () => {
+    expect(chooseCpuPitchPlan({ balls: 1, strikes: 1 }, 'balanced', NEUTRAL_RATING, 0, bouncing).speed).toBe('neutral');
+    expect(chooseCpuPitchPlan({ balls: 2, strikes: 1 }, 'balanced', NEUTRAL_RATING, 0, bouncing).speed).toBe('neutral');
+    expect(chooseCpuPitchPlan({ balls: 2, strikes: 2 }, 'breaking', NEUTRAL_RATING, 0, bouncing).speed).toBe('neutral');
+    // 速球・基準速の球は替えない（狙うコースも1つも変えない）
+    for (const count of COUNTS) {
+      const before = chooseCpuPitchPlan(count, 'power');
+      const after = chooseCpuPitchPlan(count, 'power', NEUTRAL_RATING, 0, bouncing);
+      if (before.speed !== 'slow') expect(after).toEqual(before);
+      expect(after.targetX).toBe(before.targetX);
+    }
+  });
+
+  it('ワンバウンドしない投手（チェンジアップ）は従来と完全に同じ', () => {
+    for (const count of COUNTS) {
+      for (const style of ['balanced', 'power', 'breaking'] as const) {
+        expect(chooseCpuPitchPlan(count, style, NEUTRAL_RATING, 0, { bouncingFork: false })).toEqual(
+          chooseCpuPitchPlan(count, style),
+        );
+      }
+    }
+  });
+});
+
 // ---- 投手の持ち味（フェーズS-40。B-12の「CPUは球団の個性を活かさない」の投球側） ----
 
 describe('cpuPitcherStyle（能力値から導出する持ち味）', () => {

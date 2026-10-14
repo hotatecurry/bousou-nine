@@ -131,7 +131,10 @@ for (let slot = 0; slot < LINEUP_SIZE; slot += 1) {
   console.log(`${`${slot + 1}番`.padEnd(14)}` + row([pitcherRuns[slot].toFixed(3)], 12));
 }
 const bestPitcherSlot = pitcherRuns.indexOf(Math.max(...pitcherRuns));
-console.log(`   最良は ${bestPitcherSlot + 1}番（原作の既定は9番）`);
+const pitcherSlotLoss = pitcherRuns[bestPitcherSlot] - pitcherRuns[LINEUP_SIZE - 1];
+console.log(
+  `   最良は ${bestPitcherSlot + 1}番（原作の既定は9番。9番との差 ${pitcherSlotLoss.toFixed(3)}点）`,
+);
 
 // ---- 4. 打力スコアの選び方（名鑑16球団で並べ替えて比べる） ----
 //
@@ -352,16 +355,42 @@ for (let i = 0; i < TEAMS.length; i += 1) {
 console.log('\n=== まとめ（この計測が決めたこと） ===');
 console.log('   【打順：CPUに規則を持たせない】');
 console.log(`   ・打順の値打ちは ${slotRank.map((s) => s + 1).join('>')} の順（1段目）だが、`);
-console.log('     上位4つの差は 0.02点未満＝誤差。出どころは打席数（2段目）で、1番と9番でも');
-console.log('     1試合0.88打席しか違わない。');
-console.log(`   ・投手は ${bestPitcherSlot + 1}番が最良（3段目）＝原作の既定（9番）と一致する。`);
-console.log('   ・**どのスコアで組み直しても名鑑どおりに勝てない**（4段目）。B-12が名鑑を');
-console.log('     定石順で手書きしているため。局所探索の最良でも +1.8% しか動かない＝');
+const topSlots = strongRuns.slice(0, 4);
+console.log(
+  `     上位4つの差は ${(Math.max(...topSlots) - Math.min(...topSlots)).toFixed(3)}点＝誤差。` +
+    '出どころは打席数（2段目）で、1番と9番でも',
+);
+console.log(`     1試合${(flat.pa[0] - flat.pa[LINEUP_SIZE - 1]).toFixed(2)}打席しか違わない。`);
+console.log(
+  bestPitcherSlot === LINEUP_SIZE - 1
+    ? '   ・投手は 9番が最良（3段目）＝原作の既定（9番）と一致する。'
+    : `   ・投手は ${bestPitcherSlot + 1}番が最良（3段目）だが、9番との差は ${pitcherSlotLoss.toFixed(3)}点＝誤差。` +
+        '\n     ＝**9番に固定して失うものは無い**（一様な格子では、長打力の無い打者の外した' +
+        '\n     当たりが野手の前に落ちて出塁だけはする＝打席の多い上位に置いても損が出ない。BBB-82）。',
+);
+const bestRuleGain = Math.max(...SCORES.map(({ name }) => (scoreTotals.get(name) ?? 0) / 16)) - bookTotal / 16;
+const bestOrderGain = bestTotal / 16 - bookTotal / 16;
+const asPct = (v: number) => `${v >= 0 ? '+' : ''}${((v / (bookTotal / 16)) * 100).toFixed(1)}%`;
+console.log(
+  `   ・能力値のスコアで組み直しても名鑑どおりから ${asPct(bestRuleGain)} まで（4段目）。B-12が名鑑を`,
+);
+console.log(
+  `     定石順で手書きしているため。局所探索の最良でも ${asPct(bestOrderGain)} しか動かない＝`,
+);
 console.log('     **打順を触ることに値打ちが無い**（I-29の TIMING_SWEET_BAND、O-35の');
 console.log('     「F＝緩急の幅」と同じく、計測が設計を否定した）。');
 console.log('   【盗塁：走力を見る】');
-console.log('   ・一塁→二塁は成功率 0.73 を下回ると損（5段目）＝軽々しく走ってよい手ではない。');
-console.log('     二塁→三塁の分岐点はもっと低い（0.48〜0.62）。');
+const be = (from: number, to: number) => [0, 1, 2].map((o) => breakEven(from, to, o) ?? 0);
+const range = (v: number[]) => `${Math.min(...v).toFixed(2)}〜${Math.max(...v).toFixed(2)}`;
+console.log(
+  `   ・一塁→二塁は成功率 ${range(be(1, 2))} を下回ると損（5段目）＝軽々しく走ってよい手ではない。`,
+);
+console.log(
+  `     二塁→三塁の分岐点は ${range(be(2, 4))}` +
+    (Math.min(...be(2, 4)) > Math.max(...be(1, 2))
+      ? '＝二盗より高い（二塁の走者は安打1本でたいてい還れるので、三塁へ進む上積みが小さい）。'
+      : '。'),
+);
 console.log('   ・走力は「守備に残る余裕」を 0.53秒（走力0）→ -0.08秒（1.0）まで動かす（6段目）。');
 console.log('     人の反応（0.2秒前後）を下回るところから上が、仕掛ける値打ちのある走者。');
 console.log('   ・しきい値は 0.10秒（7段目）＝192人中54人・球団ごと1〜7人で、規則が死なず');

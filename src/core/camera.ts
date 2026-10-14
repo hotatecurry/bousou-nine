@@ -26,16 +26,19 @@
  * - **追従は指数的な追いつき**（時定数 CAMERA_FOLLOW_TAU）。速い打球ではわずかに遅れて
  *   ボールが画面中心より先に出るので、スクロールしている感じが出る。
  */
-import { GRAVITY } from './batting';
+import { CONTACT_PLANE_Z } from './batting';
 import { BASE_AXIS, type Vec2 } from './fielding';
 import {
+  type PitchStall,
   CATCH_HEIGHT,
   CATCH_Z,
+  FORK_BOUNCE_MIN_RATING,
   PITCHER_PLATE_Z,
   PLATE_Z,
   RELEASE_HEIGHT,
   RELEASE_Z,
   STRIKE_ZONE_HALF_WIDTH,
+  forkBounces,
 } from './pitch';
 
 /** ちっちゃいモードの垂直画角（度）。従来の固定鳥瞰と同じ値を引き継ぐ */
@@ -271,152 +274,205 @@ export function dekkaiBallScale(p: { x: number; y: number; z: number }): number 
 }
 
 // ---------------------------------------------------------------------------
-// 投球の見た目：弧と残像（フェーズPP-63）
+// 投球の見た目（フェーズBBB-76。原作準拠。**見た目だけ**）
 // ---------------------------------------------------------------------------
 //
-// NN-61（ボールの大きさ）が実寸にしたことで表に出た**2つの穴**を埋める。どちらも
-// **高低はゾーン判定に無関係**（説明書p19準拠。`PitchFlight` は x と z しか持たない）なので、
-// **ここから下は判定に一切効かない**＝LL-59・NN-61 と同じ「見た目だけの値」の並び。
+// テストプレイ「ピッチャーが球を投げてからヒットを打つまでの間が全然原作と違う」。原作の
+// 映像を1フレームずつ測ると、投げた球は**画面を一定の速さで下りてくる**（地面の影が
+// 毎フレーム同じドット数ずつ進む＝7球すべてで等速）。**地面には影が出て、球はその上を
+// 一定の高さで飛ぶ**（球と影の間はずっと約20ドット）。球の絵は途中で1回だけ大きくなる
+// （4×4→6×6）。
 //
-// ## 1. 遅い球が地面へ潜っていた
+// 3Dの透視ではこうはならない：同じ速さで飛ぶ球は、遠くでは画面上をほとんど動かず、
+// 手元で一気に迫る（リリースから打つまでの時間の前半で、画面上の移動の13%しか進まない
+// ＝実機で計測）。**球が来るのを見ていられる時間**そのものが原作と違っていた。
 //
-// 旧実装（`dekkaiScene.ts`）は**直線から `FORK_DROP_MAX × slowness × q²` を引く**だけで、
-// いちばん遅い球は**本塁の2.4m手前で y<0 に入り**、NN-61 が置いた下限（球の半径）で
-// 止まっていた＝**ミットの高さへ収束しない**（球はミットの下を通って到着する）。
+// そこで**描く位置だけを「画面上で等速」になる奥行きへ置き直す**（ユーザー判断 2026-10-07）：
+// - 通り道は**リリースからミットへの3Dの直線**（PP-63の弧はやめた＝原作の球は弧を描かない）。
+// - その直線の上で、**リリースから打撃面までは画面の縦の位置が時間に比例する点**に描く。
+//   両端（リリースと打撃面）は本当の位置と同じ＝**手から出て、バットのところで当たる**。
+//   打撃面からミットまでも同じ形でつなぐ（そこは本当の球も一瞬で過ぎる）。
+// - 横は**いまの速度のまま外挿**して同じ奥行きへ置く＝曲がる球もその直線（通り道）の上に乗る。
+// - PP-63の残像はやめた（原作の球はドットの絵で、伸びない）。
 //
-// 作り替えの形はユーザー判断で**放物線**（2026-08-16）：**リリースの高さ（MM-60）から
-// ミットの高さ（`CATCH_HEIGHT`）へ、重力で落ちる弧**として解く。これで
-// - **自由変数が消える**（`FORK_DROP_MAX` は要らない）＝弧の大きさは**飛行時間**、
-//   つまり球速だけで決まる（`GRAVITY` は打球の飛行と同じ実際の重力を読む）。
-// - **球は必ずミットに入る**＝NN-61 の地面クランプが構造的に不要になった。
-// - **緩急がそのまま形に出る**：速球はほぼ直線・フォークは大きく弧を描いて手元で落ちる。
-//
-// 代償は**前半が必ず直線より上を通ること**（実際の80km/hの球と同じ）。**弧は
-// `slowness` に比例させる**ので、**基準速・速球の見え方は従来と完全に同じ**
-// （ユーザー判断＝MM-60の「上手は従来のまま」、B-8の「基準値0.5＝従来の定数」と同じ
-// **基準線を動かさない**整理）。
-//
-// ## 2. 速球の伸びが画面に出ていなかった
-//
-// 旧実装は残像をワールドZ方向へ引き伸ばしていたが、でっかいモードのカメラはほぼ -Z を
-// 向く＝**伸びが視線に沿ってしまい、画面では約1割しか出ていなかった**。**画面上の
-// 進行方向（＝視線に垂直な速度成分）へ伸ばす**ように向きだけ直した（ユーザー判断）。
+// **判定はこれを一切見ない**（`PitchFlight` のまま）。描く場所が本当の場所より先へ行くのは
+// 飛行の途中だけで、**着く時刻は本当の球と同じ**＝打つタイミングは変わらない。
 
-/** 投球の見た目の通り道の1点 */
-export interface PitchArcPoint {
-  /** その z での高さ m */
-  y: number;
-  /** dy/dz。`vy = slope × vz` として画面上の動く向きに使う */
-  slope: number;
+/** 投球の通り道の高さ m（リリースの高さからミットの高さへの直線。フェーズBBB-76） */
+export function pitchLineHeight(z: number, releaseHeight: number = RELEASE_HEIGHT): number {
+  const p = (z - RELEASE_Z) / (CATCH_Z - RELEASE_Z);
+  return releaseHeight + (CATCH_HEIGHT - releaseHeight) * p;
+}
+
+// ---- フォークの落ち方（フェーズBBB-77→**BBB-79で2通りに分けた**） ----
+//
+// BBB-77 は原作の録画のフォーク（失速の間に球と影の間が20→4ドット）に合わせて、**どの投手の
+// フォークも**打撃面で地面すれすれ（0.2m）まで落としていた。原作のその1球は**本塁の上で
+// ワンバウンドしてボール**の判定で、テストプレイ「ワンバウンドしたのに見逃したらストライク」。
+// 2026-10-09 ユーザー判断で**ワンバウンドするのはFの大きい投手のフォークだけ**にした
+// （説明書p19「上でフォークかチェンジアップ」。境目と判定は `core/pitch.ts` の
+// `FORK_BOUNCE_MIN_RATING`／`pitchBounces`）：
+//
+// - **フォーク（F ≥ 境目）**：失速が始まった所から**本塁の前半分（`FORK_BOUNCE_Z`）で地面に
+//   着き**（影と重なる）、跳ねて捕手のミットへ上がる＝原作の録画と同じ絵。判定の本塁通過
+//   （`PLATE_Z`）より手前で着くので、見た目と「見逃せばボール」が食い違わない。
+// - **チェンジアップ（F < 境目）**：打撃面までに `changeupEndHeight` まで落ちるだけ
+//   （膝の高さより上＝低めのストライクに見える）。Fが大きいほど深い。
+//
+// どちらも**落ちる割合は本当の球の進み**（`trueZ`）で決める＝失速して進みが遅いぶん、
+// 落ちるのもゆっくり見える（BBB-77のまま）。
+
+/** ワンバウンドするフォークが地面に着く場所 z（本塁の前半分。判定の本塁通過より手前） */
+export const FORK_BOUNCE_Z = PLATE_Z - 0.15;
+
+/**
+ * ワンバウンドしないフォーク（チェンジアップ）が打撃面で落ちきる高さ m。F が 0 で
+ * `CHANGEUP_DROP_TOP`、境目の手前で `CHANGEUP_DROP_BOTTOM`（膝の高さ＝低めのストライク）。
+ */
+export const CHANGEUP_DROP_TOP = 0.75;
+export const CHANGEUP_DROP_BOTTOM = 0.45;
+
+/** チェンジアップ（ワンバウンドしないフォーク）が打撃面で落ちきる高さ m */
+export function changeupEndHeight(fork: number): number {
+  const t = Math.max(0, Math.min(1, fork / FORK_BOUNCE_MIN_RATING));
+  return CHANGEUP_DROP_TOP + (CHANGEUP_DROP_BOTTOM - CHANGEUP_DROP_TOP) * t;
 }
 
 /**
- * 投球の見た目の高さ（フェーズPP-63）。**リリースの高さからミットの高さへ落ちる放物線**で、
- * 弧の大きさは飛行時間（＝球速）から出る。
- *
- * 飛行時間 T の放物線は、両端を結ぶ直線に `(g T² / 2) · p(1-p)` を足したもの（p は
- * リリース0→ミット1の進み）＝**頂点はその1/4**（`g T² / 8`）。`slowness`（`core/pitch.ts`）を
- * 掛けるので、**基準速以上の球は直線ちょうど＝PP-63の前と1ドットも変わらない**。
- *
- * @param z いまのボールのZ
- * @param vz 球速 m/s（リリース時に確定し飛行中は変わらない＝説明書p19②）
- * @param releaseHeight リリースの高さ（`armReleaseHeight`。MM-60）
- * @param slowness その投手の基準速からどれだけ遅いか 0..1（`pitchSlowness`）
+ * 描く球の高さ m。ふつうは通り道の直線（`pitchLineHeight`）。フォーク（`stall` のある球）は
+ * 上の2通りに落ちる（**高さはゾーン判定には使わない**＝判定はワンバウンドしたかどうか
+ * だけで、それは `stall.fork` から `core/pitch.ts` が決める）。
  */
-export function pitchArcPath(
-  z: number,
-  vz: number,
+export function pitchDrawnHeight(
+  drawnZ: number,
+  trueZ: number,
   releaseHeight: number = RELEASE_HEIGHT,
-  slowness = 0,
-): PitchArcPoint {
-  const span = CATCH_Z - RELEASE_Z;
-  const p = Math.max(0, Math.min(1, (z - RELEASE_Z) / span));
-  const flightSec = span / Math.max(vz, 1e-6);
-  // 直線に足す弧（頂点はこの1/4）。slowness=0 なら弧は無い＝完全な直線。
-  const arc = slowness * GRAVITY * flightSec * flightSec * 0.5;
-  const fall = CATCH_HEIGHT - releaseHeight;
-  return {
-    y: releaseHeight + fall * p + arc * p * (1 - p),
-    slope: (fall + arc * (1 - 2 * p)) / span,
-  };
+  stall?: PitchStall,
+): number {
+  const line = pitchLineHeight(drawnZ, releaseHeight);
+  if (!stall || trueZ <= stall.fromZ) return line;
+  if (forkBounces(stall.fork)) {
+    if (trueZ <= FORK_BOUNCE_Z) {
+      const u = (trueZ - stall.fromZ) / (FORK_BOUNCE_Z - stall.fromZ);
+      return line + (FORK_BOUNCE_CENTER_Y - line) * u;
+    }
+    // 跳ねて捕手のミットへ上がる（原作：本塁で影と重なった球が、捕手のミットへ上がっていく）
+    const v = Math.min(1, (trueZ - FORK_BOUNCE_Z) / (CATCH_Z - FORK_BOUNCE_Z));
+    return FORK_BOUNCE_CENTER_Y + (CATCH_HEIGHT - FORK_BOUNCE_CENTER_Y) * Math.sin((v * Math.PI) / 2);
+  }
+  const end = changeupEndHeight(stall.fork);
+  const u = Math.min(1, (trueZ - stall.fromZ) / (CONTACT_PLANE_Z - stall.fromZ));
+  return line + (end - line) * u;
 }
 
 /**
- * その速度が**画面上でどちらへ動いて見えるか**（ワールドの単位ベクトル）。
- * 視線に垂直な成分＝画面に映る動きで、真正面へ来る球（垂直成分が無い）は null。
- *
- * このカメラでは球の動きはほぼ画面の縦なので、返るのはおおむね真下向きになる
- * （＝残像は縦に伸びる）。
+ * でっかいモードのカメラの上向き（単位ベクトル）。カメラは真正面（x=0）から見るので
+ * 前向きは YZ 平面にあり、上向きはそれに垂直で y が正の向き（ロールなし＝three の lookAt と同じ）。
  */
-export function dekkaiScreenMotionAxis(v: {
-  x: number;
-  y: number;
-  z: number;
-}): { x: number; y: number; z: number } | null {
-  const along = v.x * DEKKAI_FORWARD.x + v.y * DEKKAI_FORWARD.y + v.z * DEKKAI_FORWARD.z;
-  const px = v.x - along * DEKKAI_FORWARD.x;
-  const py = v.y - along * DEKKAI_FORWARD.y;
-  const pz = v.z - along * DEKKAI_FORWARD.z;
-  const len = Math.hypot(px, py, pz);
-  if (len < 1e-6) return null;
-  return { x: px / len, y: py / len, z: pz / len };
+const DEKKAI_UP = { x: 0, y: -DEKKAI_FORWARD.z, z: DEKKAI_FORWARD.y };
+
+/**
+ * 画面の縦の位置（**正接の比**＝`NDC の y × tan(垂直画角/2)`）。画角で割る前の値なので
+ * **窓の形（画角）によらない**＝等速の判定に画角が要らない。カメラは x=0 から真正面を
+ * 見るので x は縦の位置に効かない。
+ */
+export function dekkaiScreenRise(p: { y: number; z: number }): number {
+  const ry = p.y - DEKKAI_CAMERA_POS.y;
+  const rz = p.z - DEKKAI_CAMERA_POS.z;
+  const depth = ry * DEKKAI_FORWARD.y + rz * DEKKAI_FORWARD.z;
+  const rise = ry * DEKKAI_UP.y + rz * DEKKAI_UP.z;
+  return rise / depth;
 }
 
 /**
- * 残像の長さを決める「1フレーム」（秒）＝60fpsの1枚ぶん。
- *
- * **残像の長さは新しい数値を持ち込まずに決める**＝**その球が1フレームで画面上に動く距離**
- * ちょうど（＝コマの間の隙間を埋める長さ）。実際の dt ではなく固定の1枚ぶんにするのは、
- * フレーム時間の揺れで球の形がちらつかないため。
+ * 通り道（`pitchLineHeight` の直線）の上で、画面の縦の位置がちょうど `rise` になる z。
+ * 直線の上では `rise = (A·z + B) / (C·z + D)` の形（分子・分母とも z の1次式）なので、
+ * 逆に解ける。
  */
-export const DEKKAI_TRAIL_FRAME_SEC = 1 / 60;
+function lineDepthForRise(rise: number, releaseHeight: number): number {
+  const k = (CATCH_HEIGHT - releaseHeight) / (CATCH_Z - RELEASE_Z);
+  // y(z) - カメラの高さ = k·z + y0
+  const y0 = releaseHeight - k * RELEASE_Z - DEKKAI_CAMERA_POS.y;
+  const cz = DEKKAI_CAMERA_POS.z;
+  const a = DEKKAI_UP.y * k + DEKKAI_UP.z;
+  const b = DEKKAI_UP.y * y0 - DEKKAI_UP.z * cz;
+  const c = DEKKAI_FORWARD.y * k + DEKKAI_FORWARD.z;
+  const d = DEKKAI_FORWARD.y * y0 - DEKKAI_FORWARD.z * cz;
+  return (b - rise * d) / (rise * c - a);
+}
 
-/** でっかいモードのボールの描き方（位置・拡大・残像）。`dekkaiBallLook` が組んで返す */
-export interface DekkaiBallLook {
-  /**
-   * 球の中心を置く場所。**残像は必ず後ろへ伸ばす**（先端は実際の位置のまま）＝
-   * 見た目が判定より先に行かない（伸ばした球の前端で早く振ってしまうことがない）。
-   */
+/**
+ * 球の絵が大きくなる場所（リリース→ミットの何割か。原作：23フレームのうち13フレーム目）
+ * と、その前後の大きさ（`DEKKAI_BALL_SCALE` に掛ける倍率）。原作の球は 4×4 → 6×6 ドットで、
+ * 画面の高さに対して 1/60 → 1/40。1280x720 なら直径 12px → 18px（OO-62の14.4pxを挟む）＝
+ * **近づくと1回だけ大きくなる**原作の見え方。手元の大きさは本塁の幅（ゾーン幅）に対しても
+ * 原作と同じ比（約1/4）になる。
+ */
+export const DEKKAI_PITCH_SIZE_SWITCH = 13 / 23;
+export const DEKKAI_PITCH_SIZE_FAR = 5 / 6;
+export const DEKKAI_PITCH_SIZE_NEAR = 5 / 4;
+
+/**
+ * ワンバウンドするフォークが地面に着いた瞬間の球の中心の高さ m（フェーズBBB-79）＝本塁での
+ * 描く球の半径（`BALL_RADIUS` × 見かけの倍率 × 手元の大きさ）。ここまで下がると球の下端が
+ * 地面に着き、真下の影と重なる（原作の録画：本塁の上で球と影が1つになる）。
+ */
+export const FORK_BOUNCE_CENTER_Y = BALL_RADIUS * DEKKAI_BALL_SCALE * DEKKAI_PITCH_SIZE_NEAR;
+
+/**
+ * 影の縦横比（原作の影は 4×2 → 5×3 ドット＝縦が横の約半分）。地面の円を斜めから見ると、
+ * 遠いほど平たく潰れる（リリース付近は1/6）ので、奥行きの向きをそのぶん引き伸ばして
+ * どこでもこの比に揃える。
+ */
+export const DEKKAI_SHADOW_ASPECT = 0.55;
+
+/** でっかいモードの投球の描き方（`dekkaiPitchLook` が組んで返す） */
+export interface DekkaiPitchLook {
+  /** 球の中心を置く場所 */
   center: { x: number; y: number; z: number };
-  /** 一様な拡大率（見かけの大きさを一定に保つ距離補正＝NN-61） */
+  /** 球の一様な拡大率（見かけの大きさ一定＝NN-61 × 原作の2段の大きさ） */
   scale: number;
-  /** 残像を伸ばす向き（画面上の進行方向）。伸ばさないなら null */
-  axis: { x: number; y: number; z: number } | null;
-  /** 伸ばす割合（描いた球の直径に対する上乗せ。0=伸ばさない） */
-  trail: number;
+  /** 影（地面の円）を置く場所と大きさ。`depthStretch` は奥行きの向きだけに掛ける */
+  shadow: { x: number; z: number; scale: number; depthStretch: number };
 }
 
 /**
- * でっかいモードのボールをどう描くか（フェーズPP-63）。
+ * でっかいモードの投球をどう描くか（フェーズBBB-76）。
  *
- * **残像は「1フレームで画面上に動く距離」**（上記）で、**`fastness` を掛ける**ので
- * 基準速以下の球には出ない＝PP-63の前の見え方をそのまま保つ（弧と同じ整理）。
- * 近づくほど画面上の動きは速くなるので**残像も伸びる**＝NN-61 が見かけの大きさを
- * 一定にして手放した「近づいてくる」手がかりが、こちらの形で少し戻る。
- *
- * @param pos ボールの位置（弧を含んだ見た目の高さ）
- * @param vel ボールの速度（`vy = slope × vz`。弧の傾きから作る）
- * @param fastness その投手の基準速からどれだけ速いか 0..1（`pitchFastness`）
+ * @param flight 判定の飛行状態（そのまま。描く場所はここから導くだけ）
+ * @param releaseHeight リリースの高さ（`armReleaseHeight`。MM-60）
  */
-export function dekkaiBallLook(
-  pos: { x: number; y: number; z: number },
-  vel: { x: number; y: number; z: number },
-  fastness = 0,
-): DekkaiBallLook {
-  const scale = dekkaiBallScale(pos);
-  const axis = fastness > 0 ? dekkaiScreenMotionAxis(vel) : null;
-  if (!axis || scale <= 0) return { center: { ...pos }, scale, axis: null, trail: 0 };
-  // 画面上の動きの速さ＝視線に垂直な速度成分（axis はその向きの単位ベクトル）
-  const screenSpeed = vel.x * axis.x + vel.y * axis.y + vel.z * axis.z;
-  const drawnDiameter = 2 * BALL_RADIUS * scale;
-  const trail = (fastness * screenSpeed * DEKKAI_TRAIL_FRAME_SEC) / drawnDiameter;
-  // 伸びるのは前後半分ずつなので、後ろへ半分ずらすと先端が実際の位置に残る
-  const back = BALL_RADIUS * scale * trail;
+export function dekkaiPitchLook(
+  flight: { x: number; z: number; vx: number; vz: number; stall?: PitchStall },
+  releaseHeight: number = RELEASE_HEIGHT,
+): DekkaiPitchLook {
+  const z = flight.z;
+  const riseAt = (zz: number): number =>
+    dekkaiScreenRise({ y: pitchLineHeight(zz, releaseHeight), z: zz });
+  // 区間ごとに「画面の縦の位置が時間（＝z）に比例する」ように置き直す
+  const [from, to] = z <= CONTACT_PLANE_Z ? [RELEASE_Z, CONTACT_PLANE_Z] : [CONTACT_PLANE_Z, CATCH_Z];
+  const p = Math.max(0, Math.min(1, (z - from) / (to - from)));
+  const rise = riseAt(from) + (riseAt(to) - riseAt(from)) * p;
+  const zd = lineDepthForRise(rise, releaseHeight);
+  // 横はいまの速度のまま、置き直した奥行きまで外挿する（曲がる球も通り道の上に乗る）
+  const xd = flight.vz > 0 ? flight.x + (flight.vx * (zd - z)) / flight.vz : flight.x;
+  // 高さは通り道の直線。フォークは手元で地面へ落ちていく（BBB-77。`pitchDrawnHeight`）
+  const center = { x: xd, y: pitchDrawnHeight(zd, z, releaseHeight, flight.stall), z: zd };
+  const progress = (z - RELEASE_Z) / (CATCH_Z - RELEASE_Z);
+  const size = progress < DEKKAI_PITCH_SIZE_SWITCH ? DEKKAI_PITCH_SIZE_FAR : DEKKAI_PITCH_SIZE_NEAR;
+  // 影：地面の円を、見下ろす角度で潰れたぶん奥行きの向きに伸ばす（縦横比を原作に揃える）
+  const ground = { x: xd, y: 0, z: zd };
+  const toCamera = Math.hypot(DEKKAI_CAMERA_POS.y, zd - DEKKAI_CAMERA_POS.z);
+  const sinLook = DEKKAI_CAMERA_POS.y / Math.max(toCamera, 1e-6);
   return {
-    center: { x: pos.x - axis.x * back, y: pos.y - axis.y * back, z: pos.z - axis.z * back },
-    scale,
-    axis,
-    trail,
+    center,
+    scale: dekkaiBallScale(center) * size,
+    shadow: {
+      x: xd,
+      z: zd,
+      scale: dekkaiBallScale(ground) * size,
+      depthStretch: DEKKAI_SHADOW_ASPECT / Math.max(sinLook, 1e-3),
+    },
   };
 }
 
